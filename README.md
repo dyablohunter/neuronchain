@@ -1,2 +1,2 @@
 # Neuron Chain
-The smallest blockchain in the world.
+The blockchain that runs in the browser.
