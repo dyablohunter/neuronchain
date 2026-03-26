@@ -195,53 +195,72 @@ function refreshAccount() {
     ? '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">No accounts yet. Create one with FaceID above.</td></tr>'
     : localAccounts.map((acc) => {
         const bal = node.ledger.getAccountBalance(acc.pub);
-        const unclaimed = node.ledger.getUnclaimedForAccount(acc.pub);
-        const unclaimedStr = unclaimed.length > 0 ? ` <span style="color:var(--success)">(+${unclaimed.length} pending)</span>` : '';
         return `<tr>
           <td>${acc.username}</td>
           <td><span class="hash truncate">${trunc(acc.pub, 20)}</span></td>
-          <td>${formatUNIT(bal)} UNIT${unclaimedStr}</td>
-          <td><button class="btn btn-outline" onclick="navigator.clipboard.writeText('${acc.username}')">Copy</button></td>
+          <td>${formatUNIT(bal)} UNIT</td>
+          <td>
+            <button class="btn btn-outline" onclick="navigator.clipboard.writeText('${acc.username}')">Copy</button>
+            <button class="btn btn-delete-account" data-pub="${acc.pub}" style="background:var(--danger);color:#fff;margin-left:6px;">Delete</button>
+          </td>
         </tr>`;
       }).join('');
+
+  tbody.querySelectorAll('.btn-delete-account').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const pub = btn.getAttribute('data-pub')!;
+      const acc = localAccounts.find((a) => a.pub === pub);
+      if (!acc) return;
+      if (!confirm(`Delete account "${acc.username}"? This removes it from your local wallet. You can recover it later with FaceID or key pair.`)) return;
+      localAccounts = localAccounts.filter((a) => a.pub !== pub);
+      node.localKeys.delete(pub);
+      saveWallet();
+      refreshAccount();
+      refreshTransfer();
+      refreshContracts();
+      toast(`Account "${acc.username}" removed`, 'info');
+    });
+  });
 }
 
 function refreshTransfer() {
-  $<HTMLSelectElement>('#txFrom').innerHTML =
-    localAccounts.map((a) => `<option value="${a.username}">${a.username} (${formatUNIT(node.ledger.getAccountBalance(a.pub))} UNIT)</option>`).join('');
-
-  const unclaimed: { sendBlockHash: string; fromPub: string; amount: number; forUsername: string }[] = [];
-  for (const acc of localAccounts) {
-    for (const u of node.ledger.getUnclaimedForAccount(acc.pub)) {
-      unclaimed.push({ ...u, forUsername: acc.username });
+  const select = $<HTMLSelectElement>('#txFrom');
+  const currentValue = select.value;
+  const newOptions = localAccounts.map((a) =>
+    `<option value="${a.username}">${a.username} (${formatUNIT(node.ledger.getAccountBalance(a.pub))} UNIT)</option>`
+  ).join('');
+  if (select.innerHTML !== newOptions) {
+    select.innerHTML = newOptions;
+    // Restore previous selection if it still exists
+    if (currentValue && localAccounts.some((a) => a.username === currentValue)) {
+      select.value = currentValue;
     }
   }
 
-  const el = $('#unclaimedReceives');
-  if (unclaimed.length === 0) {
-    el.innerHTML = '<p style="color:var(--text-muted);font-size:13px;">No pending receives.</p>';
-  } else {
-    el.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>From</th><th>To</th><th>Amount</th><th>Action</th></tr></thead>
-      <tbody>${unclaimed.map((u) => `<tr>
-        <td>${resolveName(u.fromPub)}</td><td>${u.forUsername}</td><td>${formatUNIT(u.amount)} UNIT</td>
-        <td><button class="btn btn-success btn-claim" data-hash="${u.sendBlockHash}" data-pub="${node.ledger.resolveToPublicKey(u.forUsername) || ''}">Claim</button></td>
-      </tr>`).join('')}</tbody></table></div>`;
+  // Auto-claim any unclaimed receives
+  autoClaimPending();
 
-    el.querySelectorAll('.btn-claim').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const hash = btn.getAttribute('data-hash')!;
-        const pub = btn.getAttribute('data-pub')!;
-        const acc = localAccounts.find((a) => a.pub === pub);
-        if (!acc) return;
-        const result = await node.ledger.createReceive(pub, hash, acc.keys);
+  const el = $('#unclaimedReceives');
+  el.innerHTML = '';
+}
+
+let autoClaimRunning = false;
+async function autoClaimPending(): Promise<void> {
+  if (autoClaimRunning) return;
+  autoClaimRunning = true;
+  try {
+    for (const acc of localAccounts) {
+      const unclaimed = node.ledger.getUnclaimedForAccount(acc.pub);
+      for (const u of unclaimed) {
+        const result = await node.ledger.createReceive(acc.pub, u.sendBlockHash, acc.keys);
         if (result.block) {
           await node.submitBlock(result.block);
-          toast(`Claimed ${formatUNIT(result.block.receiveAmount || 0)} UNIT`, 'success');
-          refreshTab();
-        } else { toast(`Claim failed: ${result.error}`, 'error'); }
-      });
-    });
+          addLog(`Auto-claimed ${formatUNIT(result.block.receiveAmount || 0)} UNIT from ${resolveName(u.fromPub)}`, 'success');
+        }
+      }
+    }
+  } finally {
+    autoClaimRunning = false;
   }
 }
 
@@ -506,17 +525,17 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // Register account
     addLog('FaceID: Registering account on ledger...', 'info');
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Creating account on-chain...</span>';
-    const account = buildAccount(username, keys.pub, faceMap.hash);
+    const account = buildAccount(username, keys.pub, faceMap.hash, faceMap.canonical);
     node.ledger.registerAccount(account);
 
     // Create open block (mints 1M UNIT)
     addLog('FaceID: Creating open block (+1M UNIT)...', 'info');
-    const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys);
+    const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys, faceMap.canonical);
     addLog(`FaceID: Open block created (hash: ${openBlock.hash.slice(0, 16)}...)`, 'success');
 
     // Submit through node (publishes to Gun + BroadcastChannel, triggers auto-vote)
     await node.submitBlock(openBlock);
-    node.gunNet.saveAccount(keys.pub, { username, pub: keys.pub, balance: 1000000, nonce: 0, createdAt: account.createdAt, faceMapHash: faceMap.hash });
+    node.gunNet.saveAccount(keys.pub, { username, pub: keys.pub, balance: 1000000, nonce: 0, createdAt: account.createdAt, faceMapHash: faceMap.hash, faceDescriptor: JSON.stringify(faceMap.canonical) });
     node.gunNet.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
     addLog('FaceID: Published block, account, and encrypted key blob', 'success');
 
@@ -544,7 +563,10 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     addLog(`Account created: ${username} (+1M UNIT, face-locked)`, 'success');
     refreshAccount(); refreshTransfer(); refreshContracts();
   } catch (err) {
-    toast(`Error: ${err}`, 'error');
+    const msg = err instanceof Error ? err.message : String(err);
+    addLog(`Account creation failed: ${msg}`, 'error');
+    statusEl.innerHTML = `<span style="color:var(--danger)">${msg}</span>`;
+    toast(`Error: ${msg}`, 'error');
     hideCameraModal();
   }
   restoreCreateBtn();

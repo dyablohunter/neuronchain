@@ -140,6 +140,10 @@ export class NeuronNode extends EventEmitter {
     const contracts = await this.gunNet.loadContracts();
 
     for (const [pub, accData] of accounts) {
+      let faceDescriptor: number[] | undefined;
+      if (accData.faceDescriptor) {
+        try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch { /* ignore */ }
+      }
       this.ledger.registerAccount({
         username: String(accData.username || ''),
         pub: String(accData.pub || pub),
@@ -147,6 +151,7 @@ export class NeuronNode extends EventEmitter {
         nonce: Number(accData.nonce || 0),
         createdAt: Number(accData.createdAt || 0),
         faceMapHash: String(accData.faceMapHash || ''),
+        faceDescriptor,
       });
     }
 
@@ -155,6 +160,9 @@ export class NeuronNode extends EventEmitter {
         await this.ledger.addBlock(block);
       }
     }
+
+    // Rebuild face account count from loaded blocks
+    this.ledger.rebuildFaceAccountCount();
 
     for (const [id, cData] of contracts) {
       if (!this.ledger.contracts.has(id)) {
@@ -190,6 +198,10 @@ export class NeuronNode extends EventEmitter {
       for (const [pub, accData] of accounts) {
         if (!accData.username) continue; // Skip null/deleted entries
         const existing = this.ledger.accounts.has(pub);
+        let faceDescriptor: number[] | undefined;
+        if (accData.faceDescriptor) {
+          try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch { /* ignore */ }
+        }
         this.ledger.registerAccount({
           username: String(accData.username),
           pub: String(accData.pub || pub),
@@ -197,6 +209,7 @@ export class NeuronNode extends EventEmitter {
           nonce: Number(accData.nonce || 0),
           createdAt: Number(accData.createdAt || 0),
           faceMapHash: String(accData.faceMapHash || ''),
+          faceDescriptor,
         });
         if (!existing) newAccounts++;
       }
@@ -232,6 +245,7 @@ export class NeuronNode extends EventEmitter {
       }
 
       if (newAccounts > 0 || newBlocks > 0) {
+        this.ledger.rebuildFaceAccountCount();
         console.log(`[Resync] +${newAccounts} accounts, +${newBlocks} blocks`);
         this.emit('resync', { newAccounts, newBlocks });
       }
@@ -253,6 +267,7 @@ export class NeuronNode extends EventEmitter {
         nonce: acc.nonce,
         createdAt: acc.createdAt,
         faceMapHash: acc.faceMapHash,
+        faceDescriptor: acc.faceDescriptor ? JSON.stringify(acc.faceDescriptor) : undefined,
       });
     }
 

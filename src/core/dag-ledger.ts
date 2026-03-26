@@ -12,6 +12,9 @@ import { KeyPair } from './crypto';
 import { VoteManager, Vote } from './vote';
 import { EventEmitter } from './events';
 
+/** Euclidean distance threshold for face matching (same as face-verify.ts) */
+const FACE_MATCH_THRESHOLD = 0.45;
+
 export type NetworkType = 'testnet' | 'mainnet';
 
 export interface DAGStats {
@@ -72,6 +75,9 @@ export class DAGLedger extends EventEmitter {
       if (account.faceMapHash && !existing.faceMapHash) {
         existing.faceMapHash = account.faceMapHash;
       }
+      if (account.faceDescriptor && !existing.faceDescriptor) {
+        existing.faceDescriptor = account.faceDescriptor;
+      }
       return true;
     }
     if (this.usernameToPublicKey.has(account.username) && account.username !== account.pub) return false;
@@ -122,13 +128,54 @@ export class DAGLedger extends EventEmitter {
   }
 
   /**
+   * Count how many existing accounts match a face descriptor using
+   * Euclidean distance (not hash equality). This catches the same face
+   * even when quantization produces slightly different hashes across sessions.
+   */
+  countMatchingFaceAccounts(descriptor: number[], excludePub?: string): number {
+    let count = 0;
+    for (const account of this.accounts.values()) {
+      if (excludePub && account.pub === excludePub) continue;
+      if (account.faceDescriptor && account.faceDescriptor.length === 128) {
+        let sum = 0;
+        for (let i = 0; i < 128; i++) sum += (descriptor[i] - account.faceDescriptor[i]) ** 2;
+        if (Math.sqrt(sum) < FACE_MATCH_THRESHOLD) count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Rebuild faceAccountCount from existing open blocks.
+   * Call after loading/syncing blocks to restore the in-memory map.
+   */
+  rebuildFaceAccountCount(): void {
+    this.faceAccountCount.clear();
+    for (const chain of this.accountChains.values()) {
+      const openBlock = chain[0];
+      if (openBlock?.type === 'open' && openBlock.faceMapHash) {
+        const prev = this.faceAccountCount.get(openBlock.faceMapHash) || 0;
+        this.faceAccountCount.set(openBlock.faceMapHash, prev + 1);
+      }
+    }
+  }
+
+  /**
    * Create and submit an OPEN block.
    * Requires faceMapHash — FaceID is mandatory for account creation.
    * Enforces per-face account limit (mainnet: 1, testnet: 3).
    * Mints VERIFICATION_MINT_AMOUNT (1,000,000 UNIT) to the new account.
    */
-  async openAccount(pub: string, faceMapHash: string, keys: KeyPair): Promise<AccountBlock> {
-    const count = this.getFaceAccountCount(faceMapHash);
+  async openAccount(pub: string, faceMapHash: string, keys: KeyPair, faceDescriptor?: number[]): Promise<AccountBlock> {
+    // Primary check: compare face descriptors using Euclidean distance
+    // This catches the same face even with different quantized hashes
+    let count: number;
+    if (faceDescriptor && faceDescriptor.length === 128) {
+      count = this.countMatchingFaceAccounts(faceDescriptor, pub);
+    } else {
+      // Fallback: hash-based count (for blocks received from network without descriptor)
+      count = this.getFaceAccountCount(faceMapHash);
+    }
     const max = this.getMaxAccountsPerFace();
     if (count >= max) {
       throw new Error(`Face already used for ${count} account(s). Limit: ${max} per face on ${this.network}.`);

@@ -7,6 +7,8 @@ export interface Account {
   nonce: number;
   createdAt: number;
   faceMapHash: string;
+  /** Canonical 128-D face descriptor for cross-session similarity matching */
+  faceDescriptor?: number[];
 }
 
 export interface AccountWithKeys extends Account {
@@ -39,6 +41,7 @@ export function buildAccount(
   username: string,
   pub: string,
   faceMapHash: string,
+  faceDescriptor?: number[],
 ): Account {
   return {
     username,
@@ -47,5 +50,6 @@ export function buildAccount(
     nonce: 0,
     createdAt: Date.now(),
     faceMapHash,
+    faceDescriptor,
   };
 }
