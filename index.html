@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeuronChain — Browser Blockchain</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>" />
+  <style>
+    :root {
+      --bg: #0a0e17;
+      --surface: #111827;
+      --surface2: #1a2236;
+      --border: #1e293b;
+      --primary: #6366f1;
+      --primary-hover: #818cf8;
+      --accent: #22d3ee;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --text: #e2e8f0;
+      --text-dim: #94a3b8;
+      --text-muted: #64748b;
+      --radius: 8px;
+      --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      --mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .header-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .header-logo .icon { font-size: 26px; }
+    .header-logo .name span { color: var(--primary); }
+
+    .header-network {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .network-badge {
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .network-badge.testnet { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .network-badge.mainnet { background: rgba(99, 102, 241, 0.15); color: var(--primary-hover); border: 1px solid rgba(99, 102, 241, 0.3); }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--danger);
+      transition: background 0.3s;
+    }
+    .status-dot.active { background: var(--success); animation: pulse 2s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .tabs::-webkit-scrollbar { display: none; }
+
+    .tab-btn {
+      padding: 12px 20px;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .tab-btn:hover { color: var(--text-dim); background: rgba(255,255,255,0.02); }
+    .tab-btn.active { color: var(--primary-hover); border-bottom-color: var(--primary); }
+    .tab-btn .tab-icon { font-size: 15px; }
+
+    /* Main content */
+    .main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+
+    .tab-panel { display: none; animation: fadeIn 0.2s ease; }
+    .tab-panel.active { display: block; }
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* Cards */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 16px;
+    }
+
+    /* Stats grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+
+    .stat-item {
+      background: var(--surface2);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+
+    .stat-value {
+      font-size: 22px;
+      font-weight: 700;
+      font-family: var(--mono);
+      color: var(--text);
+    }
+
+    .stat-value.small { font-size: 14px; word-break: break-all; }
+
+    /* Forms */
+    .form-group { margin-bottom: 16px; }
+
+    .form-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .form-input, .form-select, .form-textarea {
+      width: 100%;
+      padding: 10px 14px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 14px;
+      transition: border-color 0.2s;
+    }
+
+    .form-input:focus, .form-select:focus, .form-textarea:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+
+    .form-textarea { min-height: 120px; resize: vertical; }
+
+    .form-select {
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      padding-right: 32px;
+    }
+
+    option { background: var(--surface); }
+
+    /* Buttons */
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: var(--radius);
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-success { background: var(--success); color: white; }
+    .btn-success:hover { background: #059669; }
+    .btn-danger { background: var(--danger); color: white; }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-outline {
+      background: transparent;
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+    }
+    .btn-outline:hover { border-color: var(--text-muted); color: var(--text); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    /* Table */
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th {
+      text-align: left;
+      padding: 10px 12px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    tr:hover { background: rgba(255,255,255,0.02); }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .badge-transfer { background: rgba(99, 102, 241, 0.15); color: var(--primary-hover); }
+    .badge-deploy { background: rgba(34, 211, 238, 0.15); color: var(--accent); }
+    .badge-call { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+    .badge-create { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+
+    .hash { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+    .truncate { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; }
+
+    /* Log console */
+    .log-console {
+      background: #050810;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.8;
+    }
+
+    .log-entry { color: var(--text-dim); }
+    .log-entry .time { color: var(--text-muted); margin-right: 8px; }
+    .log-entry.info .msg { color: var(--accent); }
+    .log-entry.success .msg { color: var(--success); }
+    .log-entry.warn .msg { color: var(--warning); }
+    .log-entry.error .msg { color: var(--danger); }
+
+    /* Secret key reveal */
+    .secret-box {
+      background: rgba(239, 68, 68, 0.05);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-top: 12px;
+    }
+
+    .secret-box .warn-text {
+      color: var(--danger);
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .secret-value {
+      font-family: var(--mono);
+      font-size: 14px;
+      word-break: break-all;
+      background: var(--surface2);
+      padding: 10px;
+      border-radius: 4px;
+      user-select: all;
+    }
+
+    /* Help section */
+    .help-section { margin-bottom: 24px; }
+    .help-section h3 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--primary-hover);
+    }
+
+    .help-section p, .help-section li {
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--text-dim);
+    }
+
+    .help-section ul { padding-left: 20px; margin-top: 8px; }
+    .help-section code {
+      background: var(--surface2);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--accent);
+    }
+
+    /* Row layouts */
+    .row { display: flex; gap: 16px; }
+    .row > * { flex: 1; }
+
+    @media (max-width: 768px) {
+      .row { flex-direction: column; }
+      .stats-grid { grid-template-columns: 1fr 1fr; }
+      .main { padding: 16px; }
+      .tab-btn { padding: 10px 14px; font-size: 12px; }
+    }
+
+    /* Toast notifications */
+    .toast-container {
+      position: fixed;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .toast {
+      padding: 12px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 13px;
+      animation: slideIn 0.3s ease;
+      max-width: 360px;
+    }
+
+    .toast.success { border-left: 3px solid var(--success); }
+    .toast.error { border-left: 3px solid var(--danger); }
+    .toast.info { border-left: 3px solid var(--accent); }
+
+    @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* Spinner */
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Camera modal */
+    .camera-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      z-index: 2000;
+      align-items: center;
+      justify-content: center;
+    }
+    .camera-modal.active { display: flex; }
+
+    .camera-modal-inner {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      width: 90%;
+      max-width: 520px;
+      overflow: hidden;
+      position: relative;
+      animation: fadeIn 0.2s ease;
+    }
+
+    .camera-modal-close {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(0,0,0,0.5);
+      color: #fff;
+      font-size: 18px;
+      cursor: pointer;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s;
+    }
+    .camera-modal-close:hover { background: var(--danger); }
+
+    .camera-modal video {
+      width: 100%;
+      display: block;
+      background: #000;
+    }
+
+    .camera-modal-status {
+      padding: 12px 16px;
+      font-size: 13px;
+      color: var(--text-dim);
+      text-align: center;
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .camera-modal-overlay {
+      position: absolute;
+      bottom: 56px;
+      left: 0;
+      right: 0;
+      text-align: center;
+      color: var(--accent);
+      font-size: 13px;
+      font-family: var(--mono);
+      text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+      padding: 8px;
+    }
+
+    /* Confirm dialog overlay */
+    .dialog-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 2000;
+      align-items: center;
+      justify-content: center;
+    }
+    .dialog-overlay.active { display: flex; }
+
+    .dialog {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      max-width: 420px;
+      width: 90%;
+      animation: fadeIn 0.15s ease;
+    }
+
+    .dialog h3 { font-size: 16px; margin-bottom: 8px; color: var(--danger); }
+    .dialog p { font-size: 13px; color: var(--text-dim); margin-bottom: 16px; line-height: 1.6; }
+    .dialog .btn-group { justify-content: flex-end; }
+  </style>
+</head>
+<body>
+  <div class="toast-container" id="toasts"></div>
+
+  <div class="camera-modal" id="cameraModal">
+    <div class="camera-modal-inner">
+      <button class="camera-modal-close" id="cameraModalClose">&times;</button>
+      <video id="faceVideo" autoplay muted playsinline></video>
+      <div class="camera-modal-overlay" id="cameraOverlay"></div>
+      <div class="camera-modal-status" id="cameraStatus"><span class="spinner"></span> Initializing...</div>
+    </div>
+  </div>
+
+  <div class="dialog-overlay" id="resetDialog">
+    <div class="dialog">
+      <h3>Reset Testnet</h3>
+      <p>This will permanently delete <strong>everything</strong> — chain history, accounts, contracts, balances, and local wallet. You will need to create a new account with FaceID. This cannot be undone.</p>
+      <div class="btn-group">
+        <button class="btn btn-outline" id="btnResetCancel">Cancel</button>
+        <button class="btn btn-danger" id="btnResetConfirm">Reset Testnet</button>
+      </div>
+    </div>
+  </div>
+
+  <header class="header">
+    <div class="header-logo">
+      <span class="icon">🧠</span>
+      <span class="name">Neuron<span>Chain</span></span>
+    </div>
+    <div class="header-network">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="network-badge testnet" id="networkBadge">TESTNET</span>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabNav">
+    <button class="tab-btn active" data-tab="chain"><span class="tab-icon">&#x26d3;</span> Chain</button>
+    <button class="tab-btn" data-tab="node"><span class="tab-icon">&#x2699;</span> Node</button>
+    <button class="tab-btn" data-tab="account"><span class="tab-icon">&#x1f464;</span> Account</button>
+    <button class="tab-btn" data-tab="transfer"><span class="tab-icon">&#x21c4;</span> Transfer</button>
+    <button class="tab-btn" data-tab="explorer"><span class="tab-icon">&#x1f50d;</span> Explorer</button>
+    <button class="tab-btn" data-tab="contracts"><span class="tab-icon">&#x1f4dc;</span> Contracts</button>
+    <button class="tab-btn" data-tab="help"><span class="tab-icon">&#x2753;</span> Help</button>
+  </nav>
+
+  <main class="main">
+    <!-- CHAIN TAB -->
+    <div class="tab-panel active" id="tab-chain">
+      <div class="card">
+        <div class="card-title">Network Selection</div>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="btnTestnet">Testnet</button>
+          <button class="btn btn-outline" id="btnMainnet">Mainnet</button>
+          <button class="btn btn-danger" id="btnResetChain" style="margin-left: auto;">Reset Testnet</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Chain Statistics</div>
+        <div class="stats-grid" id="chainStats"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Recent Blocks</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Hash</th><th>Type</th><th>Account</th><th>Amount</th><th>Status</th></tr></thead>
+            <tbody id="recentBlocks"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- NODE TAB -->
+    <div class="tab-panel" id="tab-node">
+      <div class="card">
+        <div class="card-title">Node Control</div>
+        <div class="btn-group" style="margin-bottom: 16px;">
+          <button class="btn btn-success" id="btnStartNode">Start Node</button>
+          <button class="btn btn-danger" id="btnStopNode" disabled>Stop Node</button>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label class="form-label">Validator Account (username)</label>
+            <input type="text" class="form-input" id="validatorAddress" placeholder="Enter username to validate..." />
+          </div>
+          <div class="form-group" style="display:flex;align-items:flex-end;">
+            <div class="btn-group">
+              <button class="btn btn-primary" id="btnStartValidating" disabled>Start Validating</button>
+              <button class="btn btn-outline" id="btnStopValidating" disabled>Stop Validating</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Node Statistics</div>
+        <div class="stats-grid" id="nodeStats"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Node Log</div>
+        <div class="log-console" id="nodeLog"></div>
+      </div>
+    </div>
+
+    <!-- ACCOUNT TAB -->
+    <div class="tab-panel" id="tab-account">
+      <div class="row">
+        <div class="card">
+          <div class="card-title">Create Account with FaceID</div>
+          <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
+            Choose a username, then verify with FaceID. Your private key is generated and <strong>encrypted with your face</strong> — only you can decrypt it. You receive <strong>1,000,000 UNIT</strong> upon creation.
+          </p>
+          <div class="form-group">
+            <label class="form-label">Choose Username</label>
+            <input type="text" class="form-input" id="newUsername" placeholder="my.username" maxlength="24" />
+          </div>
+          <div id="createStatus" style="margin-bottom: 12px;"></div>
+          <div class="btn-group">
+            <button class="btn btn-primary" id="btnCreateAccount">Create with FaceID</button>
+            <button class="btn btn-outline" id="btnCancelCreate" style="display:none;">Cancel</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Recover Account</div>
+          <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
+            <strong>Option A:</strong> Scan your face — your encrypted keys are on-chain.<br>
+            <strong>Option B:</strong> Paste your backup key pair JSON.
+          </p>
+          <div class="form-group">
+            <label class="form-label">Username</label>
+            <input type="text" class="form-input" id="recoverUsername" placeholder="your.username" />
+          </div>
+          <div id="recoverStatus" style="margin-bottom: 12px;"></div>
+          <div class="btn-group" style="margin-bottom: 16px;">
+            <button class="btn btn-primary" id="btnRecoverFace">Recover with FaceID</button>
+            <button class="btn btn-outline" id="btnToggleKeyRecover">Recover with Key Pair</button>
+          </div>
+          <div id="keyRecoverSection" style="display:none;">
+            <div class="form-group">
+              <label class="form-label">Key Pair (JSON)</label>
+              <textarea class="form-textarea" id="recoverKeyPair" placeholder='{"pub":"...","priv":"...","epub":"...","epriv":"..."}'></textarea>
+            </div>
+            <button class="btn btn-outline" id="btnRecoverKeys">Restore from Key Pair</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">My Accounts</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Username</th><th>Public Key</th><th>Balance (UNIT)</th><th>Actions</th></tr></thead>
+            <tbody id="myAccounts"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TRANSFER TAB -->
+    <div class="tab-panel" id="tab-transfer">
+      <div class="card">
+        <div class="card-title">Send UNIT</div>
+        <div class="form-group">
+          <label class="form-label">From Account</label>
+          <select class="form-select" id="txFrom"></select>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label class="form-label">To (username)</label>
+            <input type="text" class="form-input" id="txTo" placeholder="Recipient username" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Amount</label>
+            <input type="number" class="form-input" id="txAmount" placeholder="0" min="1" />
+          </div>
+        </div>
+        <button class="btn btn-primary" id="btnSendTx">Send Transaction</button>
+      </div>
+      <div class="card">
+        <div class="card-title">Pending Receives</div>
+        <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 12px;">Incoming transfers waiting to be claimed. In the block-lattice model, the recipient must create a receive block to accept tokens.</p>
+        <div id="unclaimedReceives"></div>
+      </div>
+    </div>
+
+    <!-- EXPLORER TAB -->
+    <div class="tab-panel" id="tab-explorer">
+      <div class="card">
+        <div class="card-title">Search</div>
+        <div class="row">
+          <div class="form-group">
+            <input type="text" class="form-input" id="explorerSearch" placeholder="Search by TX ID, username, or block index..." />
+          </div>
+          <div class="form-group" style="flex:0;">
+            <button class="btn btn-primary" id="btnExplorerSearch">Search</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">All Transactions</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Hash</th><th>Type</th><th>Account</th><th>Counterparty</th><th>Amount</th><th>Status</th></tr></thead>
+            <tbody id="explorerTxs"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="explorerDetail"></div>
+    </div>
+
+    <!-- CONTRACTS TAB -->
+    <div class="tab-panel" id="tab-contracts">
+      <div class="card">
+        <div class="card-title">Deploy Smart Contract</div>
+        <div class="form-group">
+          <label class="form-label">From Account</label>
+          <select class="form-select" id="contractFrom"></select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Contract Name</label>
+          <input type="text" class="form-input" id="contractName" placeholder="My Token Contract" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Contract Code (JavaScript)</label>
+          <textarea class="form-textarea" id="contractCode" placeholder="function init() { state.counter = 0; }
+function increment() { state.counter++; return state.counter; }
+function getCount() { return state.counter; }"></textarea>
+        </div>
+        <button class="btn btn-primary" id="btnDeployContract">Deploy Contract</button>
+      </div>
+      <div class="card">
+        <div class="card-title">Call Contract</div>
+        <div class="row">
+          <div class="form-group">
+            <label class="form-label">Contract ID</label>
+            <input type="text" class="form-input" id="callContractId" placeholder="Contract TX ID" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Method</label>
+            <input type="text" class="form-input" id="callMethod" placeholder="methodName" />
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Caller Account</label>
+          <select class="form-select" id="callFrom"></select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Arguments (JSON array)</label>
+          <input type="text" class="form-input" id="callArgs" placeholder='["arg1", 42]' value="[]" />
+        </div>
+        <button class="btn btn-primary" id="btnCallContract">Call Contract</button>
+      </div>
+      <div class="card">
+        <div class="card-title">Deployed Contracts</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Deployed</th><th>Actions</th></tr></thead>
+            <tbody id="contractsList"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- HELP TAB -->
+    <div class="tab-panel" id="tab-help">
+      <div class="card">
+        <div class="help-section">
+          <h3>Welcome to NeuronChain</h3>
+          <p>NeuronChain is a browser-based blockchain using a <strong>block-lattice DAG</strong> with <strong>stake-weighted voting</strong> and <strong>face-locked keys</strong>. Your private key is encrypted with your face — no seed phrases, no passwords. The native currency is the <strong>Neuron Unit (UNIT)</strong>.</p>
+        </div>
+
+        <div class="help-section">
+          <h3>Getting Started</h3>
+          <ul>
+            <li><strong>Step 1:</strong> Go to the <strong>Node</strong> tab and click <strong>Start Node</strong> to connect to the relay network. Do this first so your data syncs immediately.</li>
+            <li><strong>Step 2:</strong> Go to the <strong>Account</strong> tab, choose a username, and scan your face. You receive <strong>1,000,000 UNIT</strong>.</li>
+            <li><strong>Step 3:</strong> Save the backup key pair JSON shown after creation (secondary recovery method).</li>
+            <li><strong>Step 4:</strong> Send UNIT in the <strong>Transfer</strong> tab — enter a recipient username and amount.</li>
+            <li><strong>Step 5:</strong> Claim incoming transfers in the <strong>Pending Receives</strong> section of the Transfer tab.</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Neuron Unit (UNIT)</h3>
+          <ul>
+            <li><strong>1,000,000 UNIT</strong> minted per new account at creation</li>
+            <li>All operations are <strong>zero fee</strong> — transfers, contracts, everything</li>
+            <li>Inflationary — total supply grows as new accounts are created</li>
+            <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account)</li>
+            <li><strong>Testnet:</strong> up to 3 accounts per face (for testing)</li>
+            <li>Usernames are always lowercase (auto-converted)</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Face-Locked Keys</h3>
+          <p>Account creation requires a face scan. Your private key is <strong>encrypted with your face</strong>:</p>
+          <ul>
+            <li><strong>Liveness check:</strong> Slowly turn your head left and right — movement detection prevents photo and deepfake attacks</li>
+            <li><strong>Face enrollment:</strong> 3 captures are averaged into a stable 128-dimensional face descriptor</li>
+            <li><strong>Quantization:</strong> The descriptor is quantized into stable bins so the same face produces the same key across sessions</li>
+            <li><strong>Key derivation:</strong> Quantized descriptor &#8594; PBKDF2 (100K iterations) &#8594; AES-256-GCM encryption key</li>
+            <li><strong>Key encryption:</strong> Your ECDSA key pair is encrypted with the face-derived AES key</li>
+            <li><strong>On-chain storage:</strong> The encrypted blob is stored on the Gun relay — available from any device, but only your face can decrypt it</li>
+            <li><strong>Backup:</strong> A JSON key pair is shown once at creation — save it as a secondary recovery method</li>
+            <li><strong>Privacy:</strong> Only a SHA-256 hash of the face map is stored publicly. No images or raw descriptors leave the browser.</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Account Recovery</h3>
+          <ul>
+            <li><strong>FaceID (primary):</strong> Enter your username &#8594; face scan &#8594; encrypted keys fetched from the relay and decrypted with your face. Works from any device.</li>
+            <li><strong>Key Pair (backup):</strong> Click "Recover with Key Pair" and paste the JSON you saved at creation. Works without a camera.</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Block-Lattice DAG</h3>
+          <p>Instead of one global chain, every account has its own chain of blocks:</p>
+          <ul>
+            <li><strong><code>open</code></strong> — first block, created with FaceID, mints 1,000,000 UNIT</li>
+            <li><strong><code>send</code></strong> — transfer UNIT (deducts from sender)</li>
+            <li><strong><code>receive</code></strong> — accept UNIT from a confirmed send (credits recipient)</li>
+            <li><strong><code>deploy</code></strong> — deploy a smart contract</li>
+            <li><strong><code>call</code></strong> — call a smart contract method</li>
+          </ul>
+          <p style="margin-top: 8px;">Transfers require two blocks: a <code>send</code> on the sender's chain and a <code>receive</code> on the recipient's chain. The recipient must <strong>claim</strong> the receive in the Transfer tab (or it is auto-claimed if their node is online).</p>
+        </div>
+
+        <div class="help-section">
+          <h3>Stake-Weighted Voting</h3>
+          <p>Blocks are confirmed through peer voting, not mining:</p>
+          <ul>
+            <li>When a block is published, peers validate it (signature, balance, no fork)</li>
+            <li>Valid blocks get an automatic vote, weighted by the voter's UNIT balance</li>
+            <li>A block is <strong>confirmed</strong> when &gt;2/3 of online stake approves</li>
+            <li>Uncontested blocks auto-confirm after 10 seconds (grace period for low-activity networks)</li>
+            <li><strong>Double-spend prevention:</strong> two blocks with the same parent = fork &#8594; peers vote on which to keep, loser is rejected and rolled back</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>P2P Networking</h3>
+          <p><strong>Gun.js</strong> handles all peer-to-peer communication. The Gun relay is embedded in the dev server — one command starts everything.</p>
+          <ul>
+            <li><strong>Start:</strong> <code>npm run dev</code> starts Vite + Gun relay on one port</li>
+            <li><strong>Mobile:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL for mobile camera access</li>
+            <li><strong>Sync:</strong> accounts, blocks, votes, and encrypted key blobs sync via the Gun relay</li>
+            <li><strong>Resync:</strong> every 8 seconds, each node polls the relay for missed data</li>
+            <li><strong>Single-tab lock:</strong> only one node per browser to prevent account farming</li>
+            <li><strong>Auto-vote:</strong> peers automatically vote on valid blocks they receive</li>
+            <li><strong>Auto-receive:</strong> incoming sends to local accounts are claimed automatically</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Networks</h3>
+          <ul>
+            <li><strong>Testnet:</strong> Up to 3 accounts per face. Can be reset from the Chain tab (wipes everything). For development and testing.</li>
+            <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account). Cannot be reset. Production network.</li>
+          </ul>
+          <p style="margin-top: 8px;">Both networks mint 1,000,000 UNIT per account and have zero fees.</p>
+        </div>
+
+        <div class="help-section">
+          <h3>Smart Contracts</h3>
+          <p>Write contracts in JavaScript. Your code has access to:</p>
+          <ul>
+            <li><code>state</code> — persistent key-value storage for the contract</li>
+            <li><code>caller</code> — public key of the account calling the contract</li>
+            <li><code>args</code> — arguments passed to the method</li>
+            <li><code>balanceOf(username)</code> — check any account's balance</li>
+            <li><code>log(...msgs)</code> — emit log messages</li>
+          </ul>
+          <p style="margin-top: 8px;">Example contract:</p>
+          <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 13px; overflow-x: auto;"><code>function init() {
+  state.counter = 0;
+}
+
+function increment() {
+  state.counter++;
+  log("Counter is now", state.counter);
+  return state.counter;
+}
+
+function getCount() {
+  return state.counter;
+}</code></pre>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

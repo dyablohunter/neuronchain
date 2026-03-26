@@ -1,0 +1,35 @@
+{
+  "name": "neuronchain",
+  "version": "1.0.0",
+  "description": "The blockchain that runs in the browser.",
+  "main": "src/main.ts",
+  "scripts": {
+    "dev": "vite",
+    "tunnel": "npx untun@latest tunnel http://localhost:5173",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dyablohunter/neuronchain.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/dyablohunter/neuronchain/issues"
+  },
+  "homepage": "https://github.com/dyablohunter/neuronchain#readme",
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.34",
+    "face-api.js": "^0.22.2",
+    "gun": "^0.2020.1241",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.2",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^2.3.0"
+  }
+}
