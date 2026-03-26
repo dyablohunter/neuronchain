@@ -5,11 +5,11 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
 /**
- * Vite plugin: Real Gun relay with storage at /gun path.
+ * Vite plugin: Gun relay with internal sharding.
  *
- * Creates a hidden internal HTTP server, attaches Gun to it (with disk storage),
- * then intercepts /gun WebSocket upgrades from Vite and forwards them to Gun.
- * Vite's HMR WebSocket is untouched (it uses /?token=xxx path).
+ * Single Gun instance at /gun — data is sharded internally using
+ * Gun's graph structure (shard/N/... paths within the same Gun DB).
+ * This avoids multiple WebSocket connections which break through tunnels.
  */
 export function gunRelay(): Plugin {
   return {
@@ -18,24 +18,16 @@ export function gunRelay(): Plugin {
       if (!server.httpServer) return;
 
       const Gun = require('gun');
-
-      // Internal HTTP server for Gun (doesn't listen on any port)
       const internalServer = createHttpServer();
+      Gun({ web: internalServer, file: '.relay-data' });
 
-      // Attach Gun with storage — this is a REAL relay that stores and serves data
-      Gun({ web: internalServer, file: 'relay-data' });
-
-      // Intercept WebSocket upgrades for /gun and forward to Gun's internal server
       server.httpServer.on('upgrade', (req, socket, head) => {
         const url = req.url || '';
         if (url.startsWith('/gun')) {
-          // Let Gun handle this WebSocket connection
           internalServer.emit('upgrade', req, socket, head);
         }
-        // All other upgrade requests (Vite HMR) pass through untouched
       });
 
-      // Forward HTTP requests to /gun to Gun's internal server
       server.middlewares.use((req, res, next) => {
         if (req.url && req.url.startsWith('/gun')) {
           internalServer.emit('request', req, res);
@@ -44,7 +36,7 @@ export function gunRelay(): Plugin {
         }
       });
 
-      console.log('  Gun relay: real Gun instance with storage at /gun');
+      console.log('  Gun relay: single instance with internal sharding at /gun');
     },
   };
 }

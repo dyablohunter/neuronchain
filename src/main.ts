@@ -3,6 +3,7 @@ import { validateUsername, generateAccountKeys, buildAccount, AccountWithKeys } 
 import { NetworkType } from './core/dag-ledger';
 import { KeyPair } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
+import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock } from './core/dag-block';
 import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, captureFaceDescriptor } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
@@ -42,6 +43,8 @@ function toast(msg: string, type: 'success' | 'error' | 'info' = 'info') {
 
 const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString();
 const trunc = (s: string, n = 16) => s.length <= n ? s : s.slice(0, n) + '...';
+const cpBtn = (text: string) => `<button class="btn-copy" onclick="navigator.clipboard.writeText('${text}')" title="Copy">&#x2398;</button>`;
+const copyBtn = (text: string, display?: string) => `${cpBtn(text)}<span class="hash truncate">${display || trunc(text, 14)}</span>`;
 
 function addLog(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info') {
   const log = $('#nodeLog');
@@ -108,6 +111,7 @@ $('#cameraModalClose').addEventListener('click', () => {
 // ──── Tabs ────
 $$('.tab-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
+    if ((btn as HTMLButtonElement).disabled) return;
     $$('.tab-btn').forEach((b) => b.classList.remove('active'));
     $$('.tab-panel').forEach((p) => p.classList.remove('active'));
     btn.classList.add('active');
@@ -118,8 +122,16 @@ $$('.tab-btn').forEach((btn) => {
   });
 });
 
+function setNodeDependentTabs(enabled: boolean) {
+  const tabs = ['transfer', 'contracts'];
+  tabs.forEach((t) => {
+    const btn = document.querySelector(`.tab-btn[data-tab="${t}"]`) as HTMLButtonElement;
+    if (btn) btn.disabled = !enabled;
+  });
+}
+
 function activeTab(): string {
-  return document.querySelector('.tab-btn.active')?.getAttribute('data-tab') || 'chain';
+  return document.querySelector('.tab-btn.active')?.getAttribute('data-tab') || 'node';
 }
 
 function refreshTab() {
@@ -153,12 +165,12 @@ function refreshChain() {
     ? '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">No blocks yet</td></tr>'
     : blocks.map((b) => {
         const status = node.ledger.getBlockStatus(b.hash);
-        const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : 'var(--warning)';
+        const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : status === 'conflict' ? 'var(--danger)' : 'var(--warning)';
         return `<tr>
-          <td><span class="hash truncate">${trunc(b.hash, 14)}</span></td>
+          <td>${copyBtn(b.hash)}</td>
           <td><span class="badge badge-${b.type === 'send' ? 'transfer' : b.type === 'receive' ? 'create' : b.type === 'deploy' ? 'deploy' : b.type === 'call' ? 'call' : 'verify'}">${b.type}</span></td>
           <td>${resolveName(b.accountPub)}</td>
-          <td>${b.type === 'send' ? '-' + (b.amount || 0).toLocaleString() : b.type === 'receive' ? '+' + (b.receiveAmount || 0).toLocaleString() : b.type === 'open' ? '+1,000,000' : '-'}</td>
+          <td>${b.type === 'send' ? '-' + formatUNIT(b.amount || 0) : b.type === 'receive' ? '+' + formatUNIT(b.receiveAmount || 0) : b.type === 'open' ? '+' + formatUNIT(VERIFICATION_MINT_AMOUNT) : '-'}</td>
           <td style="color:${statusColor}">${status}</td>
         </tr>`;
       }).join('');
@@ -171,6 +183,7 @@ function refreshNode() {
     <div class="stat-item"><div class="stat-label">Status</div><div class="stat-value small" style="color:${s.status === 'stopped' ? 'var(--danger)' : s.status === 'validating' ? 'var(--success)' : 'var(--accent)'}">${s.status.toUpperCase()}</div></div>
     <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${uptime}</div></div>
     <div class="stat-item"><div class="stat-label">Peers</div><div class="stat-value">${s.peerCount}</div></div>
+    <div class="stat-item"><div class="stat-label">Shards</div><div class="stat-value">${s.shards}</div></div>
     <div class="stat-item"><div class="stat-label">Peer ID</div><div class="stat-value small">${trunc(s.peerId, 16)}</div></div>
     <div class="stat-item"><div class="stat-label">Network</div><div class="stat-value small">${s.network}</div></div>
   `;
@@ -187,7 +200,7 @@ function refreshAccount() {
         return `<tr>
           <td>${acc.username}</td>
           <td><span class="hash truncate">${trunc(acc.pub, 20)}</span></td>
-          <td>${bal.toLocaleString()} UNIT${unclaimedStr}</td>
+          <td>${formatUNIT(bal)} UNIT${unclaimedStr}</td>
           <td><button class="btn btn-outline" onclick="navigator.clipboard.writeText('${acc.username}')">Copy</button></td>
         </tr>`;
       }).join('');
@@ -195,7 +208,7 @@ function refreshAccount() {
 
 function refreshTransfer() {
   $<HTMLSelectElement>('#txFrom').innerHTML =
-    localAccounts.map((a) => `<option value="${a.username}">${a.username} (${node.ledger.getAccountBalance(a.pub).toLocaleString()} UNIT)</option>`).join('');
+    localAccounts.map((a) => `<option value="${a.username}">${a.username} (${formatUNIT(node.ledger.getAccountBalance(a.pub))} UNIT)</option>`).join('');
 
   const unclaimed: { sendBlockHash: string; fromPub: string; amount: number; forUsername: string }[] = [];
   for (const acc of localAccounts) {
@@ -211,7 +224,7 @@ function refreshTransfer() {
     el.innerHTML = `<div class="table-wrap"><table>
       <thead><tr><th>From</th><th>To</th><th>Amount</th><th>Action</th></tr></thead>
       <tbody>${unclaimed.map((u) => `<tr>
-        <td>${resolveName(u.fromPub)}</td><td>${u.forUsername}</td><td>${u.amount.toLocaleString()} UNIT</td>
+        <td>${resolveName(u.fromPub)}</td><td>${u.forUsername}</td><td>${formatUNIT(u.amount)} UNIT</td>
         <td><button class="btn btn-success btn-claim" data-hash="${u.sendBlockHash}" data-pub="${node.ledger.resolveToPublicKey(u.forUsername) || ''}">Claim</button></td>
       </tr>`).join('')}</tbody></table></div>`;
 
@@ -224,7 +237,7 @@ function refreshTransfer() {
         const result = await node.ledger.createReceive(pub, hash, acc.keys);
         if (result.block) {
           await node.submitBlock(result.block);
-          toast(`Claimed ${result.block.receiveAmount?.toLocaleString()} UNIT`, 'success');
+          toast(`Claimed ${formatUNIT(result.block.receiveAmount || 0)} UNIT`, 'success');
           refreshTab();
         } else { toast(`Claim failed: ${result.error}`, 'error'); }
       });
@@ -232,26 +245,75 @@ function refreshTransfer() {
   }
 }
 
+const EXPLORER_PAGE_SIZE = 20;
+let explorerDisplayCount = EXPLORER_PAGE_SIZE;
+let nodeStartedAt = 0;
+let lastKnownBlockCount = 0;
+let blockCountStableSince = 0;
+
+function renderExplorerRow(b: AccountBlock): string {
+  const status = node.ledger.getBlockStatus(b.hash);
+  const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : status === 'conflict' ? 'var(--danger)' : 'var(--warning)';
+  const typeClass = b.type === 'send' ? 'badge-transfer' : b.type === 'receive' ? 'badge-create' : b.type === 'deploy' ? 'badge-deploy' : 'badge-call';
+  return `<tr>
+    <td>${copyBtn(b.hash)}</td>
+    <td><span class="badge ${typeClass}">${b.type}</span></td>
+    <td>${cpBtn(b.accountPub)}${resolveName(b.accountPub)}</td>
+    <td>${b.type === 'send' ? resolveName(b.recipient || '') : b.type === 'receive' ? resolveName(b.sendFrom || '') : '-'}</td>
+    <td>${b.type === 'send' ? formatUNIT(b.amount || 0) : b.type === 'receive' ? formatUNIT(b.receiveAmount || 0) : b.type === 'open' ? formatUNIT(VERIFICATION_MINT_AMOUNT) : '-'}</td>
+    <td style="color:${statusColor}">${status}</td>
+  </tr>`;
+}
+
 function refreshExplorer() {
-  const blocks = node.ledger.getAllBlocks().slice(0, 30);
+  const allBlocks = node.ledger.getAllBlocks();
+  const blocks = allBlocks.slice(0, explorerDisplayCount);
   const tbody = $('#explorerTxs');
+  const loadMoreEl = $('#explorerLoadMore');
+  const syncEl = $('#explorerSyncStatus');
+
+  // Sync status indicator
+  const stats = node.ledger.getStats();
+  const nodeStats = node.getStats();
+  const isRunning = nodeStats.status !== 'stopped';
+  const confirmed = stats.confirmedBlocks;
+  const total = stats.totalBlocks;
+  const accounts = stats.totalAccounts;
+  const pending = total - confirmed;
+
+  // Track when block count stabilizes (no new blocks for 10s = synced)
+  if (total !== lastKnownBlockCount) {
+    lastKnownBlockCount = total;
+    blockCountStableSince = Date.now();
+  }
+  const stableFor = Date.now() - blockCountStableSince;
+  const recentlyStarted = Date.now() - nodeStartedAt < 15000;
+  const isSyncing = recentlyStarted || stableFor < 10000;
+
+  if (!isRunning) {
+    syncEl.innerHTML = '<span style="color:var(--danger)">Node offline — start node to sync</span>';
+  } else if (total === 0 && isSyncing) {
+    syncEl.innerHTML = '<span class="spinner"></span> Connecting to relay and syncing...';
+  } else if (isSyncing) {
+    syncEl.innerHTML = `<span class="spinner"></span> Syncing — ${total} blocks &middot; ${accounts} accounts &middot; ${pending > 0 ? pending + ' pending' : 'confirming...'}`;
+  } else {
+    syncEl.innerHTML = `<span style="color:var(--success)">&#10003;</span> Synced — ${total} blocks &middot; ${accounts} accounts &middot; ${nodeStats.shards} shards`;
+  }
+
   if (blocks.length === 0) {
     tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted)">No blocks yet.</td></tr>';
+    loadMoreEl.style.display = 'none';
     return;
   }
-  tbody.innerHTML = blocks.map((b) => {
-    const status = node.ledger.getBlockStatus(b.hash);
-    const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : 'var(--warning)';
-    const typeClass = b.type === 'send' ? 'badge-transfer' : b.type === 'receive' ? 'badge-create' : b.type === 'deploy' ? 'badge-deploy' : 'badge-call';
-    return `<tr>
-      <td><span class="hash truncate">${trunc(b.hash, 14)}</span></td>
-      <td><span class="badge ${typeClass}">${b.type}</span></td>
-      <td>${resolveName(b.accountPub)}</td>
-      <td>${b.type === 'send' ? resolveName(b.recipient || '') : b.type === 'receive' ? resolveName(b.sendFrom || '') : '-'}</td>
-      <td>${b.amount || b.receiveAmount || (b.type === 'open' ? '1,000,000' : '-')}</td>
-      <td style="color:${statusColor}">${status}</td>
-    </tr>`;
-  }).join('');
+
+  tbody.innerHTML = blocks.map(renderExplorerRow).join('');
+
+  if (allBlocks.length > explorerDisplayCount) {
+    loadMoreEl.style.display = 'block';
+    loadMoreEl.textContent = `Load more (${explorerDisplayCount} of ${allBlocks.length})`;
+  } else {
+    loadMoreEl.style.display = 'none';
+  }
 }
 
 function refreshContracts() {
@@ -324,8 +386,12 @@ $('#btnStartNode').addEventListener('click', async () => {
   $('#btnStopNode').removeAttribute('disabled');
   $('#btnStartValidating').removeAttribute('disabled');
   $('#statusDot').classList.add('active');
+  setNodeDependentTabs(true);
   startKeepAlive(() => refreshTab());
   wireNodeEvents();
+  nodeStartedAt = Date.now();
+  lastKnownBlockCount = 0;
+  blockCountStableSince = 0;
   addLog('Node started', 'success');
   toast('Node started', 'success');
   refreshTab();
@@ -344,6 +410,7 @@ $('#btnStopNode').addEventListener('click', async () => {
   $('#btnStartValidating').setAttribute('disabled', '');
   $('#btnStopValidating').setAttribute('disabled', '');
   $('#statusDot').classList.remove('active');
+  setNodeDependentTabs(false);
   stopKeepAlive();
   addLog('Node stopped', 'warn');
   refreshNode();
@@ -462,7 +529,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     const keysJson = JSON.stringify(keys, null, 2);
     statusEl.innerHTML = `<div style="margin-top:12px;">
-      <span style="color:var(--success);font-weight:600;">Account created! +1,000,000 UNIT minted.</span><br>
+      <span style="color:var(--success);font-weight:600;">Account created! +${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT minted.</span><br>
       <div class="stat-item" style="margin-top:8px;"><div class="stat-label">Username</div><div class="stat-value small" style="user-select:all;">${username}</div></div>
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Public Key</div><div class="stat-value small" style="user-select:all;">${trunc(keys.pub, 40)}</div></div>
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Face Map Hash</div><div class="stat-value small" style="user-select:all;">${trunc(faceMap.hash, 24)}</div></div>
@@ -473,7 +540,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       <p style="color:var(--accent);font-size:12px;margin-top:8px;">Primary recovery: scan your face on any device. Backup: paste this key pair.</p>
     </div>`;
 
-    toast(`${username} created — 1,000,000 UNIT`, 'success');
+    toast(`${username} created — ${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT`, 'success');
     addLog(`Account created: ${username} (+1M UNIT, face-locked)`, 'success');
     refreshAccount(); refreshTransfer(); refreshContracts();
   } catch (err) {
@@ -613,7 +680,8 @@ $('#btnRecoverKeys').addEventListener('click', () => {
 $('#btnSendTx').addEventListener('click', async () => {
   const from = $<HTMLSelectElement>('#txFrom').value;
   const to = $<HTMLInputElement>('#txTo').value.trim().toLowerCase();
-  const amount = Number($<HTMLInputElement>('#txAmount').value);
+  const amountInput = $<HTMLInputElement>('#txAmount').value;
+  const amount = parseUNIT(amountInput);
   if (!from || !to || amount <= 0) { toast('Fill all fields', 'error'); return; }
 
   const sender = localAccounts.find((a) => a.username === from);
@@ -624,8 +692,8 @@ $('#btnSendTx').addEventListener('click', async () => {
 
   const sub = await node.submitBlock(result.block!);
   if (sub.success) {
-    toast(`Sent ${amount.toLocaleString()} UNIT to ${to}`, 'success');
-    addLog(`Send: ${amount.toLocaleString()} UNIT to ${to}`, 'success');
+    toast(`Sent ${formatUNIT(amount)} UNIT to ${to}`, 'success');
+    addLog(`Send: ${formatUNIT(amount)} UNIT to ${to}`, 'success');
     $<HTMLInputElement>('#txAmount').value = '';
     $<HTMLInputElement>('#txTo').value = '';
     refreshTab();
@@ -633,6 +701,11 @@ $('#btnSendTx').addEventListener('click', async () => {
 });
 
 // ──── Explorer ────
+$('#explorerLoadMore').addEventListener('click', () => {
+  explorerDisplayCount += EXPLORER_PAGE_SIZE;
+  refreshExplorer();
+});
+
 $('#btnExplorerSearch').addEventListener('click', () => {
   const query = $<HTMLInputElement>('#explorerSearch').value.trim().toLowerCase();
   if (!query) return;
@@ -643,10 +716,10 @@ $('#btnExplorerSearch').addEventListener('click', () => {
     const status = node.ledger.getBlockStatus(block.hash);
     const tally = node.ledger.votes.getTally(block.hash);
     detail.innerHTML = `<div class="card"><div class="card-title">Block Detail</div><div class="stats-grid">
-      <div class="stat-item"><div class="stat-label">Hash</div><div class="stat-value small">${block.hash}</div></div>
+      <div class="stat-item"><div class="stat-label">Hash</div><div class="stat-value small">${cpBtn(block.hash)}${block.hash}</div></div>
       <div class="stat-item"><div class="stat-label">Type</div><div class="stat-value small">${block.type}</div></div>
-      <div class="stat-item"><div class="stat-label">Account</div><div class="stat-value small">${resolveName(block.accountPub)}</div></div>
-      <div class="stat-item"><div class="stat-label">Balance</div><div class="stat-value">${block.balance.toLocaleString()} UNIT</div></div>
+      <div class="stat-item"><div class="stat-label">Account</div><div class="stat-value small">${cpBtn(block.accountPub)}${resolveName(block.accountPub)}</div></div>
+      <div class="stat-item"><div class="stat-label">Balance</div><div class="stat-value">${formatUNIT(block.balance)} UNIT</div></div>
       <div class="stat-item"><div class="stat-label">Status</div><div class="stat-value small">${status}</div></div>
       <div class="stat-item"><div class="stat-label">Approve Stake</div><div class="stat-value">${tally?.approveStake ?? 0}</div></div>
       <div class="stat-item"><div class="stat-label">Voters</div><div class="stat-value">${tally?.voterCount ?? 0}</div></div>
@@ -659,10 +732,10 @@ $('#btnExplorerSearch').addEventListener('click', () => {
   if (acc) {
     const chain = node.ledger.getAccountChain(acc.pub);
     detail.innerHTML = `<div class="card"><div class="card-title">Account: ${acc.username}</div><div class="stats-grid">
-      <div class="stat-item"><div class="stat-label">Public Key</div><div class="stat-value small">${acc.pub}</div></div>
-      <div class="stat-item"><div class="stat-label">Balance</div><div class="stat-value">${node.ledger.getAccountBalance(acc.pub).toLocaleString()} UNIT</div></div>
+      <div class="stat-item"><div class="stat-label">Public Key</div><div class="stat-value small">${cpBtn(acc.pub)}${acc.pub}</div></div>
+      <div class="stat-item"><div class="stat-label">Balance</div><div class="stat-value">${formatUNIT(node.ledger.getAccountBalance(acc.pub))} UNIT</div></div>
       <div class="stat-item"><div class="stat-label">Chain Length</div><div class="stat-value">${chain.length}</div></div>
-      <div class="stat-item"><div class="stat-label">Face Map</div><div class="stat-value small">${trunc(acc.faceMapHash, 20)}</div></div>
+      <div class="stat-item"><div class="stat-label">Face Map</div><div class="stat-value small">${cpBtn(acc.faceMapHash)}${trunc(acc.faceMapHash, 20)}</div></div>
     </div></div>`;
     return;
   }
@@ -709,15 +782,21 @@ function wireNodeEvents() {
     addLog(`Confirmed: ${block.type} by ${resolveName(block.accountPub)}`, 'success');
     refreshTab();
   });
+  node.on('block:conflict', (b: unknown) => {
+    const block = b as { hash: string; type: string; accountPub: string };
+    addLog(`CONFLICT: fork detected for ${block.type} by ${resolveName(block.accountPub)} — voting started`, 'warn');
+    refreshTab();
+  });
   node.on('block:rejected', (b: unknown) => {
     const block = b as { hash: string };
     addLog(`Rejected: ${trunc(block.hash)}`, 'error');
+    refreshTab();
   });
   node.on('peer:connected', (id: unknown) => { addLog(`Peer: ${trunc(String(id))}`, 'info'); refreshNode(); });
   node.on('peer:disconnected', (id: unknown) => { addLog(`Peer left: ${trunc(String(id))}`, 'warn'); refreshNode(); });
   node.on('auto:received', (data: unknown) => {
     const d = data as { from: string; amount: number };
-    addLog(`Auto-received: +${d.amount.toLocaleString()} UNIT`, 'success');
+    addLog(`Auto-received: +${formatUNIT(d.amount)} UNIT`, 'success');
     refreshTab();
   });
   node.on('contract:deployed', (data: unknown) => {
@@ -760,11 +839,12 @@ if (savedNetwork !== 'testnet') {
   $('#btnMainnet').className = 'btn btn-primary';
 }
 
-// Restore saved tab
+// Restore saved tab (skip disabled tabs)
 const savedTab = localStorage.getItem('neuronchain_tab');
-if (savedTab) {
-  const tabBtn = document.querySelector(`.tab-btn[data-tab="${savedTab}"]`);
-  if (tabBtn) {
+const disabledTabs = ['transfer', 'contracts'];
+if (savedTab && !disabledTabs.includes(savedTab)) {
+  const tabBtn = document.querySelector(`.tab-btn[data-tab="${savedTab}"]`) as HTMLButtonElement;
+  if (tabBtn && !tabBtn.disabled) {
     $$('.tab-btn').forEach((b) => b.classList.remove('active'));
     $$('.tab-panel').forEach((p) => p.classList.remove('active'));
     tabBtn.classList.add('active');

@@ -11,6 +11,7 @@ export interface NodeStats {
   network: NetworkType;
   peerId: string;
   peerCount: number;
+  shards: number;
 }
 
 export class NeuronNode extends EventEmitter {
@@ -18,18 +19,16 @@ export class NeuronNode extends EventEmitter {
   gunNet: GunNetwork;
   private status: 'stopped' | 'running' | 'validating' = 'stopped';
   private startTime: number | null = null;
-  private relays?: string[];
   private voteProcessInterval: ReturnType<typeof setInterval> | null = null;
   private resyncInterval: ReturnType<typeof setInterval> | null = null;
 
   /** Keys of locally owned accounts — used for auto-voting and auto-receiving */
   localKeys: Map<string, KeyPair> = new Map();
 
-  constructor(network: NetworkType = 'testnet', relays?: string[]) {
+  constructor(network: NetworkType = 'testnet') {
     super();
-    this.relays = relays;
     this.ledger = new DAGLedger(network);
-    this.gunNet = new GunNetwork(network, relays);
+    this.gunNet = new GunNetwork(network);
   }
 
   private wireEvents(): void {
@@ -69,7 +68,7 @@ export class NeuronNode extends EventEmitter {
       const result = await this.ledger.addBlock(b);
       if (result.success) {
         this.emit('block:received', b);
-        this.autoVote(b);
+        this.voteIfConflict(b);
         this.autoReceive(b);
       }
     });
@@ -84,6 +83,7 @@ export class NeuronNode extends EventEmitter {
     // Ledger events
     this.ledger.on('block:added', (block: unknown) => this.emit('block:added', block));
     this.ledger.on('block:confirmed', (block: unknown) => this.emit('block:confirmed', block));
+    this.ledger.on('block:conflict', (block: unknown) => this.emit('block:conflict', block));
     this.ledger.on('block:rejected', (block: unknown) => this.emit('block:rejected', block));
     this.ledger.on('contract:deployed', (data: unknown) => this.emit('contract:deployed', data));
     this.ledger.on('contract:executed', (data: unknown) => this.emit('contract:executed', data));
@@ -93,8 +93,14 @@ export class NeuronNode extends EventEmitter {
     this.gunNet.on('peer:disconnected', (peerId: unknown) => this.emit('peer:disconnected', peerId));
   }
 
-  /** Auto-vote on a block using all local accounts */
-  private async autoVote(block: AccountBlock): Promise<void> {
+  /**
+   * Vote on a block — only if it's in conflict (fork detected).
+   * Uncontested blocks are confirmed optimistically without voting.
+   */
+  private async voteIfConflict(block: AccountBlock): Promise<void> {
+    const status = this.ledger.votes.getStatus(block.hash);
+    if (status !== 'conflict') return; // No conflict — no vote needed
+
     for (const [pub, keys] of this.localKeys) {
       const balance = this.ledger.getAccountBalance(pub);
       if (balance <= 0) continue;
@@ -164,7 +170,7 @@ export class NeuronNode extends EventEmitter {
 
     // Periodic vote processing
     this.voteProcessInterval = setInterval(() => {
-      this.ledger.processVotes();
+      this.ledger.processConflicts();
     }, 3000);
 
     // Periodic resync from Gun (catches anything the live listeners missed)
@@ -216,7 +222,7 @@ export class NeuronNode extends EventEmitter {
             const result = await this.ledger.addBlock(block);
             if (result.success) {
               newBlocks++;
-              this.autoVote(block);
+              this.voteIfConflict(block);
               this.autoReceive(block);
             } else {
               console.log(`[Resync] Failed to add block ${block.hash.slice(0, 12)}: ${result.error}`);
@@ -298,7 +304,7 @@ export class NeuronNode extends EventEmitter {
     const result = await this.ledger.addBlock(block);
     if (result.success) {
       this.gunNet.publishBlock(block);
-      this.autoVote(block);
+      this.voteIfConflict(block);
     }
     return result;
   }
@@ -311,6 +317,7 @@ export class NeuronNode extends EventEmitter {
       network: this.ledger.network,
       peerId: netStats.peerId,
       peerCount: netStats.peerCount,
+      shards: netStats.shards,
     };
   }
 
@@ -318,7 +325,7 @@ export class NeuronNode extends EventEmitter {
     const wasRunning = this.status !== 'stopped';
     if (wasRunning) await this.stop();
     this.ledger = new DAGLedger(network);
-    this.gunNet = new GunNetwork(network, this.relays);
+    this.gunNet = new GunNetwork(network);
     this.emit('network:switched', network);
   }
 }

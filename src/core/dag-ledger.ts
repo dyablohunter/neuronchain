@@ -347,39 +347,42 @@ export class DAGLedger extends EventEmitter {
       acc.nonce = block.index;
     }
 
+    // Register with vote manager — optimistic confirmation or conflict detection
+    const result = this.votes.registerBlock(block.hash, block.previousHash, block.accountPub);
+
     this.txTimestamps.push(Date.now());
+
+    if (result === 'confirmed') {
+      this.emit('block:confirmed', block);
+    } else {
+      this.emit('block:conflict', block);
+    }
+
     this.emit('block:added', block);
     return { success: true };
   }
 
-  // ──── Voting ────
+  // ──── Conflict-Only Voting ────
 
   /**
-   * Cast a vote on a block (called when peer receives + validates a block).
+   * Cast a vote on a conflicted block.
+   * Only matters when two blocks share the same parent (fork).
    */
   castVote(vote: Vote): void {
     this.votes.addVote(vote);
-
-    const status = this.votes.getStatus(vote.blockHash);
-    if (status === 'confirmed') {
-      this.emit('block:confirmed', this.allBlocks.get(vote.blockHash));
-    } else if (status === 'rejected') {
-      this.handleRejectedBlock(vote.blockHash);
-    }
   }
 
   /**
-   * Check and update confirmation status for all pending blocks.
-   * Called periodically.
+   * Resolve active conflicts. Called periodically.
+   * Only processes blocks that are in conflict (fork detected).
    */
-  processVotes(): void {
-    for (const [hash] of this.allBlocks) {
-      const status = this.votes.getStatus(hash);
-      if (status === 'confirmed') {
-        this.emit('block:confirmed', this.allBlocks.get(hash));
-      } else if (status === 'rejected') {
-        this.handleRejectedBlock(hash);
-      }
+  processConflicts(): void {
+    const { confirmed, rejected } = this.votes.resolveConflicts();
+    for (const hash of confirmed) {
+      this.emit('block:confirmed', this.allBlocks.get(hash));
+    }
+    for (const hash of rejected) {
+      this.handleRejectedBlock(hash);
     }
   }
 

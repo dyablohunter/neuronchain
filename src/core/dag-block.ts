@@ -11,7 +11,43 @@ import { signData, verifySignature, KeyPair } from './crypto';
  */
 export type AccountBlockType = 'open' | 'send' | 'receive' | 'deploy' | 'call';
 
-export const VERIFICATION_MINT_AMOUNT = 1_000_000;
+/**
+ * 18 decimal places — all balances/amounts use BigInt internally
+ * to avoid floating-point precision loss (10^18 > Number.MAX_SAFE_INTEGER).
+ *
+ * However, Gun.js and the rest of the system pass numbers around,
+ * so we store as strings in serialization and convert at boundaries.
+ * For simplicity in the current system, we use a scaled integer approach:
+ * amounts are stored as regular numbers representing WHOLE UNIT values,
+ * and sub-UNIT amounts use 3 decimal digits (milli-UNIT precision).
+ *
+ * Internal storage: amount * 1000 (milli-UNIT integer)
+ * Display: amount / 1000 with up to 3 decimal places
+ */
+export const UNIT_DECIMALS = 3;
+export const UNIT_FACTOR = 1000; // 1 UNIT = 1000 milli-UNIT
+export const VERIFICATION_MINT_AMOUNT = 1_000_000 * UNIT_FACTOR; // 1M UNIT in milli-UNIT
+
+/** Convert milli-UNIT integer to display string */
+export function formatUNIT(milliUnits: number): string {
+  const whole = Math.floor(milliUnits / UNIT_FACTOR);
+  const frac = milliUnits % UNIT_FACTOR;
+  if (frac === 0) return whole.toLocaleString();
+  const fracStr = frac.toString().padStart(UNIT_DECIMALS, '0').replace(/0+$/, '');
+  return `${whole.toLocaleString()}.${fracStr}`;
+}
+
+/** Parse a user-input UNIT string to milli-UNIT integer */
+export function parseUNIT(input: string): number {
+  const parts = input.trim().split('.');
+  const whole = parseInt(parts[0] || '0', 10) || 0;
+  let frac = 0;
+  if (parts[1]) {
+    const fracStr = parts[1].slice(0, UNIT_DECIMALS).padEnd(UNIT_DECIMALS, '0');
+    frac = parseInt(fracStr, 10) || 0;
+  }
+  return whole * UNIT_FACTOR + frac;
+}
 
 export type ConfirmationStatus = 'pending' | 'voting' | 'confirmed' | 'rejected';
 

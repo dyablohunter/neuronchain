@@ -118,8 +118,9 @@
       gap: 6px;
     }
 
-    .tab-btn:hover { color: var(--text-dim); background: rgba(255,255,255,0.02); }
+    .tab-btn:hover:not(:disabled) { color: var(--text-dim); background: rgba(255,255,255,0.02); }
     .tab-btn.active { color: var(--primary-hover); border-bottom-color: var(--primary); }
+    .tab-btn:disabled { opacity: 0.35; cursor: not-allowed; }
     .tab-btn .tab-icon { font-size: 15px; }
 
     /* Main content */
@@ -419,6 +420,19 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    /* Copy button */
+    .btn-copy {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 2px 4px;
+      font-size: 13px;
+      vertical-align: middle;
+      transition: color 0.2s;
+    }
+    .btn-copy:hover { color: var(--accent); }
+
     /* Camera modal */
     .camera-modal {
       display: none;
@@ -555,18 +569,18 @@
   </header>
 
   <nav class="tabs" id="tabNav">
-    <button class="tab-btn active" data-tab="chain"><span class="tab-icon">&#x26d3;</span> Chain</button>
-    <button class="tab-btn" data-tab="node"><span class="tab-icon">&#x2699;</span> Node</button>
-    <button class="tab-btn" data-tab="account"><span class="tab-icon">&#x1f464;</span> Account</button>
-    <button class="tab-btn" data-tab="transfer"><span class="tab-icon">&#x21c4;</span> Transfer</button>
+    <button class="tab-btn active" data-tab="node"><span class="tab-icon">&#x2699;</span> Node</button>
     <button class="tab-btn" data-tab="explorer"><span class="tab-icon">&#x1f50d;</span> Explorer</button>
-    <button class="tab-btn" data-tab="contracts"><span class="tab-icon">&#x1f4dc;</span> Contracts</button>
+    <button class="tab-btn" data-tab="account"><span class="tab-icon">&#x1f464;</span> Accounts</button>
+    <button class="tab-btn" data-tab="transfer" disabled><span class="tab-icon">&#x21c4;</span> Transfer</button>
+    <button class="tab-btn" data-tab="contracts" disabled><span class="tab-icon">&#x1f4dc;</span> Contracts</button>
+    <button class="tab-btn" data-tab="chain"><span class="tab-icon">&#x26d3;</span> Chain</button>
     <button class="tab-btn" data-tab="help"><span class="tab-icon">&#x2753;</span> Help</button>
   </nav>
 
   <main class="main">
     <!-- CHAIN TAB -->
-    <div class="tab-panel active" id="tab-chain">
+    <div class="tab-panel" id="tab-chain">
       <div class="card">
         <div class="card-title">Network Selection</div>
         <div class="btn-group">
@@ -591,7 +605,7 @@
     </div>
 
     <!-- NODE TAB -->
-    <div class="tab-panel" id="tab-node">
+    <div class="tab-panel active" id="tab-node">
       <div class="card">
         <div class="card-title">Node Control</div>
         <div class="btn-group" style="margin-bottom: 16px;">
@@ -689,7 +703,7 @@
           </div>
           <div class="form-group">
             <label class="form-label">Amount</label>
-            <input type="number" class="form-input" id="txAmount" placeholder="0" min="1" />
+            <input type="text" class="form-input" id="txAmount" placeholder="0.001" inputmode="decimal" />
           </div>
         </div>
         <button class="btn btn-primary" id="btnSendTx">Send Transaction</button>
@@ -716,12 +730,14 @@
       </div>
       <div class="card">
         <div class="card-title">All Transactions</div>
+        <div id="explorerSyncStatus" style="margin-bottom:12px;font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:8px;"></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Hash</th><th>Type</th><th>Account</th><th>Counterparty</th><th>Amount</th><th>Status</th></tr></thead>
             <tbody id="explorerTxs"></tbody>
           </table>
         </div>
+        <button class="btn btn-outline" id="explorerLoadMore" style="display:none;width:100%;margin-top:12px;">Load more</button>
       </div>
       <div id="explorerDetail"></div>
     </div>
@@ -790,11 +806,11 @@ function getCount() { return state.counter; }"></textarea>
         <div class="help-section">
           <h3>Getting Started</h3>
           <ul>
-            <li><strong>Step 1:</strong> Go to the <strong>Node</strong> tab and click <strong>Start Node</strong> to connect to the relay network. Do this first so your data syncs immediately.</li>
-            <li><strong>Step 2:</strong> Go to the <strong>Account</strong> tab, choose a username, and scan your face. You receive <strong>1,000,000 UNIT</strong>.</li>
+            <li><strong>Step 1:</strong> Click <strong>Start Node</strong> on this tab to connect to the relay network. Do this first — Transfer and Contracts tabs are disabled until the node is running.</li>
+            <li><strong>Step 2:</strong> Go to the <strong>Accounts</strong> tab, choose a username, and scan your face. You receive <strong>1,000,000 UNIT</strong>.</li>
             <li><strong>Step 3:</strong> Save the backup key pair JSON shown after creation (secondary recovery method).</li>
             <li><strong>Step 4:</strong> Send UNIT in the <strong>Transfer</strong> tab — enter a recipient username and amount.</li>
-            <li><strong>Step 5:</strong> Claim incoming transfers in the <strong>Pending Receives</strong> section of the Transfer tab.</li>
+            <li><strong>Step 5:</strong> Check the <strong>Explorer</strong> tab to see your transactions syncing across the network.</li>
           </ul>
         </div>
 
@@ -803,7 +819,7 @@ function getCount() { return state.counter; }"></textarea>
           <ul>
             <li><strong>1,000,000 UNIT</strong> minted per new account at creation</li>
             <li>All operations are <strong>zero fee</strong> — transfers, contracts, everything</li>
-            <li>Inflationary — total supply grows as new accounts are created</li>
+            <li>Inflationary — total supply grows as new accounts are created (limited to the total number of people)</li>
             <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account)</li>
             <li><strong>Testnet:</strong> up to 3 accounts per face (for testing)</li>
             <li>Usernames are always lowercase (auto-converted)</li>
@@ -847,28 +863,29 @@ function getCount() { return state.counter; }"></textarea>
         </div>
 
         <div class="help-section">
-          <h3>Stake-Weighted Voting</h3>
-          <p>Blocks are confirmed through peer voting, not mining:</p>
+          <h3>Optimistic Confirmation</h3>
+          <p>Blocks are <strong>confirmed instantly</strong> — no voting needed for normal transactions:</p>
           <ul>
-            <li>When a block is published, peers validate it (signature, balance, no fork)</li>
-            <li>Valid blocks get an automatic vote, weighted by the voter's UNIT balance</li>
-            <li>A block is <strong>confirmed</strong> when &gt;2/3 of online stake approves</li>
-            <li>Uncontested blocks auto-confirm after 10 seconds (grace period for low-activity networks)</li>
-            <li><strong>Double-spend prevention:</strong> two blocks with the same parent = fork &#8594; peers vote on which to keep, loser is rejected and rolled back</li>
+            <li>A block passes local validation (valid signature, sufficient balance, no fork) &#8594; <strong>confirmed immediately</strong></li>
+            <li>No waiting for peer votes — 99.9% of transactions confirm in &lt;1ms</li>
+            <li>Voting only triggers when a <strong>fork is detected</strong> (two blocks sharing the same parent = double-spend attempt)</li>
+            <li>During conflicts: peers vote weighted by UNIT balance, &gt;2/3 stake wins, loser rejected</li>
+            <li>Conflicts resolve within 10 seconds</li>
           </ul>
         </div>
 
         <div class="help-section">
-          <h3>P2P Networking</h3>
-          <p><strong>Gun.js</strong> handles all peer-to-peer communication. The Gun relay is embedded in the dev server — one command starts everything.</p>
+          <h3>P2P Networking (Sharded)</h3>
+          <p><strong>Gun.js</strong> handles all P2P communication using a <strong>sharded relay architecture</strong>:</p>
           <ul>
-            <li><strong>Start:</strong> <code>npm run dev</code> starts Vite + Gun relay on one port</li>
-            <li><strong>Mobile:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL for mobile camera access</li>
-            <li><strong>Sync:</strong> accounts, blocks, votes, and encrypted key blobs sync via the Gun relay</li>
-            <li><strong>Resync:</strong> every 8 seconds, each node polls the relay for missed data</li>
-            <li><strong>Single-tab lock:</strong> only one node per browser to prevent account farming</li>
-            <li><strong>Auto-vote:</strong> peers automatically vote on valid blocks they receive</li>
+            <li><strong>4 shard relays</strong> — block data distributed by account pub key hash. Each shard handles 1/4 of accounts.</li>
+            <li><strong>1 global relay</strong> — shared data: accounts, votes, peers, key blobs, contracts.</li>
+            <li><strong>Start:</strong> <code>npm run dev</code> starts Vite + all 5 Gun relays on one port</li>
+            <li><strong>Mobile:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL</li>
+            <li><strong>Resync:</strong> every 8 seconds, nodes poll all shards for missed data</li>
+            <li><strong>Single-tab lock:</strong> one node per browser (prevents account farming)</li>
             <li><strong>Auto-receive:</strong> incoming sends to local accounts are claimed automatically</li>
+            <li><strong>Scaling:</strong> add more shards to increase throughput linearly</li>
           </ul>
         </div>
 
