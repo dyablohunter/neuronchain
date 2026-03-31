@@ -1,7 +1,7 @@
 import { NeuronNode } from './network/node';
 import { validateUsername, generateAccountKeys, buildAccount, AccountWithKeys } from './core/account';
 import { NetworkType } from './core/dag-ledger';
-import { KeyPair } from './core/crypto';
+import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock } from './core/dag-block';
 import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, captureFaceDescriptor } from './core/face-verify';
@@ -43,42 +43,89 @@ function toast(msg: string, type: 'success' | 'error' | 'info' = 'info') {
 
 const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString();
 const trunc = (s: string, n = 16) => s.length <= n ? s : s.slice(0, n) + '...';
-const cpBtn = (text: string) => `<button class="btn-copy" onclick="navigator.clipboard.writeText('${text}')" title="Copy">&#x2398;</button>`;
-const copyBtn = (text: string, display?: string) => `${cpBtn(text)}<span class="hash truncate">${display || trunc(text, 14)}</span>`;
+
+/** Escape HTML to prevent XSS when inserting user-supplied data into innerHTML */
+function escHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+const cpBtn = (text: string) => `<button class="btn-copy" onclick="navigator.clipboard.writeText('${escHtml(text)}')" title="Copy">&#x2398;</button>`;
+const copyBtn = (text: string, display?: string) => `${cpBtn(text)}<span class="hash truncate">${escHtml(display || trunc(text, 14))}</span>`;
 
 function addLog(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info') {
   const log = $('#nodeLog');
   const entry = document.createElement('div');
   entry.className = `log-entry ${level}`;
-  entry.innerHTML = `<span class="time">[${fmtTime(Date.now())}]</span><span class="msg">${msg}</span>`;
+  entry.innerHTML = `<span class="time">[${fmtTime(Date.now())}]</span><span class="msg">${escHtml(msg)}</span>`;
   log.appendChild(entry);
   log.scrollTop = log.scrollHeight;
 }
 
 function resolveName(pub: string): string {
-  for (const a of localAccounts) if (a.pub === pub) return a.username;
-  for (const [, acc] of node.ledger.accounts) if (acc.pub === pub) return acc.username;
-  return trunc(pub);
+  for (const a of localAccounts) if (a.pub === pub) return escHtml(a.username);
+  for (const [, acc] of node.ledger.accounts) if (acc.pub === pub) return escHtml(acc.username);
+  return escHtml(trunc(pub));
 }
 
-// ──── Wallet (localStorage — keys for active session only) ────
-function saveWallet() {
-  localStorage.setItem(WALLET_KEY, JSON.stringify(
-    localAccounts.map((a) => ({ username: a.username, pub: a.pub, keys: a.keys, createdAt: a.createdAt, faceMapHash: a.faceMapHash }))
-  ));
+// ──── Wallet (localStorage — encrypted with session key) ────
+const SESSION_KEY_NAME = 'neuronchain_session_key';
+
+async function getOrCreateSessionKey(): Promise<CryptoKey> {
+  const existing = sessionStorage.getItem(SESSION_KEY_NAME);
+  if (existing) {
+    const raw = Uint8Array.from(atob(existing), c => c.charCodeAt(0));
+    return crypto.subtle.importKey('raw', raw, 'AES-GCM', true, ['encrypt', 'decrypt']);
+  }
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  const exported = await crypto.subtle.exportKey('raw', key);
+  sessionStorage.setItem(SESSION_KEY_NAME, btoa(String.fromCharCode(...new Uint8Array(exported))));
+  return key;
 }
-function loadWallet() {
+
+async function saveWallet() {
+  const data = JSON.stringify(
+    localAccounts.map((a) => ({ username: a.username, pub: a.pub, keys: a.keys, createdAt: a.createdAt, faceMapHash: a.faceMapHash }))
+  );
+  try {
+    const key = await getOrCreateSessionKey();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = new TextEncoder().encode(data);
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+    const combined = new Uint8Array(iv.length + new Uint8Array(ciphertext).length);
+    combined.set(iv);
+    combined.set(new Uint8Array(ciphertext), iv.length);
+    localStorage.setItem(WALLET_KEY, btoa(String.fromCharCode(...combined)));
+  } catch {
+    // Fallback: store as-is if Web Crypto unavailable (shouldn't happen)
+    localStorage.setItem(WALLET_KEY, data);
+  }
+}
+
+async function loadWallet() {
   try {
     const raw = localStorage.getItem(WALLET_KEY);
     if (!raw) return;
-    localAccounts = (JSON.parse(raw) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string }[])
+    let parsed: string;
+    try {
+      // Try decrypting with session key
+      const key = await getOrCreateSessionKey();
+      const combined = Uint8Array.from(atob(raw), c => c.charCodeAt(0));
+      const iv = combined.slice(0, 12);
+      const ciphertext = combined.slice(12);
+      const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+      parsed = new TextDecoder().decode(decrypted);
+    } catch {
+      // Fallback: try parsing as plain JSON (migration from unencrypted format)
+      parsed = raw;
+    }
+    localAccounts = (JSON.parse(parsed) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string }[])
       .map((d) => ({ username: d.username, pub: d.pub, keys: d.keys, balance: 0, nonce: 0, createdAt: d.createdAt, faceMapHash: d.faceMapHash || '' }));
   } catch { /* corrupt */ }
 }
 
 function registerLocalKeys() {
   for (const acc of localAccounts) {
-    node.localKeys.set(acc.pub, acc.keys);
+    node.addLocalKey(acc.pub, acc.keys);
     node.ledger.registerAccount(buildAccount(acc.username, acc.pub, acc.faceMapHash));
   }
 }
@@ -118,6 +165,9 @@ $$('.tab-btn').forEach((btn) => {
     const tabId = btn.getAttribute('data-tab')!;
     $(`#tab-${tabId}`).classList.add('active');
     localStorage.setItem('neuronchain_tab', tabId);
+    if (['explorer', 'account', 'transfer', 'contracts'].includes(tabId)) {
+      node.requestResync();
+    }
     refreshTab();
   });
 });
@@ -183,7 +233,7 @@ function refreshNode() {
     <div class="stat-item"><div class="stat-label">Status</div><div class="stat-value small" style="color:${s.status === 'stopped' ? 'var(--danger)' : s.status === 'validating' ? 'var(--success)' : 'var(--accent)'}">${s.status.toUpperCase()}</div></div>
     <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${uptime}</div></div>
     <div class="stat-item"><div class="stat-label">Peers</div><div class="stat-value">${s.peerCount}</div></div>
-    <div class="stat-item"><div class="stat-label">Shards</div><div class="stat-value">${s.shards}</div></div>
+    <div class="stat-item"><div class="stat-label">Synapses</div><div class="stat-value">${s.synapses}</div></div>
     <div class="stat-item"><div class="stat-label">Peer ID</div><div class="stat-value small">${trunc(s.peerId, 16)}</div></div>
     <div class="stat-item"><div class="stat-label">Network</div><div class="stat-value small">${s.network}</div></div>
   `;
@@ -196,12 +246,12 @@ function refreshAccount() {
     : localAccounts.map((acc) => {
         const bal = node.ledger.getAccountBalance(acc.pub);
         return `<tr>
-          <td>${acc.username}</td>
-          <td><span class="hash truncate">${trunc(acc.pub, 20)}</span></td>
+          <td>${escHtml(acc.username)}</td>
+          <td><span class="hash truncate">${escHtml(trunc(acc.pub, 20))}</span></td>
           <td>${formatUNIT(bal)} UNIT</td>
           <td>
-            <button class="btn btn-outline" onclick="navigator.clipboard.writeText('${acc.username}')">Copy</button>
-            <button class="btn btn-delete-account" data-pub="${acc.pub}" style="background:var(--danger);color:#fff;margin-left:6px;">Delete</button>
+            <button class="btn btn-outline" onclick="navigator.clipboard.writeText('${escHtml(acc.username)}')">Copy</button>
+            <button class="btn btn-delete-account" data-pub="${escHtml(acc.pub)}" style="background:var(--danger);color:#fff;margin-left:6px;">Delete</button>
           </td>
         </tr>`;
       }).join('');
@@ -227,7 +277,7 @@ function refreshTransfer() {
   const select = $<HTMLSelectElement>('#txFrom');
   const currentValue = select.value;
   const newOptions = localAccounts.map((a) =>
-    `<option value="${a.username}">${a.username} (${formatUNIT(node.ledger.getAccountBalance(a.pub))} UNIT)</option>`
+    `<option value="${escHtml(a.username)}">${escHtml(a.username)} (${formatUNIT(node.ledger.getAccountBalance(a.pub))} UNIT)</option>`
   ).join('');
   if (select.innerHTML !== newOptions) {
     select.innerHTML = newOptions;
@@ -316,7 +366,7 @@ function refreshExplorer() {
   } else if (isSyncing) {
     syncEl.innerHTML = `<span class="spinner"></span> Syncing — ${total} blocks &middot; ${accounts} accounts &middot; ${pending > 0 ? pending + ' pending' : 'confirming...'}`;
   } else {
-    syncEl.innerHTML = `<span style="color:var(--success)">&#10003;</span> Synced — ${total} blocks &middot; ${accounts} accounts &middot; ${nodeStats.shards} shards`;
+    syncEl.innerHTML = `<span style="color:var(--success)">&#10003;</span> Synced — ${total} blocks &middot; ${accounts} accounts &middot; ${nodeStats.synapses} synapses`;
   }
 
   if (blocks.length === 0) {
@@ -337,15 +387,15 @@ function refreshExplorer() {
 
 function refreshContracts() {
   ['#contractFrom', '#callFrom'].forEach((sel) => {
-    $(sel).innerHTML = localAccounts.map((a) => `<option value="${a.username}">${a.username}</option>`).join('');
+    $(sel).innerHTML = localAccounts.map((a) => `<option value="${escHtml(a.username)}">${escHtml(a.username)}</option>`).join('');
   });
   const tbody = $('#contractsList');
   const contracts = Array.from(node.ledger.contracts.entries());
   tbody.innerHTML = contracts.length === 0
     ? '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">No contracts yet.</td></tr>'
     : contracts.map(([id, c]) => `<tr>
-        <td><span class="hash truncate">${trunc(id, 14)}</span></td><td>${c.name}</td><td>${resolveName(c.owner)}</td>
-        <td>${fmtTime(c.deployedAt)}</td><td><button class="btn btn-outline" onclick="document.getElementById('callContractId').value='${id}'">Call</button></td>
+        <td><span class="hash truncate">${escHtml(trunc(id, 14))}</span></td><td>${escHtml(c.name)}</td><td>${resolveName(c.owner)}</td>
+        <td>${fmtTime(c.deployedAt)}</td><td><button class="btn btn-outline" onclick="document.getElementById('callContractId').value='${escHtml(id)}'">Call</button></td>
       </tr>`).join('');
 }
 
@@ -408,6 +458,7 @@ $('#btnStartNode').addEventListener('click', async () => {
   setNodeDependentTabs(true);
   startKeepAlive(() => refreshTab());
   wireNodeEvents();
+  startRefreshInterval();
   nodeStartedAt = Date.now();
   lastKnownBlockCount = 0;
   blockCountStableSince = 0;
@@ -431,6 +482,8 @@ $('#btnStopNode').addEventListener('click', async () => {
   $('#statusDot').classList.remove('active');
   setNodeDependentTabs(false);
   stopKeepAlive();
+  stopRefreshInterval();
+  unwireNodeEvents();
   addLog('Node stopped', 'warn');
   refreshNode();
 });
@@ -535,14 +588,16 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     // Submit through node (publishes to Gun + BroadcastChannel, triggers auto-vote)
     await node.submitBlock(openBlock);
-    node.gunNet.saveAccount(keys.pub, { username, pub: keys.pub, balance: 1000000, nonce: 0, createdAt: account.createdAt, faceMapHash: faceMap.hash, faceDescriptor: JSON.stringify(faceMap.canonical) });
+    const accPayload = `account:${keys.pub}:${username}:${account.createdAt}:${faceMap.hash}`;
+    const accSig = await signData(accPayload, keys);
+    node.gunNet.saveAccount(keys.pub, { username, pub: keys.pub, balance: 1000000, nonce: 0, createdAt: account.createdAt, faceMapHash: faceMap.hash, faceDescriptor: JSON.stringify(faceMap.canonical), _sig: accSig });
     node.gunNet.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
     addLog('FaceID: Published block, account, and encrypted key blob', 'success');
 
     // Store locally
     const fullAcc: AccountWithKeys = { ...account, keys, balance: 1000000 };
     localAccounts.push(fullAcc);
-    node.localKeys.set(keys.pub, keys);
+    node.addLocalKey(keys.pub, keys);
     saveWallet();
     addLog('FaceID: Wallet saved locally', 'success');
 
@@ -647,7 +702,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     const fullAcc: AccountWithKeys = { ...account, keys, balance: 0 };
     if (!localAccounts.find((a) => a.pub === keys.pub)) {
       localAccounts.push(fullAcc);
-      node.localKeys.set(keys.pub, keys);
+      node.addLocalKey(keys.pub, keys);
       saveWallet();
     }
 
@@ -687,7 +742,7 @@ $('#btnRecoverKeys').addEventListener('click', () => {
     if (!localAccounts.find((a) => a.pub === keys.pub)) {
       const fullAcc: AccountWithKeys = { ...account, keys, balance: existing?.balance || 0 };
       localAccounts.push(fullAcc);
-      node.localKeys.set(keys.pub, keys);
+      node.addLocalKey(keys.pub, keys);
       saveWallet();
     }
 
@@ -798,7 +853,10 @@ $('#btnCallContract').addEventListener('click', async () => {
 });
 
 // ──── Node Events ────
+let nodeEventsWired = false;
 function wireNodeEvents() {
+  if (nodeEventsWired) return;
+  nodeEventsWired = true;
   node.on('block:confirmed', (b: unknown) => {
     const block = b as { type: string; accountPub: string };
     addLog(`Confirmed: ${block.type} by ${resolveName(block.accountPub)}`, 'success');
@@ -820,6 +878,10 @@ function wireNodeEvents() {
     const d = data as { from: string; amount: number };
     addLog(`Auto-received: +${formatUNIT(d.amount)} UNIT`, 'success');
     refreshTab();
+  });
+  node.on('inbox:signal', (data: unknown) => {
+    const sig = data as { sender: string; amount: number };
+    addLog(`Inbox: incoming ${formatUNIT(sig.amount)} UNIT from ${resolveName(sig.sender)}`, 'info');
   });
   node.on('contract:deployed', (data: unknown) => {
     addLog(`Contract: ${(data as { name: string }).name}`, 'success');
@@ -848,32 +910,53 @@ function wireNodeEvents() {
   });
 }
 
-setInterval(() => refreshTab(), 5000);
-
-// ──── Boot ────
-loadWallet();
-
-// Restore saved network UI
-if (savedNetwork !== 'testnet') {
-  $('#networkBadge').textContent = savedNetwork.toUpperCase();
-  $('#networkBadge').className = `network-badge ${savedNetwork}`;
-  $('#btnTestnet').className = 'btn btn-outline';
-  $('#btnMainnet').className = 'btn btn-primary';
+function unwireNodeEvents() {
+  if (!nodeEventsWired) return;
+  nodeEventsWired = false;
+  node.removeAllListeners();
+  node.gunNet.removeAllListeners();
 }
 
-// Restore saved tab (skip disabled tabs)
-const savedTab = localStorage.getItem('neuronchain_tab');
-const disabledTabs = ['transfer', 'contracts'];
-if (savedTab && !disabledTabs.includes(savedTab)) {
-  const tabBtn = document.querySelector(`.tab-btn[data-tab="${savedTab}"]`) as HTMLButtonElement;
-  if (tabBtn && !tabBtn.disabled) {
-    $$('.tab-btn').forEach((b) => b.classList.remove('active'));
-    $$('.tab-panel').forEach((p) => p.classList.remove('active'));
-    tabBtn.classList.add('active');
-    $(`#tab-${savedTab}`).classList.add('active');
+let refreshInterval: ReturnType<typeof setInterval> | null = null;
+
+function startRefreshInterval() {
+  stopRefreshInterval();
+  refreshInterval = setInterval(() => refreshTab(), 5000);
+}
+
+function stopRefreshInterval() {
+  if (refreshInterval) {
+    clearInterval(refreshInterval);
+    refreshInterval = null;
   }
 }
 
-refreshTab();
-addLog('NeuronChain initialized (Block-Lattice DAG, Face-Locked Keys)', 'info');
-addLog(`Network: ${savedNetwork} | Loaded ${localAccounts.length} account(s)`, 'info');
+// ──── Boot ────
+(async () => {
+  await loadWallet();
+
+  // Restore saved network UI
+  if (savedNetwork !== 'testnet') {
+    $('#networkBadge').textContent = savedNetwork.toUpperCase();
+    $('#networkBadge').className = `network-badge ${savedNetwork}`;
+    $('#btnTestnet').className = 'btn btn-outline';
+    $('#btnMainnet').className = 'btn btn-primary';
+  }
+
+  // Restore saved tab (skip disabled tabs)
+  const savedTab = localStorage.getItem('neuronchain_tab');
+  const disabledTabs = ['transfer', 'contracts'];
+  if (savedTab && !disabledTabs.includes(savedTab)) {
+    const tabBtn = document.querySelector(`.tab-btn[data-tab="${savedTab}"]`) as HTMLButtonElement;
+    if (tabBtn && !tabBtn.disabled) {
+      $$('.tab-btn').forEach((b) => b.classList.remove('active'));
+      $$('.tab-panel').forEach((p) => p.classList.remove('active'));
+      tabBtn.classList.add('active');
+      $(`#tab-${savedTab}`).classList.add('active');
+    }
+  }
+
+  refreshTab();
+  addLog('NeuronChain initialized (Block-Lattice DAG, Face-Locked Keys)', 'info');
+  addLog(`Network: ${savedNetwork} | Loaded ${localAccounts.length} account(s)`, 'info');
+})();

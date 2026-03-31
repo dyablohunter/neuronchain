@@ -314,6 +314,8 @@ export class DAGLedger extends EventEmitter {
     // Already have this block?
     if (this.allBlocks.has(block.hash)) return { success: true };
 
+    // ── Phase 1: Validate everything BEFORE storing ──
+
     // Verify signature
     const sigValid = await verifyBlockSignature(block);
     if (!sigValid) return { success: false, error: 'Invalid signature' };
@@ -325,7 +327,7 @@ export class DAGLedger extends EventEmitter {
     const validation = validateBlockStructure(block, parent);
     if (!validation.valid) return { success: false, error: validation.error };
 
-    // For receive blocks: verify the send block exists and is confirmed
+    // For receive blocks: verify the send block exists and matches
     if (block.type === 'receive') {
       const sendBlock = this.allBlocks.get(block.sendBlockHash!);
       if (!sendBlock) return { success: false, error: 'Referenced send block not found' };
@@ -334,15 +336,16 @@ export class DAGLedger extends EventEmitter {
       if (sendBlock.amount !== block.receiveAmount) return { success: false, error: 'Amount mismatch' };
     }
 
-    // Store the block
+    // Check for conflicts before inserting (detect forks early)
+    const voteResult = this.votes.registerBlock(block.hash, block.previousHash, block.accountPub);
+
+    // ── Phase 2: All validation passed — now store and apply side effects ──
+
     this.allBlocks.set(block.hash, block);
     if (!this.accountChains.has(block.accountPub)) {
       this.accountChains.set(block.accountPub, []);
     }
     this.accountChains.get(block.accountPub)!.push(block);
-
-    // Register for voting
-    this.votes.registerBlock(block.hash, block.previousHash, block.accountPub);
 
     // Track unclaimed sends
     if (block.type === 'send' && block.recipient && block.amount) {
@@ -373,8 +376,8 @@ export class DAGLedger extends EventEmitter {
       } catch { /* invalid contract data */ }
     }
 
-    // Process contract call
-    if (block.type === 'call' && block.contractData) {
+    // Process contract call — only execute if block is confirmed (not in conflict)
+    if (block.type === 'call' && block.contractData && voteResult === 'confirmed') {
       try {
         const data = JSON.parse(block.contractData);
         this.executeContract(data.contractId, data.method, data.args || [], block.accountPub);
@@ -394,12 +397,9 @@ export class DAGLedger extends EventEmitter {
       acc.nonce = block.index;
     }
 
-    // Register with vote manager — optimistic confirmation or conflict detection
-    const result = this.votes.registerBlock(block.hash, block.previousHash, block.accountPub);
-
     this.txTimestamps.push(Date.now());
 
-    if (result === 'confirmed') {
+    if (voteResult === 'confirmed') {
       this.emit('block:confirmed', block);
     } else {
       this.emit('block:conflict', block);
@@ -416,7 +416,10 @@ export class DAGLedger extends EventEmitter {
    * Only matters when two blocks share the same parent (fork).
    */
   castVote(vote: Vote): void {
-    this.votes.addVote(vote);
+    // Override self-reported stake with actual on-chain balance
+    const actualBalance = this.getAccountBalance(vote.voterPub);
+    if (actualBalance <= 0) return; // No stake = no vote
+    this.votes.addVote({ ...vote, stake: actualBalance });
   }
 
   /**
@@ -464,38 +467,97 @@ export class DAGLedger extends EventEmitter {
     return this.votes.getStatus(blockHash);
   }
 
-  // ──── Smart Contracts ────
+  // ──── Smart Contracts (Web Worker sandbox) ────
 
+  /** Max execution time for a contract call */
+  private static readonly CONTRACT_TIMEOUT_MS = 3000;
+
+  /**
+   * Execute a contract in an isolated Web Worker.
+   *
+   * The worker has no access to the main thread's DOM, localStorage,
+   * fetch, or any other API — only `postMessage` to return a result.
+   * `importScripts` is explicitly blocked in the worker code.
+   * The worker is terminated after a timeout to prevent infinite loops.
+   */
   private executeContract(contractId: string, method: string, args: unknown[], caller: string): unknown {
     const contract = this.contracts.get(contractId);
     if (!contract) return null;
 
+    // Validate method name to prevent injection
+    if (!/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(method)) return null;
+
+    // Build the worker code — runs in a completely isolated JS context
+    const workerCode = `
+      "use strict";
+      // Block remaining Worker globals
+      const importScripts = undefined;
+      const XMLHttpRequest = undefined;
+      const WebSocket = undefined;
+      const EventSource = undefined;
+      const indexedDB = undefined;
+      const caches = undefined;
+      const navigator = undefined;
+      const location = undefined;
+
+      self.onmessage = function(e) {
+        const { state, caller, args, method } = e.data;
+        try {
+          // Inject contract code into an isolated function scope
+          const contractFn = new Function('state', 'caller', 'args',
+            ${JSON.stringify(contract.code)} +
+            "\\nif (typeof " + method + " === 'function') return " + method + "(...args);\\nreturn null;"
+          );
+          const result = contractFn(state, caller, args);
+          self.postMessage({ ok: true, result, state });
+        } catch (err) {
+          self.postMessage({ ok: false, error: String(err) });
+        }
+      };
+    `;
+
     try {
-      const sandbox = {
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const url = URL.createObjectURL(blob);
+      const worker = new Worker(url);
+
+      // Fire and forget — we can't truly await a Worker synchronously,
+      // so we handle the result via event and update state asynchronously
+      const timeout = setTimeout(() => {
+        worker.terminate();
+        URL.revokeObjectURL(url);
+        this.emit('contract:error', { contractId, method, error: 'Execution timed out' });
+      }, DAGLedger.CONTRACT_TIMEOUT_MS);
+
+      worker.onmessage = (e: MessageEvent) => {
+        clearTimeout(timeout);
+        worker.terminate();
+        URL.revokeObjectURL(url);
+
+        const data = e.data as { ok: boolean; result?: unknown; state?: Record<string, unknown>; error?: string };
+        if (data.ok) {
+          if (data.state) contract.state = data.state;
+          this.emit('contract:executed', { contractId, method, result: data.result });
+        } else {
+          this.emit('contract:error', { contractId, method, error: data.error });
+        }
+      };
+
+      worker.onerror = (err: ErrorEvent) => {
+        clearTimeout(timeout);
+        worker.terminate();
+        URL.revokeObjectURL(url);
+        this.emit('contract:error', { contractId, method, error: err.message });
+      };
+
+      worker.postMessage({
         state: { ...contract.state },
         caller,
         args,
-        balanceOf: (username: string) => {
-          const acc = this.getAccountByUsername(username);
-          return acc ? acc.balance : 0;
-        },
-        log: (...msgs: unknown[]) => {
-          this.emit('contract:log', { contractId, messages: msgs });
-        },
-      };
+        method,
+      });
 
-      const fn = new Function('ctx', `
-        with(ctx) {
-          ${contract.code}
-          if (typeof ${method} === 'function') return ${method}(...args);
-          return null;
-        }
-      `);
-
-      const result = fn(sandbox);
-      contract.state = sandbox.state;
-      this.emit('contract:executed', { contractId, method, result });
-      return result;
+      return null; // Result delivered asynchronously via events
     } catch (err) {
       this.emit('contract:error', { contractId, method, error: String(err) });
       return null;

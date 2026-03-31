@@ -802,8 +802,8 @@ function getCount() { return state.counter; }"></textarea>
         <div class="help-section">
           <h3>Getting Started</h3>
           <ul>
-            <li><strong>Step 1:</strong> Click <strong>Start Node</strong> on this tab to connect to the relay network. Do this first — Transfer and Contracts tabs are disabled until the node is running.</li>
-            <li><strong>Step 2:</strong> Go to the <strong>Accounts</strong> tab, choose a username, and scan your face. You receive <strong>1,000,000 UNIT</strong>.</li>
+            <li><strong>Step 1:</strong> Go to the <strong>Node</strong> tab and click <strong>Start Node</strong> to connect to the relay network. Do this first — Transfer and Contracts tabs are disabled until the node is running.</li>
+            <li><strong>Step 2:</strong> Go to the <strong>Accounts</strong> tab, choose a username (3-24 chars, lowercase alphanumeric + dot), and scan your face. You receive <strong>1,000,000 UNIT</strong>.</li>
             <li><strong>Step 3:</strong> Save the backup key pair JSON shown after creation (secondary recovery method).</li>
             <li><strong>Step 4:</strong> Send UNIT in the <strong>Transfer</strong> tab — enter a recipient username and amount.</li>
             <li><strong>Step 5:</strong> Check the <strong>Explorer</strong> tab to see your transactions syncing across the network.</li>
@@ -814,6 +814,7 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Neuron Unit (UNIT)</h3>
           <ul>
             <li><strong>1,000,000 UNIT</strong> minted per new account at creation</li>
+            <li><strong>3 decimal precision</strong> (milli-UNIT) — smallest transferable unit is 0.001 UNIT</li>
             <li>All operations are <strong>zero fee</strong> — transfers, contracts, everything</li>
             <li>Inflationary — total supply grows as new accounts are created (limited to the total number of people)</li>
             <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account)</li>
@@ -826,12 +827,13 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Face-Locked Keys</h3>
           <p>Account creation requires a face scan. Your private key is <strong>encrypted with your face</strong>:</p>
           <ul>
-            <li><strong>Liveness check:</strong> Slowly turn your head left and right — movement detection prevents photo and deepfake attacks</li>
-            <li><strong>Face enrollment:</strong> 3 captures are averaged into a stable 128-dimensional face descriptor</li>
+            <li><strong>Liveness check:</strong> Slowly turn your head left and right — movement detection requires at least 30 pixels of nose travel and 2 direction reversals to prevent photo and video replay attacks</li>
+            <li><strong>Face enrollment:</strong> 3 captures are averaged into a stable 128-dimensional face descriptor (face-api.js, 99.38% accuracy on LFW)</li>
             <li><strong>Quantization:</strong> The descriptor is quantized into stable bins so the same face produces the same key across sessions</li>
             <li><strong>Key derivation:</strong> Quantized descriptor &#8594; PBKDF2 (100K iterations) &#8594; AES-256-GCM encryption key</li>
             <li><strong>Key encryption:</strong> Your ECDSA key pair is encrypted with the face-derived AES key</li>
             <li><strong>On-chain storage:</strong> The encrypted blob is stored on the Gun relay — available from any device, but only your face can decrypt it</li>
+            <li><strong>Local wallet:</strong> Keys are encrypted with a per-session AES key in localStorage — cleared when the browser session ends</li>
             <li><strong>Backup:</strong> A JSON key pair is shown once at creation — save it as a secondary recovery method</li>
             <li><strong>Privacy:</strong> Only a SHA-256 hash of the face map is stored publicly. No images or raw descriptors leave the browser.</li>
           </ul>
@@ -862,33 +864,52 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Optimistic Confirmation</h3>
           <p>Blocks are <strong>confirmed instantly</strong> — no voting needed for normal transactions:</p>
           <ul>
-            <li>A block passes local validation (valid signature, sufficient balance, no fork) &#8594; <strong>confirmed immediately</strong></li>
+            <li>A block passes local validation (valid SHA-256 hash, ECDSA signature, sufficient balance, no fork) &#8594; <strong>confirmed immediately</strong></li>
             <li>No waiting for peer votes — 99.9% of transactions confirm in &lt;1ms</li>
             <li>Voting only triggers when a <strong>fork is detected</strong> (two blocks sharing the same parent = double-spend attempt)</li>
-            <li>During conflicts: peers vote weighted by UNIT balance, &gt;2/3 stake wins, loser rejected</li>
+            <li>During conflicts: peers vote weighted by their <strong>verified on-chain UNIT balance</strong> (self-reported stakes are overridden), &gt;2/3 stake wins, loser rejected</li>
             <li>Conflicts resolve within 10 seconds</li>
+            <li>Vote replay protection: duplicate signatures are rejected, votes older than 60 seconds are ignored</li>
           </ul>
         </div>
 
         <div class="help-section">
-          <h3>P2P Networking (Sharded)</h3>
-          <p><strong>Gun.js</strong> handles all P2P communication using a <strong>sharded relay architecture</strong>:</p>
+          <h3>P2P Networking</h3>
+          <p><strong>Gun.js</strong> handles all P2P communication using a <strong>path-sharded relay</strong>:</p>
           <ul>
-            <li><strong>4 shard relays</strong> — block data distributed by account pub key hash. Each shard handles 1/4 of accounts.</li>
-            <li><strong>1 global relay</strong> — shared data: accounts, votes, peers, key blobs, contracts.</li>
-            <li><strong>Start:</strong> <code>npm run dev</code> starts Vite + all 5 Gun relays on one port</li>
-            <li><strong>Mobile:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL</li>
-            <li><strong>Resync:</strong> every 8 seconds, nodes poll all shards for missed data</li>
+            <li><strong>1 Gun relay</strong> with data split across <strong>4 synapse paths</strong> by <code>hash(accountPub) % 4</code></li>
+            <li><strong>Global path</strong> — shared data: accounts, votes, peers, key blobs, contracts</li>
+            <li><strong>Start:</strong> <code>npm run dev</code> starts Vite + Gun relay on one port</li>
+            <li><strong>Testing Tunnel:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL for multiple devices access</li>
+            <li><strong>Resync:</strong> on-demand when switching tabs, with a 60-second background fallback</li>
             <li><strong>Single-tab lock:</strong> one node per browser (prevents account farming)</li>
             <li><strong>Auto-receive:</strong> incoming sends to local accounts are claimed automatically</li>
-            <li><strong>Scaling:</strong> add more shards to increase throughput linearly</li>
+            <li><strong>Inbox signals:</strong> senders notify recipients via a lightweight Gun path, triggering instant resync on the receiver's device</li>
+            <li><strong>Production scaling:</strong> synapse paths map 1:1 to separate relay URLs — point each at a different server when needed</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Security</h3>
+          <ul>
+            <li><strong>SHA-256 block hashing</strong> — all block hashes computed via Web Crypto API</li>
+            <li><strong>ECDSA signatures</strong> — every block is signed by its author and verified on receipt</li>
+            <li><strong>Server-side validation</strong> — the Gun relay verifies ECDSA signatures before storing blocks, accounts, and votes</li>
+            <li><strong>Rate limiting</strong> — the relay enforces per-connection write limits (60 burst, 20/s sustained) to prevent flooding</li>
+            <li><strong>Null write protection</strong> — malicious deletion of accounts, key blobs, and other protected data is blocked server-side</li>
+            <li><strong>Signed accounts</strong> — account data is ECDSA-signed by the owner; peers and the relay reject unsigned or spoofed accounts</li>
+            <li><strong>Sandboxed contracts</strong> — smart contracts execute in an isolated Web Worker with no access to DOM, localStorage, fetch, or other browser APIs; terminated after 3 seconds to prevent infinite loops</li>
+            <li><strong>Balance overflow protection</strong> — all balances and amounts are validated against <code>Number.isSafeInteger</code> before acceptance</li>
+            <li><strong>Generation counter</strong> — testnet resets increment a generation number; stale data from before the reset is automatically ignored by all peers</li>
+            <li><strong>Encrypted local wallet</strong> — keys in localStorage are AES-256-GCM encrypted with a per-session key (cleared when the browser session ends)</li>
+            <li><strong>XSS protection</strong> — all peer-supplied data (usernames, hashes, contract names) is HTML-escaped before rendering</li>
           </ul>
         </div>
 
         <div class="help-section">
           <h3>Networks</h3>
           <ul>
-            <li><strong>Testnet:</strong> Up to 3 accounts per face. Can be reset from the Chain tab (wipes everything). For development and testing.</li>
+            <li><strong>Testnet:</strong> Up to 3 accounts per face. Can be reset from the Chain tab (wipes everything, increments generation counter). For development and testing.</li>
             <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account). Cannot be reset. Production network.</li>
           </ul>
           <p style="margin-top: 8px;">Both networks mint 1,000,000 UNIT per account and have zero fees.</p>
@@ -896,7 +917,7 @@ function getCount() { return state.counter; }"></textarea>
 
         <div class="help-section">
           <h3>Smart Contracts</h3>
-          <p>Write contracts in JavaScript. Your code has access to:</p>
+          <p>Write contracts in JavaScript. Contracts execute in an <strong>isolated Web Worker sandbox</strong> — no access to the page, network, or storage APIs. Your code has access to:</p>
           <ul>
             <li><code>state</code> — persistent key-value storage for the contract</li>
             <li><code>caller</code> — public key of the account calling the contract</li>
@@ -904,6 +925,7 @@ function getCount() { return state.counter; }"></textarea>
             <li><code>balanceOf(username)</code> — check any account's balance</li>
             <li><code>log(...msgs)</code> — emit log messages</li>
           </ul>
+          <p style="margin-top: 8px;">Contracts are terminated after 3 seconds if they haven't returned. Contract calls on conflicted blocks are not executed until the conflict is resolved.</p>
           <p style="margin-top: 8px;">Example contract:</p>
           <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 13px; overflow-x: auto;"><code>function init() {
   state.counter = 0;
@@ -918,6 +940,19 @@ function increment() {
 function getCount() {
   return state.counter;
 }</code></pre>
+        </div>
+
+        <div class="help-section">
+          <h3>Technical Specs</h3>
+          <ul>
+            <li><strong>Key pairs:</strong> ECDSA (Gun SEA)</li>
+            <li><strong>Block hashing:</strong> SHA-256 (Web Crypto API)</li>
+            <li><strong>Face key derivation:</strong> PBKDF2 (100K iterations) &#8594; AES-256-GCM</li>
+            <li><strong>Face descriptor:</strong> 128 dimensions, quantized to 0.05 bins</li>
+            <li><strong>Consensus:</strong> Optimistic confirmation, conflict-only stake-weighted voting (&gt;2/3 threshold, 10s timeout)</li>
+            <li><strong>P2P:</strong> Gun.js (WebSocket), path-sharded relay, real-time listeners + polling fallback</li>
+            <li><strong>Keep-alive:</strong> Wake Lock API + Web Worker heartbeat + silent audio (prevents tab suspension)</li>
+          </ul>
         </div>
       </div>
     </div>

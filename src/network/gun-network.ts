@@ -4,25 +4,25 @@ import { EventEmitter } from '../core/events';
 import { AccountBlock } from '../core/dag-block';
 import { Vote } from '../core/vote';
 
-export const NUM_SHARDS = 4;
+export const NUM_SYNAPSES = 4;
 
 export interface NetworkStats {
   peerId: string;
   peerCount: number;
   isRunning: boolean;
-  shards: number;
+  synapses: number;
   startedAt: number | null;
 }
 
 /**
- * Determine which shard an account belongs to.
+ * Determine which synapse an account belongs to.
  */
-export function getShardIndex(accountPub: string): number {
+export function getSynapseIndex(accountPub: string): number {
   let hash = 0;
   for (let i = 0; i < accountPub.length; i++) {
     hash = ((hash << 5) - hash + accountPub.charCodeAt(i)) | 0;
   }
-  return Math.abs(hash) % NUM_SHARDS;
+  return Math.abs(hash) % NUM_SYNAPSES;
 }
 
 function getRelayUrl(): string {
@@ -31,27 +31,29 @@ function getRelayUrl(): string {
 }
 
 /**
- * Gun.js P2P network — single connection, internally sharded.
+ * Gun.js P2P network — single connection, path-sharded.
  *
- * One Gun instance connects to one relay. Data is sharded by
- * splitting the Gun graph into shard paths:
+ * One Gun instance connects to one relay. Data is split by
+ * synapse paths in the Gun graph:
  *
- * neuronchain/{network}/accounts/{pub}             — account metadata (flat, proven to sync)
- * neuronchain/{network}/votes/...                  — conflict votes
- * neuronchain/{network}/peers/...                  — peer presence
- * neuronchain/{network}/keyblobs/{pub}             — encrypted key blobs
- * neuronchain/{network}/contracts/{id}             — contracts
- * neuronchain/{network}/shard-0/dag/{pub}/{idx}    — blocks for shard 0
- * neuronchain/{network}/shard-1/dag/{pub}/{idx}    — blocks for shard 1
- * ...
+ *   neuronchain/{network}/accounts/{pub}               — account metadata
+ *   neuronchain/{network}/votes/...                    — conflict votes
+ *   neuronchain/{network}/peers/...                    — peer presence
+ *   neuronchain/{network}/keyblobs/{pub}               — encrypted key blobs
+ *   neuronchain/{network}/contracts/{id}               — contracts
+ *   neuronchain/{network}/synapse-0/dag/{pub}/{idx}    — blocks for synapse 0
+ *   neuronchain/{network}/synapse-1/dag/{pub}/{idx}    — blocks for synapse 1
+ *   ...
  *
- * This gives the same logical sharding without multiple WebSocket connections.
+ * The synapse paths map 1:1 to separate relay URLs, so for production
+ * scaling you can point each synapse at a different Gun relay server
+ * by changing getRelayUrl() to return per-synapse URLs.
  */
 export class GunNetwork extends EventEmitter {
   private gun!: ReturnType<typeof Gun>;
   private root!: ReturnType<ReturnType<typeof Gun>['get']>;
   private globalDb!: ReturnType<ReturnType<typeof Gun>['get']>;
-  private shardDbs: ReturnType<ReturnType<typeof Gun>['get']>[] = [];
+  private synapseDbs: ReturnType<ReturnType<typeof Gun>['get']>[] = [];
 
   private network: string;
   private running = false;
@@ -60,11 +62,30 @@ export class GunNetwork extends EventEmitter {
   private trackedPeers: Map<string, { id: string; lastSeen: number }> = new Map();
   private processedBlocks: Set<string> = new Set();
   private processedVotes: Set<string> = new Set();
+  private peerHeartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private static readonly MAX_PROCESSED = 50000;
+  /** Generation counter — incremented on reset, data from older generations is ignored */
+  private generation = 0;
 
   constructor(network: string) {
     super();
     this.network = network;
     this.peerId = this.generatePeerId();
+    this.loadGeneration();
+  }
+
+  private get generationKey(): string {
+    return `neuronchain_generation_${this.network}`;
+  }
+
+  private loadGeneration(): void {
+    try {
+      this.generation = parseInt(localStorage.getItem(this.generationKey) || '0', 10) || 0;
+    } catch { this.generation = 0; }
+  }
+
+  private saveGeneration(): void {
+    try { localStorage.setItem(this.generationKey, String(this.generation)); } catch {}
   }
 
   private generatePeerId(): string {
@@ -73,15 +94,15 @@ export class GunNetwork extends EventEmitter {
     return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
-  private getShardDb(accountPub: string) {
-    return this.shardDbs[getShardIndex(accountPub)];
+  private getSynapseDb(accountPub: string) {
+    return this.synapseDbs[getSynapseIndex(accountPub)];
   }
 
   async start(): Promise<void> {
     if (this.running) return;
 
     const relayUrl = getRelayUrl();
-    console.log(`[GunNet] Connecting to ${relayUrl} (${NUM_SHARDS} internal shards)`);
+    console.log(`[GunNet] Connecting to ${relayUrl} (${NUM_SYNAPSES} synapse paths)`);
 
     this.gun = Gun({
       peers: [relayUrl],
@@ -102,16 +123,27 @@ export class GunNetwork extends EventEmitter {
     });
 
     this.root = this.gun.get(`neuronchain/${this.network}`);
-    this.globalDb = this.root; // accounts/votes/peers at top level (proven to sync)
+    this.globalDb = this.root;
 
-    for (let i = 0; i < NUM_SHARDS; i++) {
-      this.shardDbs.push(this.root.get(`shard-${i}`));
+    for (let i = 0; i < NUM_SYNAPSES; i++) {
+      this.synapseDbs.push(this.root.get(`synapse-${i}`));
     }
+
+    // Listen for generation updates from peers (e.g. after a testnet reset)
+    this.globalDb.get('_generation').on((data: unknown) => {
+      if (typeof data === 'number' && data > this.generation) {
+        console.log(`[GunNet] Generation updated: ${this.generation} → ${data}`);
+        this.generation = data;
+        this.saveGeneration();
+      }
+    });
 
     // Live listeners — global (accounts, votes)
     this.globalDb.get('accounts').map().on((data: unknown) => {
       if (!data || typeof data !== 'object') return;
       const acc = data as Record<string, unknown>;
+      // Reject stale data from before a reset
+      if (typeof acc._gen === 'number' && (acc._gen as number) < this.generation) return;
       if (acc.pub && acc.username) this.emit('account:synced', acc);
     });
 
@@ -121,17 +153,22 @@ export class GunNetwork extends EventEmitter {
       const voteKey = `${vote.blockHash}:${vote.voterPub}`;
       if (vote.blockHash && vote.voterPub && !this.processedVotes.has(voteKey)) {
         this.processedVotes.add(voteKey);
+        this.capSet(this.processedVotes);
         this.emit('vote:received', vote);
       }
     });
 
-    // Live listeners — each shard (blocks)
-    for (let i = 0; i < NUM_SHARDS; i++) {
-      this.shardDbs[i].get('dag').map().map().on((data: unknown) => {
+    // Live listeners — each synapse (blocks)
+    for (let i = 0; i < NUM_SYNAPSES; i++) {
+      this.synapseDbs[i].get('dag').map().map().on((data: unknown) => {
         if (!data || typeof data !== 'object') return;
-        const block = this.deserializeBlock(data as Record<string, unknown>);
+        const raw = data as Record<string, unknown>;
+        // Reject data from older generations (stale data after a reset)
+        if (typeof raw._gen === 'number' && raw._gen < this.generation) return;
+        const block = this.deserializeBlock(raw);
         if (block && !this.processedBlocks.has(block.hash)) {
           this.processedBlocks.add(block.hash);
+          this.capSet(this.processedBlocks);
           this.emit('block:received', block);
         }
       });
@@ -152,7 +189,7 @@ export class GunNetwork extends EventEmitter {
       }
     });
 
-    setInterval(() => {
+    this.peerHeartbeatInterval = setInterval(() => {
       if (!this.running) return;
       this.globalDb.get('peers').get(this.peerId).put({ lastSeen: Date.now() });
       const now = Date.now();
@@ -173,8 +210,28 @@ export class GunNetwork extends EventEmitter {
     if (!this.running) return;
     this.globalDb.get('peers').get(this.peerId).put({ lastSeen: 0 });
     this.running = false;
+    if (this.peerHeartbeatInterval) {
+      clearInterval(this.peerHeartbeatInterval);
+      this.peerHeartbeatInterval = null;
+    }
     this.trackedPeers.clear();
+    this.capSet(this.processedBlocks);
+    this.capSet(this.processedVotes);
     this.emit('network:stopped');
+  }
+
+  private capSet(set: Set<string>): void {
+    if (set.size > GunNetwork.MAX_PROCESSED) {
+      const excess = set.size - GunNetwork.MAX_PROCESSED;
+      const toDelete: string[] = [];
+      let count = 0;
+      for (const v of set) {
+        if (count < excess) toDelete.push(v);
+        else break;
+        count++;
+      }
+      for (const v of toDelete) set.delete(v);
+    }
   }
 
   // ──── Publishing ────
@@ -182,10 +239,12 @@ export class GunNetwork extends EventEmitter {
   publishBlock(block: AccountBlock): void {
     if (!this.running) return;
     this.processedBlocks.add(block.hash);
-    const shardDb = this.getShardDb(block.accountPub);
-    const shardIdx = getShardIndex(block.accountPub);
-    console.log(`[GunNet] Publishing block to shard ${shardIdx}: ${block.type} by ${block.accountPub.slice(0, 12)}...`);
-    shardDb.get('dag').get(block.accountPub).get(String(block.index)).put(this.serializeBlock(block));
+    const synapseDb = this.getSynapseDb(block.accountPub);
+    const synapseIdx = getSynapseIndex(block.accountPub);
+    console.log(`[GunNet] Publishing block to synapse ${synapseIdx}: ${block.type} by ${block.accountPub.slice(0, 12)}...`);
+    const data = this.serializeBlock(block);
+    data._gen = this.generation;
+    synapseDb.get('dag').get(block.accountPub).get(String(block.index)).put(data);
   }
 
   publishVote(vote: Vote): void {
@@ -199,10 +258,32 @@ export class GunNetwork extends EventEmitter {
     });
   }
 
+  publishInboxSignal(recipientPub: string, senderPub: string, blockHash: string, amount: number): void {
+    if (!this.running || !this.globalDb) return;
+    const signalId = `${blockHash}:${senderPub}`;
+    this.globalDb.get('inbox').get(recipientPub).get(signalId).put({
+      sender: senderPub,
+      blockHash,
+      amount,
+      timestamp: Date.now(),
+    });
+  }
+
+  watchInbox(recipientPub: string, callback: (signal: { sender: string; blockHash: string; amount: number; timestamp: number }) => void): void {
+    if (!this.globalDb) return;
+    this.globalDb.get('inbox').get(recipientPub).map().on((data: unknown) => {
+      if (!data || typeof data !== 'object') return;
+      const sig = data as { sender?: string; blockHash?: string; amount?: number; timestamp?: number };
+      if (sig.sender && sig.blockHash) {
+        callback({ sender: sig.sender, blockHash: sig.blockHash, amount: sig.amount ?? 0, timestamp: sig.timestamp ?? 0 });
+      }
+    });
+  }
+
   saveAccount(pub: string, account: Record<string, unknown>): void {
     if (!this.running || !this.globalDb) return;
-    console.log(`[GunNet] Saving account: ${account.username} (shard ${getShardIndex(pub)})`);
-    this.globalDb.get('accounts').get(pub).put(account);
+    console.log(`[GunNet] Saving account: ${account.username} (synapse ${getSynapseIndex(pub)})`);
+    this.globalDb.get('accounts').get(pub).put({ ...account, _gen: this.generation });
   }
 
   saveContract(id: string, contract: Record<string, unknown>): void {
@@ -245,11 +326,10 @@ export class GunNetwork extends EventEmitter {
   async loadAccountChains(): Promise<Map<string, AccountBlock[]>> {
     const chains = new Map<string, AccountBlock[]>();
 
-    // Load from all shards sequentially (same Gun connection)
-    for (let shardIdx = 0; shardIdx < NUM_SHARDS; shardIdx++) {
+    for (let synapseIdx = 0; synapseIdx < NUM_SYNAPSES; synapseIdx++) {
       const pubs = await new Promise<string[]>((resolve) => {
         const list: string[] = [];
-        this.shardDbs[shardIdx].get('dag').map().once((data: unknown, key: string) => {
+        this.synapseDbs[synapseIdx].get('dag').map().once((data: unknown, key: string) => {
           if (data && key) list.push(key);
         });
         setTimeout(() => resolve(list), 2000);
@@ -258,7 +338,7 @@ export class GunNetwork extends EventEmitter {
       for (const pub of pubs) {
         const blocks = await new Promise<AccountBlock[]>((resolve) => {
           const list: AccountBlock[] = [];
-          this.shardDbs[shardIdx].get('dag').get(pub).map().once((data: unknown) => {
+          this.synapseDbs[synapseIdx].get('dag').get(pub).map().once((data: unknown) => {
             if (data && typeof data === 'object') {
               const block = this.deserializeBlock(data as Record<string, unknown>);
               if (block) {
@@ -273,14 +353,52 @@ export class GunNetwork extends EventEmitter {
           }, 2000);
         });
         if (blocks.length > 0) {
-          console.log(`[GunNet] Shard ${shardIdx}: ${blocks.length} blocks for ${pub.slice(0, 12)}...`);
+          console.log(`[GunNet] Synapse ${synapseIdx}: ${blocks.length} blocks for ${pub.slice(0, 12)}...`);
           chains.set(pub, blocks);
         }
       }
     }
 
-    console.log(`[GunNet] Loaded ${chains.size} chains from ${NUM_SHARDS} shards`);
+    console.log(`[GunNet] Loaded ${chains.size} chains from ${NUM_SYNAPSES} synapse paths`);
     return chains;
+  }
+
+  async loadAccountChain(accountPub: string): Promise<AccountBlock[]> {
+    const synapseDb = this.getSynapseDb(accountPub);
+    if (!synapseDb) return [];
+    return new Promise((resolve) => {
+      const list: AccountBlock[] = [];
+      let timer: ReturnType<typeof setTimeout>;
+      synapseDb.get('dag').get(accountPub).map().once((data: unknown) => {
+        if (data && typeof data === 'object') {
+          const block = this.deserializeBlock(data as Record<string, unknown>);
+          if (block) {
+            list.push(block);
+            this.processedBlocks.add(block.hash);
+          }
+        }
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          list.sort((a, b) => a.index - b.index);
+          resolve(list);
+        }, 300);
+      });
+      timer = setTimeout(() => resolve(list), 1500);
+    });
+  }
+
+  async loadAccount(pub: string): Promise<Record<string, unknown> | null> {
+    if (!this.globalDb) return null;
+    return new Promise((resolve) => {
+      let resolved = false;
+      this.globalDb.get('accounts').get(pub).once((data: unknown) => {
+        if (!resolved) {
+          resolved = true;
+          resolve(data && typeof data === 'object' ? data as Record<string, unknown> : null);
+        }
+      });
+      setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 1500);
+    });
   }
 
   async loadAccounts(): Promise<Map<string, Record<string, unknown>>> {
@@ -312,8 +430,13 @@ export class GunNetwork extends EventEmitter {
   async clearAll(): Promise<void> {
     if (!this.globalDb) return;
 
-    // Clear global
-    for (const store of ['accounts', 'votes', 'contracts', 'keyblobs', 'peers']) {
+    // Increment generation — all peers will reject data from older generations
+    this.generation++;
+    this.saveGeneration();
+    this.globalDb.get('_generation').put(this.generation as never);
+    console.log(`[GunNet] Generation incremented to ${this.generation} — stale data will be rejected`);
+
+    for (const store of ['accounts', 'votes', 'contracts', 'keyblobs', 'peers', 'inbox']) {
       this.globalDb.get(store).map().once((_: unknown, key: string) => {
         this.globalDb.get(store).get(key).put(null);
         this.globalDb.get(store).get(key).map().once((__: unknown, k2: string) => {
@@ -322,11 +445,10 @@ export class GunNetwork extends EventEmitter {
       });
     }
 
-    // Clear all shards
-    for (const shardDb of this.shardDbs) {
-      shardDb.get('dag').map().once((_: unknown, key: string) => {
-        shardDb.get('dag').get(key).map().once((__: unknown, k2: string) => {
-          shardDb.get('dag').get(key).get(k2).put(null);
+    for (const synapseDb of this.synapseDbs) {
+      synapseDb.get('dag').map().once((_: unknown, key: string) => {
+        synapseDb.get('dag').get(key).map().once((__: unknown, k2: string) => {
+          synapseDb.get('dag').get(key).get(k2).put(null);
         });
       });
     }
@@ -367,12 +489,16 @@ export class GunNetwork extends EventEmitter {
     };
   }
 
+  private static readonly VALID_BLOCK_TYPES = new Set(['open', 'send', 'receive', 'deploy', 'call']);
+
   private deserializeBlock(data: Record<string, unknown>): AccountBlock | null {
     try {
       if (!data.hash || !data.accountPub) return null;
+      const type = String(data.type);
+      if (!GunNetwork.VALID_BLOCK_TYPES.has(type)) return null;
       return {
         hash: String(data.hash), accountPub: String(data.accountPub),
-        index: Number(data.index), type: String(data.type) as AccountBlock['type'],
+        index: Number(data.index), type: type as AccountBlock['type'],
         previousHash: String(data.previousHash), balance: Number(data.balance),
         timestamp: Number(data.timestamp), signature: String(data.signature),
         recipient: data.recipient ? String(data.recipient) : undefined,
@@ -389,7 +515,7 @@ export class GunNetwork extends EventEmitter {
   getStats(): NetworkStats {
     return {
       peerId: this.peerId, peerCount: this.trackedPeers.size,
-      isRunning: this.running, shards: NUM_SHARDS, startedAt: this.startedAt,
+      isRunning: this.running, synapses: NUM_SYNAPSES, startedAt: this.startedAt,
     };
   }
 

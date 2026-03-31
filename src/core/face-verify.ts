@@ -127,7 +127,8 @@ export async function detectLiveness(
   let framesWithFace = 0;
   let framesWithoutFace = 0;
   const nosePositions: { x: number; y: number }[] = [];
-  const MIN_MOVEMENT = 12; // pixels of nose travel required
+  const MIN_MOVEMENT = 30; // pixels of nose travel required (higher = harder to spoof with photo)
+  const MIN_DIRECTION_CHANGES = 2; // must reverse direction at least twice (rules out linear pan)
 
   onStatus?.('Face detected — slowly turn your head left and right...');
 
@@ -146,11 +147,22 @@ export async function detectLiveness(
         const xs = nosePositions.map((p) => p.x);
         const ys = nosePositions.map((p) => p.y);
         const totalRange = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
-        const progress = Math.min(100, Math.round((totalRange / MIN_MOVEMENT) * 100));
 
-        onStatus?.(`Liveness: ${progress}% — keep moving slowly`);
+        // Count direction changes in X axis (left-right reversals)
+        let dirChanges = 0;
+        for (let i = 2; i < nosePositions.length; i++) {
+          const dx1 = nosePositions[i - 1].x - nosePositions[i - 2].x;
+          const dx2 = nosePositions[i].x - nosePositions[i - 1].x;
+          if ((dx1 > 1 && dx2 < -1) || (dx1 < -1 && dx2 > 1)) dirChanges++;
+        }
 
-        if (totalRange >= MIN_MOVEMENT) {
+        const movementPct = Math.min(50, Math.round((totalRange / MIN_MOVEMENT) * 50));
+        const dirPct = Math.min(50, Math.round((dirChanges / MIN_DIRECTION_CHANGES) * 50));
+        const progress = movementPct + dirPct;
+
+        onStatus?.(`Liveness: ${progress}% — turn head left then right`);
+
+        if (totalRange >= MIN_MOVEMENT && dirChanges >= MIN_DIRECTION_CHANGES) {
           onStatus?.('Liveness confirmed!');
           return true;
         }

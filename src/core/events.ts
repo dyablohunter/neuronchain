@@ -14,6 +14,10 @@ export class EventEmitter {
     this.handlers.get(event)?.delete(handler);
   }
 
+  removeAllListeners(): void {
+    this.handlers.clear();
+  }
+
   emit(event: string, ...args: unknown[]): void {
     this.handlers.get(event)?.forEach((handler) => {
       try {

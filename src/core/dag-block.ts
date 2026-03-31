@@ -85,10 +85,10 @@ export interface ConfirmedBlock extends AccountBlock {
 }
 
 /**
- * Compute a deterministic hash for a block.
- * Sync for speed — uses the same approach as checkpoint blocks.
+ * Compute a deterministic SHA-256 hash for a block.
+ * Returns a 64-char hex string.
  */
-export function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signature'>): string {
+export async function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signature'>): Promise<string> {
   const data = [
     block.accountPub,
     block.index,
@@ -105,26 +105,9 @@ export function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signature'>
     block.contractData || '',
   ].join(':');
 
-  // Deterministic sync hash → 64 hex chars
-  let h1 = 0, h2 = 0, h3 = 0, h4 = 0;
-  for (let i = 0; i < data.length; i++) {
-    const c = data.charCodeAt(i);
-    h1 = ((h1 << 5) - h1 + c) | 0;
-    h2 = ((h2 << 7) - h2 + c) | 0;
-    h3 = ((h3 << 11) - h3 + c) | 0;
-    h4 = ((h4 << 13) - h4 + c) | 0;
-  }
-  const seg = (v: number) => Math.abs(v).toString(16).padStart(8, '0');
-  let result = seg(h1) + seg(h2) + seg(h3) + seg(h4);
-  // Extend to 64 chars
-  for (let i = 0; i < 4; i++) {
-    let h = h1 + h2 * (i + 1) + h3 * (i + 2) + h4 * (i + 3);
-    for (let j = 0; j < 8; j++) {
-      h = ((h << 5) - h + data.charCodeAt((i * 8 + j) % data.length)) | 0;
-    }
-    result += seg(h);
-  }
-  return result.slice(0, 64);
+  const encoded = new TextEncoder().encode(data);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**
@@ -149,7 +132,7 @@ export async function createAccountBlock(
 ): Promise<AccountBlock> {
   const timestamp = Date.now();
   const hashInput = { ...params, timestamp };
-  const hash = hashAccountBlock(hashInput);
+  const hash = await hashAccountBlock(hashInput);
   const signature = await signData(hash, keys);
 
   return {
@@ -175,6 +158,11 @@ export function validateBlockStructure(
   block: AccountBlock,
   parent: AccountBlock | null,
 ): { valid: boolean; error?: string } {
+  // Reject any block with a balance that exceeds safe integer range
+  if (!Number.isSafeInteger(block.balance) || block.balance < 0) {
+    return { valid: false, error: 'Balance out of safe integer range' };
+  }
+
   if (block.type === 'open') {
     if (parent !== null) return { valid: false, error: 'Open block cannot have a parent' };
     if (block.index !== 0) return { valid: false, error: 'Open block must be index 0' };
@@ -192,6 +180,7 @@ export function validateBlockStructure(
     case 'send': {
       if (!block.recipient) return { valid: false, error: 'Send block needs recipient' };
       if (!block.amount || block.amount <= 0) return { valid: false, error: 'Send amount must be positive' };
+      if (!Number.isSafeInteger(block.amount)) return { valid: false, error: 'Send amount out of safe integer range' };
       if (parent.balance < block.amount) return { valid: false, error: 'Insufficient balance' };
       if (block.balance !== parent.balance - block.amount) return { valid: false, error: 'Balance mismatch after send' };
       return { valid: true };
@@ -199,7 +188,10 @@ export function validateBlockStructure(
     case 'receive': {
       if (!block.sendBlockHash) return { valid: false, error: 'Receive block needs sendBlockHash' };
       if (!block.receiveAmount || block.receiveAmount <= 0) return { valid: false, error: 'Receive amount must be positive' };
-      if (block.balance !== parent.balance + block.receiveAmount) return { valid: false, error: 'Balance mismatch after receive' };
+      if (!Number.isSafeInteger(block.receiveAmount)) return { valid: false, error: 'Receive amount out of safe integer range' };
+      const newBalance = parent.balance + block.receiveAmount;
+      if (!Number.isSafeInteger(newBalance)) return { valid: false, error: 'Resulting balance would overflow safe integer range' };
+      if (block.balance !== newBalance) return { valid: false, error: 'Balance mismatch after receive' };
       return { valid: true };
     }
     case 'deploy': {

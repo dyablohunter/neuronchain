@@ -34,6 +34,8 @@ export interface VoteTally {
 
 const CONFLICT_RESOLVE_THRESHOLD = 2 / 3;
 const CONFLICT_RESOLVE_TIMEOUT_MS = 10_000;
+/** Votes older than this are rejected to prevent replay of stale votes */
+const VOTE_MAX_AGE_MS = 60_000;
 
 export class VoteManager {
   private confirmedBlocks: Set<string> = new Set();
@@ -42,6 +44,8 @@ export class VoteManager {
   private parentToBlocks: Map<string, Set<string>> = new Map();
   /** Only blocks in conflict get tallies */
   private tallies: Map<string, VoteTally> = new Map();
+  /** Seen vote signatures — prevents replaying the exact same signed vote */
+  private seenSignatures: Set<string> = new Set();
 
   /**
    * Register a block. If no conflict, it's confirmed optimistically.
@@ -91,6 +95,13 @@ export class VoteManager {
     const tally = this.tallies.get(vote.blockHash);
     if (!tally) return; // Not in conflict — no vote needed
     if (tally.votes.has(vote.voterPub)) return; // Already voted
+
+    // Reject replayed signatures
+    if (this.seenSignatures.has(vote.signature)) return;
+    this.seenSignatures.add(vote.signature);
+
+    // Reject stale votes (prevents replay of old votes with outdated stakes)
+    if (Date.now() - vote.timestamp > VOTE_MAX_AGE_MS) return;
 
     tally.votes.set(vote.voterPub, vote);
     tally.voterCount++;
@@ -209,5 +220,6 @@ export class VoteManager {
     this.confirmedBlocks.clear();
     this.rejectedBlocks.clear();
     this.parentToBlocks.clear();
+    this.seenSignatures.clear();
   }
 }
