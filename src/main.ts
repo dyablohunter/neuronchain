@@ -590,7 +590,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     await node.submitBlock(openBlock);
     const accPayload = `account:${keys.pub}:${username}:${account.createdAt}:${faceMap.hash}`;
     const accSig = await signData(accPayload, keys);
-    node.gunNet.saveAccount(keys.pub, { username, pub: keys.pub, balance: 1000000, nonce: 0, createdAt: account.createdAt, faceMapHash: faceMap.hash, faceDescriptor: JSON.stringify(faceMap.canonical), _sig: accSig });
+    node.gunNet.saveAccount(keys.pub, { username, pub: keys.pub, balance: 1000000, nonce: 0, createdAt: account.createdAt, faceMapHash: faceMap.hash, faceDescriptor: JSON.stringify(faceMap.canonical), keyBlobHash: keyBlob.blobHash || '', _sig: accSig });
     node.gunNet.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
     addLog('FaceID: Published block, account, and encrypted key blob', 'success');
 
@@ -672,7 +672,23 @@ $('#btnRecoverFace').addEventListener('click', async () => {
       username: String(blobData.username),
       pub: String(blobData.pub),
       createdAt: Number(blobData.createdAt),
+      blobHash: blobData.blobHash ? String(blobData.blobHash) : undefined,
     };
+
+    // Verify key blob hash against on-chain account data (prevents relay from serving fake blobs)
+    const onChainAccount = await node.gunNet.loadAccount(blob.pub);
+    if (onChainAccount && onChainAccount.keyBlobHash && blob.blobHash) {
+      const { verifyKeyBlobHash } = await import('./core/face-store');
+      const hashValid = await verifyKeyBlobHash(blob, String(onChainAccount.keyBlobHash));
+      if (!hashValid) {
+        toast('Key blob hash mismatch — blob may be tampered', 'error');
+        hideCameraModal();
+        $('#btnRecoverFace').removeAttribute('disabled');
+        statusEl.innerHTML = '<span style="color:var(--danger)">Key blob integrity check failed. The relay may have served a tampered blob.</span>';
+        return;
+      }
+      addLog('Key blob integrity verified against on-chain hash', 'success');
+    }
 
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);

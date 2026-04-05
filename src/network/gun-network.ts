@@ -3,8 +3,19 @@ import 'gun/sea.js';
 import { EventEmitter } from '../core/events';
 import { AccountBlock } from '../core/dag-block';
 import { Vote } from '../core/vote';
+import { verifySignature } from '../core/crypto';
 
 export const NUM_SYNAPSES = 4;
+
+/**
+ * Known operator public keys — only these keys can sign mainnet generation bumps.
+ * Add operator pub keys here as the network grows. For testnet, this is not enforced.
+ * In production, load from a governance config or on-chain registry.
+ */
+export const KNOWN_OPERATORS: string[] = [
+  // Add operator pub keys here, e.g.:
+  // 'operator1_pub_key_here',
+];
 
 export interface NetworkStats {
   peerId: string;
@@ -25,9 +36,30 @@ export function getSynapseIndex(accountPub: string): number {
   return Math.abs(hash) % NUM_SYNAPSES;
 }
 
-function getRelayUrl(): string {
-  if (typeof window === 'undefined') return 'http://localhost:5173/gun';
-  return `${window.location.origin}/gun`;
+/**
+ * Relay URLs — connect to multiple independent relays for decentralization.
+ * If one relay censors or goes down, data still propagates through others.
+ * Add community-run relays here as the network grows.
+ */
+function getRelayUrls(): string[] {
+  // Check for user-configured relays (set via localStorage or env)
+  if (typeof window !== 'undefined') {
+    try {
+      const custom = localStorage.getItem('neuronchain_relays');
+      if (custom) {
+        const parsed = JSON.parse(custom) as string[];
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch { /* ignore */ }
+  }
+
+  const origin = typeof window === 'undefined'
+    ? 'http://localhost:5173'
+    : window.location.origin;
+
+  // Default: origin relay. Add additional relays for redundancy:
+  // e.g. ['https://relay1.neuronchain.net/gun', 'https://relay2.neuronchain.net/gun']
+  return [`${origin}/gun`];
 }
 
 /**
@@ -49,11 +81,26 @@ function getRelayUrl(): string {
  * scaling you can point each synapse at a different Gun relay server
  * by changing getRelayUrl() to return per-synapse URLs.
  */
+/**
+ * Gun node reference — Gun's built-in types don't support schemaless/dynamic keys,
+ * so we define a minimal interface covering the methods we actually use.
+ * This avoids the `never` cascade from ReturnType<...>['get'] through Gun's generics.
+ */
+interface GunRef {
+  get(key: string): GunRef;
+  put(value: unknown, cb?: (ack: unknown) => void): GunRef;
+  on(cb: (data: unknown, key: string) => void): GunRef;
+  once(cb: (data: unknown, key: string) => void): GunRef;
+  map(): GunRef;
+  off(): GunRef;
+  set(value: unknown, cb?: (ack: unknown) => void): GunRef;
+}
+
 export class GunNetwork extends EventEmitter {
   private gun!: ReturnType<typeof Gun>;
-  private root!: ReturnType<ReturnType<typeof Gun>['get']>;
-  private globalDb!: ReturnType<ReturnType<typeof Gun>['get']>;
-  private synapseDbs: ReturnType<ReturnType<typeof Gun>['get']>[] = [];
+  private root!: GunRef;
+  private globalDb!: GunRef;
+  private synapseDbs: GunRef[] = [];
 
   private network: string;
   private running = false;
@@ -88,6 +135,14 @@ export class GunNetwork extends EventEmitter {
     try { localStorage.setItem(this.generationKey, String(this.generation)); } catch {}
   }
 
+  /** Verify a signed generation bump message from a known operator */
+  private async verifyGenerationBump(msg: { generation?: number; signature?: string; operatorPub?: string }): Promise<boolean> {
+    if (!msg.signature || !msg.operatorPub || typeof msg.generation !== 'number') return false;
+    const payload = `generation:${msg.generation}`;
+    const result = await verifySignature(msg.signature, msg.operatorPub);
+    return result === payload;
+  }
+
   private generatePeerId(): string {
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
@@ -101,15 +156,16 @@ export class GunNetwork extends EventEmitter {
   async start(): Promise<void> {
     if (this.running) return;
 
-    const relayUrl = getRelayUrl();
-    console.log(`[GunNet] Connecting to ${relayUrl} (${NUM_SYNAPSES} synapse paths)`);
+    const relayUrls = getRelayUrls();
+    console.log(`[GunNet] Connecting to ${relayUrls.length} relay(s): ${relayUrls.join(', ')} (${NUM_SYNAPSES} synapse paths)`);
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     this.gun = Gun({
-      peers: [relayUrl],
+      peers: relayUrls,
       localStorage: false,
       radisk: false,
       file: false,
-    });
+    } as any);
 
     this.gun.on('hi', (peer: unknown) => {
       const p = peer as { url?: string; id?: string };
@@ -122,26 +178,60 @@ export class GunNetwork extends EventEmitter {
       this.emit('relay:disconnected', p.url || p.id);
     });
 
-    this.root = this.gun.get(`neuronchain/${this.network}`);
+    this.root = this.gun.get(`neuronchain/${this.network}`) as unknown as GunRef;
     this.globalDb = this.root;
 
     for (let i = 0; i < NUM_SYNAPSES; i++) {
       this.synapseDbs.push(this.root.get(`synapse-${i}`));
     }
 
-    // Listen for generation updates from peers (e.g. after a testnet reset)
-    this.globalDb.get('_generation').on((data: unknown) => {
-      if (typeof data === 'number' && data > this.generation) {
-        console.log(`[GunNet] Generation updated: ${this.generation} → ${data}`);
-        this.generation = data;
+    // Listen for generation updates — require signed governance message
+    // On testnet, unsigned bumps are still accepted for convenience.
+    // On mainnet, only signed generation bumps from known operators are accepted.
+    this.globalDb.get('_generation_msg').on((data: unknown) => {
+      if (!data || typeof data !== 'object') return;
+      const msg = data as { generation?: number; signature?: string; operatorPub?: string };
+      if (typeof msg.generation !== 'number' || msg.generation <= this.generation) return;
+
+      if (this.network === 'mainnet') {
+        // Mainnet: require signature from a known operator
+        if (!msg.signature || !msg.operatorPub || !KNOWN_OPERATORS.includes(msg.operatorPub)) {
+          console.warn(`[GunNet] Rejected generation bump — unsigned or unknown operator`);
+          return;
+        }
+        // Signature verification is done asynchronously
+        this.verifyGenerationBump(msg).then(valid => {
+          if (valid) {
+            console.log(`[GunNet] Generation updated (signed): ${this.generation} → ${msg.generation}`);
+            this.generation = msg.generation!;
+            this.saveGeneration();
+          }
+        });
+      } else {
+        // Testnet: accept any bump (backwards compat)
+        console.log(`[GunNet] Generation updated: ${this.generation} → ${msg.generation}`);
+        this.generation = msg.generation;
         this.saveGeneration();
       }
     });
+    // Backwards compat: still listen to raw _generation for testnet
+    if (this.network !== 'mainnet') {
+      this.globalDb.get('_generation').on((data: unknown) => {
+        if (typeof data === 'number' && data > this.generation) {
+          console.log(`[GunNet] Generation updated (legacy): ${this.generation} → ${data}`);
+          this.generation = data;
+          this.saveGeneration();
+        }
+      });
+    }
 
     // Live listeners — global (accounts, votes)
+    // Client-side null-write rejection: ignore data where critical fields are null
     this.globalDb.get('accounts').map().on((data: unknown) => {
       if (!data || typeof data !== 'object') return;
       const acc = data as Record<string, unknown>;
+      // Reject null writes — critical fields must not be null
+      if (acc.pub === null || acc.username === null) return;
       // Reject stale data from before a reset
       if (typeof acc._gen === 'number' && (acc._gen as number) < this.generation) return;
       if (acc.pub && acc.username) this.emit('account:synced', acc);
@@ -149,6 +239,9 @@ export class GunNetwork extends EventEmitter {
 
     this.globalDb.get('votes').map().map().on((data: unknown) => {
       if (!data || typeof data !== 'object') return;
+      const raw = data as Record<string, unknown>;
+      // Reject null writes on vote fields
+      if (raw.blockHash === null || raw.voterPub === null || raw.signature === null) return;
       const vote = data as Vote;
       const voteKey = `${vote.blockHash}:${vote.voterPub}`;
       if (vote.blockHash && vote.voterPub && !this.processedVotes.has(voteKey)) {
@@ -159,10 +252,13 @@ export class GunNetwork extends EventEmitter {
     });
 
     // Live listeners — each synapse (blocks)
+    // Client-side null-write rejection: ignore blocks with nulled critical fields
     for (let i = 0; i < NUM_SYNAPSES; i++) {
       this.synapseDbs[i].get('dag').map().map().on((data: unknown) => {
         if (!data || typeof data !== 'object') return;
         const raw = data as Record<string, unknown>;
+        // Reject null writes — critical block fields must not be null
+        if (raw.hash === null || raw.accountPub === null || raw.signature === null) return;
         // Reject data from older generations (stale data after a reset)
         if (typeof raw._gen === 'number' && raw._gen < this.generation) return;
         const block = this.deserializeBlock(raw);
@@ -255,10 +351,11 @@ export class GunNetwork extends EventEmitter {
       blockHash: vote.blockHash, voterPub: vote.voterPub,
       approve: vote.approve, stake: vote.stake,
       timestamp: vote.timestamp, signature: vote.signature,
+      chainHeadHash: vote.chainHeadHash || '',
     });
   }
 
-  publishInboxSignal(recipientPub: string, senderPub: string, blockHash: string, amount: number): void {
+  publishInboxSignal(recipientPub: string, senderPub: string, blockHash: string, amount: number, signature?: string): void {
     if (!this.running || !this.globalDb) return;
     const signalId = `${blockHash}:${senderPub}`;
     this.globalDb.get('inbox').get(recipientPub).get(signalId).put({
@@ -266,16 +363,17 @@ export class GunNetwork extends EventEmitter {
       blockHash,
       amount,
       timestamp: Date.now(),
+      signature: signature || '',
     });
   }
 
-  watchInbox(recipientPub: string, callback: (signal: { sender: string; blockHash: string; amount: number; timestamp: number }) => void): void {
+  watchInbox(recipientPub: string, callback: (signal: { sender: string; blockHash: string; amount: number; timestamp: number; signature?: string }) => void): void {
     if (!this.globalDb) return;
     this.globalDb.get('inbox').get(recipientPub).map().on((data: unknown) => {
       if (!data || typeof data !== 'object') return;
-      const sig = data as { sender?: string; blockHash?: string; amount?: number; timestamp?: number };
+      const sig = data as { sender?: string; blockHash?: string; amount?: number; timestamp?: number; signature?: string };
       if (sig.sender && sig.blockHash) {
-        callback({ sender: sig.sender, blockHash: sig.blockHash, amount: sig.amount ?? 0, timestamp: sig.timestamp ?? 0 });
+        callback({ sender: sig.sender, blockHash: sig.blockHash, amount: sig.amount ?? 0, timestamp: sig.timestamp ?? 0, signature: sig.signature });
       }
     });
   }
@@ -427,13 +525,37 @@ export class GunNetwork extends EventEmitter {
 
   // ──── Reset ────
 
-  async clearAll(): Promise<void> {
+  /**
+   * Clear all data and increment generation.
+   * On mainnet, requires operator keys to sign the generation bump.
+   * On testnet, unsigned bumps are allowed for convenience.
+   */
+  async clearAll(operatorKeys?: { pub: string; priv: string; epub: string; epriv: string }): Promise<void> {
     if (!this.globalDb) return;
+
+    // On mainnet, require operator keys
+    if (this.network === 'mainnet' && !operatorKeys) {
+      console.error('[GunNet] Mainnet clearAll requires operator keys');
+      return;
+    }
 
     // Increment generation — all peers will reject data from older generations
     this.generation++;
     this.saveGeneration();
-    this.globalDb.get('_generation').put(this.generation as never);
+
+    // Publish signed generation message for mainnet
+    if (operatorKeys) {
+      const { signData } = await import('../core/crypto');
+      const payload = `generation:${this.generation}`;
+      const signature = await signData(payload, operatorKeys);
+      this.globalDb.get('_generation_msg').put({
+        generation: this.generation,
+        signature,
+        operatorPub: operatorKeys.pub,
+      });
+    }
+    // Legacy format for testnet backwards compat
+    this.globalDb.get('_generation').put(this.generation);
     console.log(`[GunNet] Generation incremented to ${this.generation} — stale data will be rejected`);
 
     for (const store of ['accounts', 'votes', 'contracts', 'keyblobs', 'peers', 'inbox']) {

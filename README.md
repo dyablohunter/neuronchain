@@ -93,11 +93,12 @@ Transfers require two blocks: a `send` on the sender's chain and a `receive` on 
 Blocks are **confirmed instantly** if they pass local validation:
 
 1. Block created → SHA-256 hashed → signed with ECDSA → **confirmed immediately** (no voting)
-2. Block published to Gun relay (relay verifies signature server-side before storing) → propagates to other nodes
-3. Other nodes validate and confirm optimistically (no vote needed)
+2. Block published to Gun relays (relay verifies signature server-side before storing) → propagates to other nodes
+3. Other nodes validate signatures client-side and confirm optimistically (no vote needed)
 4. **Only if a fork is detected** (two blocks with same parent) → stake-weighted voting triggers
-5. Voting: peers vote weighted by **verified on-chain UNIT balance** (self-reported stakes are overridden) → >2/3 stake wins → loser rejected
-6. Vote replay protection: duplicate signatures rejected, votes older than 60 seconds ignored
+5. Voting: peers vote weighted by **verified on-chain UNIT balance** — votes carry the voter's chain head hash as a balance proof, so receiving nodes can independently verify stake instead of trusting self-reported values → >2/3 stake wins → loser rejected
+6. Vote signatures are verified **both** at the relay (spam filter) and at each receiving client (trust-independent verification)
+7. Vote replay protection: duplicate signatures rejected, votes older than 60 seconds ignored
 
 ### Double-Spend Prevention
 
@@ -105,10 +106,10 @@ Two blocks from the same account with the same parent hash = fork. Peers detect 
 
 ## P2P Networking
 
-Gun.js handles all peer-to-peer communication using a **synapse relay architecture**:
+Gun.js handles all peer-to-peer communication using a **multi-relay, path-sharded architecture**:
 
 ```
-Browser Node ──► Single Gun relay at /gun
+Browser Node ──► Multiple Gun relays (configurable)
   ├── neuronchain/{network}/accounts/...         → account metadata (global)
   ├── neuronchain/{network}/votes/...            → conflict votes (global)
   ├── neuronchain/{network}/peers/...            → peer presence (global)
@@ -120,7 +121,8 @@ Browser Node ──► Single Gun relay at /gun
   └── neuronchain/{network}/synapse-3/dag/...    → blocks for hash(pub) % 4 === 3
 ```
 
-- **Path-sharded:** 1 Gun relay, block data split across 4 synapse paths by `hash(pub) % 4`
+- **Multi-relay:** nodes connect to multiple independent Gun relays simultaneously for redundancy — if one relay censors or goes down, data propagates through others. Custom relays configurable via `localStorage.setItem('neuronchain_relays', JSON.stringify([...]))`
+- **Path-sharded:** block data split across 4 synapse paths by `hash(pub) % 4`
 - **Global data:** accounts, votes, peers, key blobs, contracts share the same relay
 - **Production scaling:** synapse paths map 1:1 to separate relay URLs — point each at a different server when needed
 - **Single command:** `npm run dev` starts Vite + Gun relay
@@ -128,12 +130,13 @@ Browser Node ──► Single Gun relay at /gun
 - **On-demand resync:** nodes resync when switching to relevant tabs, with a 60-second background fallback
 - **Single-tab lock:** one node per browser (prevents account farming)
 - **Auto-receive:** incoming sends to local accounts are claimed automatically
-- **Inbox signals:** senders write a lightweight notification to the recipient's inbox path in Gun, triggering an instant resync on the receiver's device
+- **Signed inbox signals:** senders sign notifications with their ECDSA key; recipients verify the signature before processing — prevents relay fabrication of fake transfer notifications
 
 ## Features
 
 - **Face-locked keys** — private key encrypted with face-derived AES-256 key
 - **Face recovery** — scan face on any device to decrypt keys from the chain
+- **Key blob integrity** — encrypted key blobs include a SHA-256 content hash stored on-chain; on recovery, the hash is verified to detect relay tampering
 - **Backup key pair** — JSON key pair shown at creation for secondary recovery
 - **1M UNIT per account** — inflationary, minted at creation
 - **Zero fees** — all operations free
@@ -141,17 +144,20 @@ Browser Node ──► Single Gun relay at /gun
 - **SHA-256 block hashing** — all block hashes computed via Web Crypto API
 - **Optimistic confirmation** — blocks confirmed instantly, voting only on conflicts
 - **Double-spend prevention** — fork detection triggers stake-weighted voting with verified on-chain balances
+- **Balance proofs in votes** — votes include the voter's chain head hash so receiving nodes can independently verify the voter's balance instead of trusting self-reported stake
+- **Client-side vote verification** — all incoming votes are cryptographically verified client-side before acceptance, not just by the relay
 - **Vote replay protection** — duplicate signatures rejected, stale votes ignored
-- **Gun.js P2P** — embedded relay, cross-device sync
+- **Multi-relay P2P** — nodes connect to multiple independent Gun relays for redundancy; custom relays configurable via localStorage
 - **Server-side validation** — relay verifies ECDSA signatures on blocks, accounts, and votes before storing
 - **Rate limiting** — per-connection write limits on the relay (60 burst, 20/s sustained)
-- **Null write protection** — malicious deletion of protected data blocked server-side
+- **Null write protection** — malicious null writes blocked both server-side (relay middleware) and client-side (Gun listeners reject null critical fields)
 - **Signed accounts** — account data ECDSA-signed by owner, verified by peers and relay
+- **Signed inbox signals** — transfer notifications are ECDSA-signed by the sender; recipients verify before processing
 - **Movement liveness** — head movement + direction reversal detection prevents photo/video attacks
 - **Smart contracts** — JavaScript in isolated Web Worker sandbox (3s timeout, no DOM/network access)
 - **Encrypted local wallet** — keys in localStorage encrypted with per-session AES-256 key
 - **Balance overflow protection** — all values validated against safe integer range
-- **Generation counter** — testnet resets increment generation; stale data from prior generations auto-rejected
+- **Generation governance** — testnet resets increment generation counter (any client); mainnet resets require a signed message from a known operator key
 - **XSS protection** — all peer-supplied data HTML-escaped before rendering
 - **Keep-alive** — Wake Lock + Web Worker + silent audio prevents tab freezing
 - **Single-tab lock** — one node per browser
@@ -259,13 +265,15 @@ For production, deploy with a proper domain and SSL certificate. The Gun relay n
 | Type | Block-lattice DAG with optimistic confirmation |
 | Normal blocks | **Confirmed instantly** (no voting needed) |
 | Conflict blocks | Stake-weighted voting (verified on-chain balance), >2/3 threshold |
+| Balance proofs | Votes carry voter's chain head hash; receivers verify balance independently |
+| Vote verification | Signatures verified both server-side (relay) and client-side (each node) |
 | Conflict timeout | 10 seconds (highest stake wins) |
 | Fork detection | Two blocks with same parent = conflict |
 | Vote replay protection | Signature deduplication + 60s staleness window |
 | Balance validation | All values checked against `Number.isSafeInteger` |
 | Block types | open, send, receive, deploy, call |
 
-**How it works:** Blocks are confirmed the moment they pass local validation (valid SHA-256 hash, ECDSA signature, sufficient balance, no fork). No voting, no waiting. Voting only engages when a **fork is detected** (two blocks sharing the same parent hash = double-spend attempt). Vote stakes are overridden with the voter's actual on-chain balance to prevent self-reported stake manipulation. 99.9% of blocks confirm instantly.
+**How it works:** Blocks are confirmed the moment they pass local validation (valid SHA-256 hash, ECDSA signature, sufficient balance, no fork). No voting, no waiting. Voting only engages when a **fork is detected** (two blocks sharing the same parent hash = double-spend attempt). Votes include a balance proof (the voter's chain head hash) so receiving nodes can independently verify the voter's stake from their local ledger, rather than trusting self-reported values. Vote signatures are verified at both the relay and each client node. 99.9% of blocks confirm instantly.
 
 ### Estimated Performance
 
@@ -289,15 +297,19 @@ With optimistic confirmation, throughput scales with the number of active accoun
 | Property | Value |
 |----------|-------|
 | P2P protocol | Gun.js (WebSocket) |
-| Relay architecture | **Path-sharded** — 1 Gun relay, 4 synapse paths + global (scalable to separate servers) |
+| Relay architecture | **Multi-relay, path-sharded** — multiple Gun relays, 4 synapse paths + global (scalable to separate servers) |
+| Multi-relay | Nodes connect to multiple independent relays simultaneously; configurable via localStorage |
 | Synapse routing | `hash(accountPub) % NUM_SYNAPSES` |
 | Global path | Accounts, votes, peers, key blobs, contracts |
 | Synapse paths | Block data (each handles 1/N of accounts) |
 | Server-side validation | ECDSA signature verification on all blocks, accounts, and votes |
+| Client-side validation | All incoming blocks, votes, and inbox signals are signature-verified client-side |
 | Rate limiting | Token bucket: 60 burst, 20 writes/s per connection |
-| Null write protection | `put(null)` blocked on protected paths (accounts, keyblobs, contracts, votes, inbox) |
-| Generation counter | Incremented on reset; stale data from prior generations auto-rejected |
-| Sync method | Real-time listeners + inbox signals + on-demand resync (60s fallback) |
+| Null write protection | `put(null)` blocked on protected paths (relay-side) + null critical fields rejected (client-side) |
+| Inbox signals | ECDSA-signed by sender, verified by recipient |
+| Key blob integrity | SHA-256 content hash stored on-chain, verified on recovery |
+| Generation governance | Testnet: any client; Mainnet: requires signed message from known operator |
+| Sync method | Real-time listeners + signed inbox signals + on-demand resync (60s fallback) |
 | Peer discovery | Gun relay peer tracking |
 | Data persistence | Gun server-side file storage |
 | Tab limit | 1 per browser (prevents account farming) |
@@ -329,14 +341,18 @@ The Gun relay runs server-side middleware (`gun-middleware.ts`) that intercepts 
 
 - **SHA-256 block hashing** — all block hashes via Web Crypto API (not a custom hash)
 - **ECDSA signature verification** — every block verified on receipt before adding to the ledger
+- **Client-side vote signature verification** — all incoming votes are cryptographically verified client-side (not just by the relay), so a malicious relay cannot fabricate or alter votes
+- **Balance proofs** — votes include the voter's chain head block hash; receiving nodes look up the block and use its balance as the verified stake, preventing stake inflation attacks
 - **Signed account data** — account records include an ECDSA signature; peers reject unsigned or mismatched accounts
-- **Vote stake verification** — self-reported vote stakes are overridden with the voter's actual on-chain balance
+- **Signed inbox signals** — transfer notifications are ECDSA-signed by the sender; recipients verify signatures before processing, preventing relay fabrication of fake notifications
+- **Null write rejection** — clients reject data from Gun where critical fields (hash, accountPub, signature, etc.) are `null`, complementing the server-side null write protection
+- **Key blob integrity verification** — encrypted key blobs include a SHA-256 content hash stored in on-chain account data; during recovery, the loaded blob's hash is verified against the on-chain hash to detect tampering by a malicious relay
 - **Vote replay protection** — duplicate vote signatures are rejected; votes older than 60 seconds are ignored
 - **Balance overflow protection** — all balances and amounts validated against `Number.isSafeInteger`
 - **Validate-before-store** — blocks are fully validated (signature, structure, conflicts) before being added to the ledger
 - **Contract sandboxing** — smart contracts execute in an isolated Web Worker with no DOM, localStorage, fetch, or network access; terminated after 3 seconds
 - **Encrypted local wallet** — private keys in localStorage are AES-256-GCM encrypted with a per-session key stored in sessionStorage
-- **Generation counter** — testnet resets increment a generation number; data from prior generations is auto-rejected by all peers
+- **Generation governance** — testnet resets are open (any client can increment generation); mainnet generation bumps require a signed message from a key in the `KNOWN_OPERATORS` list, preventing unilateral network wipes
 - **XSS prevention** — all peer-supplied data (usernames, hashes, contract names) is HTML-escaped before rendering
 - **Single-tab lock** — one node per browser via localStorage heartbeat
 

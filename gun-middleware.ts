@@ -195,9 +195,13 @@ async function verifyVoteSignature(
 ): Promise<boolean> {
   if (!voteData.signature || !voteData.voterPub || !voteData.blockHash) return false;
   try {
-    const payload = `vote:${voteData.blockHash}:${voteData.approve}:${voteData.stake}:${voteData.timestamp}`;
     const result = await SEA.verify(String(voteData.signature), String(voteData.voterPub));
-    return result === payload;
+    // New format includes chainHeadHash
+    const newPayload = `vote:${voteData.blockHash}:${voteData.approve}:${voteData.stake}:${voteData.timestamp}:${voteData.chainHeadHash || ''}`;
+    if (result === newPayload) return true;
+    // Backwards compat: old format without chainHeadHash
+    const oldPayload = `vote:${voteData.blockHash}:${voteData.approve}:${voteData.stake}:${voteData.timestamp}`;
+    return result === oldPayload;
   } catch {
     return false;
   }

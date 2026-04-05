@@ -416,10 +416,28 @@ export class DAGLedger extends EventEmitter {
    * Only matters when two blocks share the same parent (fork).
    */
   castVote(vote: Vote): void {
-    // Override self-reported stake with actual on-chain balance
-    const actualBalance = this.getAccountBalance(vote.voterPub);
-    if (actualBalance <= 0) return; // No stake = no vote
-    this.votes.addVote({ ...vote, stake: actualBalance });
+    // Verify balance proof: if vote includes a chain head hash, check that the
+    // block exists locally and its balance matches the claimed stake.
+    // If no proof, fall back to local ledger balance (backwards compat).
+    let verifiedStake: number;
+
+    if (vote.chainHeadHash) {
+      const headBlock = this.allBlocks.get(vote.chainHeadHash);
+      if (!headBlock) {
+        // We don't have this block — can't verify stake, use local balance
+        verifiedStake = this.getAccountBalance(vote.voterPub);
+      } else if (headBlock.accountPub !== vote.voterPub) {
+        // Chain head doesn't belong to voter — reject
+        return;
+      } else {
+        verifiedStake = headBlock.balance;
+      }
+    } else {
+      verifiedStake = this.getAccountBalance(vote.voterPub);
+    }
+
+    if (verifiedStake <= 0) return; // No stake = no vote
+    this.votes.addVote({ ...vote, stake: verifiedStake });
   }
 
   /**

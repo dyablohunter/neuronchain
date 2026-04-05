@@ -90,9 +90,14 @@ export class NeuronNode extends EventEmitter {
       }
     });
 
-    // Votes from peers
-    this.gunNet.on('vote:received', (vote: unknown) => {
+    // Votes from peers — verify signature client-side before accepting
+    this.gunNet.on('vote:received', async (vote: unknown) => {
       const v = vote as Vote;
+      const valid = await VoteManager.verifyVote(v);
+      if (!valid) {
+        console.warn(`[Node] Rejected vote from ${v.voterPub?.slice(0, 12)}... — invalid signature`);
+        return;
+      }
       this.ledger.castVote(v);
       this.emit('vote:received', v);
     });
@@ -126,7 +131,9 @@ export class NeuronNode extends EventEmitter {
     for (const [pub, keys] of this.localKeys) {
       const balance = this.ledger.getAccountBalance(pub);
       if (balance <= 0) continue;
-      const vote = await VoteManager.createVote(block.hash, true, balance, keys);
+      const head = this.ledger.getAccountHead(pub);
+      const chainHeadHash = head?.hash;
+      const vote = await VoteManager.createVote(block.hash, true, balance, keys, chainHeadHash);
       this.ledger.castVote(vote);
       this.gunNet.publishVote(vote);
     }
@@ -151,9 +158,20 @@ export class NeuronNode extends EventEmitter {
   private startInboxWatch(pub: string): void {
     if (this.watchedInboxes.has(pub)) return;
     this.watchedInboxes.add(pub);
-    this.gunNet.watchInbox(pub, (signal) => {
+    this.gunNet.watchInbox(pub, async (signal) => {
       const key = `${signal.blockHash}:${signal.sender}`;
       if (this.processedInbox.has(key)) return;
+
+      // Verify inbox signal signature if present
+      if (signal.signature) {
+        const payload = `inbox:${signal.blockHash}:${signal.sender}:${pub}:${signal.amount}`;
+        const result = await verifySignature(signal.signature, signal.sender);
+        if (result !== payload) {
+          console.warn(`[Inbox] Rejected signal from ${signal.sender.slice(0, 12)}... — invalid signature`);
+          return;
+        }
+      }
+
       this.processedInbox.add(key);
       if (this.processedInbox.size > NeuronNode.MAX_INBOX) {
         const first = this.processedInbox.values().next().value!;
@@ -471,7 +489,14 @@ export class NeuronNode extends EventEmitter {
       this.gunNet.publishBlock(block);
       this.voteIfConflict(block);
       if (block.type === 'send' && block.recipient) {
-        this.gunNet.publishInboxSignal(block.recipient, block.accountPub, block.hash, block.amount ?? 0);
+        // Sign inbox signal so recipients can verify the sender
+        const keys = this.localKeys.get(block.accountPub);
+        let inboxSig: string | undefined;
+        if (keys) {
+          const payload = `inbox:${block.hash}:${block.accountPub}:${block.recipient}:${block.amount ?? 0}`;
+          inboxSig = await signData(payload, keys);
+        }
+        this.gunNet.publishInboxSignal(block.recipient, block.accountPub, block.hash, block.amount ?? 0, inboxSig);
       }
     }
     return result;

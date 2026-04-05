@@ -20,6 +20,8 @@ export interface Vote {
   stake: number;
   timestamp: number;
   signature: string;
+  /** Head block hash of voter's chain — allows receivers to verify balance */
+  chainHeadHash?: string;
 }
 
 export interface VoteTally {
@@ -195,24 +197,29 @@ export class VoteManager {
     return false;
   }
 
-  /** Create a signed vote */
+  /** Create a signed vote with balance proof (chain head hash) */
   static async createVote(
     blockHash: string,
     approve: boolean,
     stake: number,
     keys: KeyPair,
+    chainHeadHash?: string,
   ): Promise<Vote> {
     const timestamp = Date.now();
-    const payload = `vote:${blockHash}:${approve}:${stake}:${timestamp}`;
+    const payload = `vote:${blockHash}:${approve}:${stake}:${timestamp}:${chainHeadHash || ''}`;
     const signature = await signData(payload, keys);
-    return { blockHash, voterPub: keys.pub, approve, stake, timestamp, signature };
+    return { blockHash, voterPub: keys.pub, approve, stake, timestamp, signature, chainHeadHash };
   }
 
-  /** Verify a vote signature */
+  /** Verify a vote signature (supports both old format without chainHeadHash and new format) */
   static async verifyVote(vote: Vote): Promise<boolean> {
-    const payload = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}`;
+    // New format includes chainHeadHash in payload
+    const newPayload = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}:${vote.chainHeadHash || ''}`;
     const result = await verifySignature(vote.signature, vote.voterPub);
-    return result === payload;
+    if (result === newPayload) return true;
+    // Backwards compat: old format without chainHeadHash
+    const oldPayload = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}`;
+    return result === oldPayload;
   }
 
   clear(): void {

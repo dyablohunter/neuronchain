@@ -842,7 +842,7 @@ function getCount() { return state.counter; }"></textarea>
         <div class="help-section">
           <h3>Account Recovery</h3>
           <ul>
-            <li><strong>FaceID (primary):</strong> Enter your username &#8594; face scan &#8594; encrypted keys fetched from the relay and decrypted with your face. Works from any device.</li>
+            <li><strong>FaceID (primary):</strong> Enter your username &#8594; face scan &#8594; encrypted keys fetched from the relay and decrypted with your face. Works from any device. The key blob's integrity is verified against its on-chain hash before decryption to detect tampering.</li>
             <li><strong>Key Pair (backup):</strong> Click "Recover with Key Pair" and paste the JSON you saved at creation. Works without a camera.</li>
           </ul>
         </div>
@@ -867,7 +867,8 @@ function getCount() { return state.counter; }"></textarea>
             <li>A block passes local validation (valid SHA-256 hash, ECDSA signature, sufficient balance, no fork) &#8594; <strong>confirmed immediately</strong></li>
             <li>No waiting for peer votes — 99.9% of transactions confirm in &lt;1ms</li>
             <li>Voting only triggers when a <strong>fork is detected</strong> (two blocks sharing the same parent = double-spend attempt)</li>
-            <li>During conflicts: peers vote weighted by their <strong>verified on-chain UNIT balance</strong> (self-reported stakes are overridden), &gt;2/3 stake wins, loser rejected</li>
+            <li>During conflicts: peers vote weighted by their <strong>verified on-chain UNIT balance</strong>. Votes include a <strong>balance proof</strong> (the voter's chain head hash) so each node can independently verify the voter's stake from its own ledger instead of trusting self-reported values. &gt;2/3 stake wins, loser rejected</li>
+            <li>Vote signatures are verified <strong>both</strong> at the relay (spam filter) and at each receiving client (trust-independent verification)</li>
             <li>Conflicts resolve within 10 seconds</li>
             <li>Vote replay protection: duplicate signatures are rejected, votes older than 60 seconds are ignored</li>
           </ul>
@@ -875,16 +876,17 @@ function getCount() { return state.counter; }"></textarea>
 
         <div class="help-section">
           <h3>P2P Networking</h3>
-          <p><strong>Gun.js</strong> handles all P2P communication using a <strong>path-sharded relay</strong>:</p>
+          <p><strong>Gun.js</strong> handles all P2P communication using a <strong>multi-relay, path-sharded architecture</strong>:</p>
           <ul>
-            <li><strong>1 Gun relay</strong> with data split across <strong>4 synapse paths</strong> by <code>hash(accountPub) % 4</code></li>
+            <li><strong>Multi-relay:</strong> nodes connect to <strong>multiple independent Gun relays</strong> simultaneously — if one relay goes down or censors data, it propagates through others. Custom relays configurable via <code>localStorage.setItem('neuronchain_relays', JSON.stringify([...]))</code></li>
+            <li>Data split across <strong>4 synapse paths</strong> by <code>hash(accountPub) % 4</code></li>
             <li><strong>Global path</strong> — shared data: accounts, votes, peers, key blobs, contracts</li>
             <li><strong>Start:</strong> <code>npm run dev</code> starts Vite + Gun relay on one port</li>
             <li><strong>Testing Tunnel:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL for multiple devices access</li>
             <li><strong>Resync:</strong> on-demand when switching tabs, with a 60-second background fallback</li>
             <li><strong>Single-tab lock:</strong> one node per browser (prevents account farming)</li>
             <li><strong>Auto-receive:</strong> incoming sends to local accounts are claimed automatically</li>
-            <li><strong>Inbox signals:</strong> senders notify recipients via a lightweight Gun path, triggering instant resync on the receiver's device</li>
+            <li><strong>Signed inbox signals:</strong> senders sign transfer notifications with their ECDSA key; recipients verify the signature before processing — prevents relay fabrication of fake notifications</li>
             <li><strong>Production scaling:</strong> synapse paths map 1:1 to separate relay URLs — point each at a different server when needed</li>
           </ul>
         </div>
@@ -894,13 +896,17 @@ function getCount() { return state.counter; }"></textarea>
           <ul>
             <li><strong>SHA-256 block hashing</strong> — all block hashes computed via Web Crypto API</li>
             <li><strong>ECDSA signatures</strong> — every block is signed by its author and verified on receipt</li>
+            <li><strong>Client-side vote verification</strong> — all incoming votes are cryptographically verified client-side, not just by the relay — a malicious relay cannot fabricate or alter votes</li>
+            <li><strong>Balance proofs</strong> — votes include the voter's chain head hash; receiving nodes verify the voter's balance from their own ledger instead of trusting self-reported stake</li>
             <li><strong>Server-side validation</strong> — the Gun relay verifies ECDSA signatures before storing blocks, accounts, and votes</li>
             <li><strong>Rate limiting</strong> — the relay enforces per-connection write limits (60 burst, 20/s sustained) to prevent flooding</li>
-            <li><strong>Null write protection</strong> — malicious deletion of accounts, key blobs, and other protected data is blocked server-side</li>
+            <li><strong>Null write protection</strong> — malicious deletion of protected data is blocked both server-side (relay middleware) and client-side (Gun listeners reject null critical fields)</li>
             <li><strong>Signed accounts</strong> — account data is ECDSA-signed by the owner; peers and the relay reject unsigned or spoofed accounts</li>
+            <li><strong>Signed inbox signals</strong> — transfer notifications are ECDSA-signed by the sender; recipients verify signatures to prevent relay fabrication</li>
+            <li><strong>Key blob integrity</strong> — encrypted key blobs include a SHA-256 content hash stored on-chain; during account recovery, the blob's hash is verified to detect tampering</li>
             <li><strong>Sandboxed contracts</strong> — smart contracts execute in an isolated Web Worker with no access to DOM, localStorage, fetch, or other browser APIs; terminated after 3 seconds to prevent infinite loops</li>
             <li><strong>Balance overflow protection</strong> — all balances and amounts are validated against <code>Number.isSafeInteger</code> before acceptance</li>
-            <li><strong>Generation counter</strong> — testnet resets increment a generation number; stale data from before the reset is automatically ignored by all peers</li>
+            <li><strong>Generation governance</strong> — testnet resets are open; mainnet generation bumps require a signed message from a known operator key, preventing unilateral network wipes</li>
             <li><strong>Encrypted local wallet</strong> — keys in localStorage are AES-256-GCM encrypted with a per-session key (cleared when the browser session ends)</li>
             <li><strong>XSS protection</strong> — all peer-supplied data (usernames, hashes, contract names) is HTML-escaped before rendering</li>
           </ul>
@@ -909,8 +915,8 @@ function getCount() { return state.counter; }"></textarea>
         <div class="help-section">
           <h3>Networks</h3>
           <ul>
-            <li><strong>Testnet:</strong> Up to 3 accounts per face. Can be reset from the Chain tab (wipes everything, increments generation counter). For development and testing.</li>
-            <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account). Cannot be reset. Production network.</li>
+            <li><strong>Testnet:</strong> Up to 3 accounts per face. Can be reset from the Chain tab (wipes everything, increments generation counter). Any client can trigger a reset. For development and testing.</li>
+            <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account). Generation resets require a signed message from a known operator key — no single client can wipe the network. Production network.</li>
           </ul>
           <p style="margin-top: 8px;">Both networks mint 1,000,000 UNIT per account and have zero fees.</p>
         </div>

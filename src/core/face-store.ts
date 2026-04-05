@@ -27,6 +27,8 @@ export interface EncryptedKeyBlob {
   pub: string;
   /** Timestamp */
   createdAt: number;
+  /** SHA-256 hash of the blob contents — stored on-chain for verification */
+  blobHash?: string;
 }
 
 /**
@@ -43,13 +45,28 @@ export async function createEncryptedKeyBlob(
   const keysJson = JSON.stringify(keys);
   const encryptedKeys = await encryptWithFaceKey(keysJson, faceKey);
 
+  // Compute content hash for on-chain verification
+  const hashInput = `${encryptedKeys}:${faceMapHash}:${keys.pub}`;
+  const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashInput));
+  const blobHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+
   return {
     encryptedKeys,
     faceMapHash,
     username,
     pub: keys.pub,
     createdAt: Date.now(),
+    blobHash,
   };
+}
+
+/** Verify a key blob's content hash matches the expected hash from on-chain account data */
+export function verifyKeyBlobHash(blob: EncryptedKeyBlob, expectedHash: string): Promise<boolean> {
+  const hashInput = `${blob.encryptedKeys}:${blob.faceMapHash}:${blob.pub}`;
+  return crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashInput)).then(buf => {
+    const computed = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    return computed === expectedHash;
+  });
 }
 
 /**
