@@ -1,4 +1,5 @@
-import * as faceapi from 'face-api.js';
+import * as tf from '@tensorflow/tfjs';
+import * as faceapi from '@vladmandic/face-api';
 
 let modelsLoaded = false;
 
@@ -25,6 +26,7 @@ export interface FaceMap {
 
 export async function loadModels(): Promise<void> {
   if (modelsLoaded) return;
+  await tf.ready();
   await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
   await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
   await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
@@ -55,17 +57,21 @@ export function stopCamera(stream: MediaStream): void {
 // ──── Face Descriptor Capture ────
 
 export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<FaceDescriptor | null> {
-  const detection = await faceapi
-    .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
-    .withFaceLandmarks()
-    .withFaceDescriptor();
+  try {
+    const detection = await faceapi
+      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
+      .withFaceLandmarks()
+      .withFaceDescriptor();
 
-  if (!detection) return null;
+    if (!detection) return null;
 
-  return {
-    data: Array.from(detection.descriptor),
-    capturedAt: Date.now(),
-  };
+    return {
+      data: Array.from(detection.descriptor),
+      capturedAt: Date.now(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -133,9 +139,15 @@ export async function detectLiveness(
   onStatus?.('Face detected — slowly turn your head left and right...');
 
   while (Date.now() - startTime < timeoutMs) {
-    const detection = await faceapi
-      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
-      .withFaceLandmarks();
+    let detection;
+    try {
+      detection = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+        .withFaceLandmarks();
+    } catch {
+      await sleep(200);
+      continue;
+    }
 
     if (detection) {
       framesWithFace++;

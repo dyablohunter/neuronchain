@@ -39,13 +39,13 @@
     .header {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      padding: 12px 24px;
+      padding: 0 24px;
       background: var(--surface);
       border-bottom: 1px solid var(--border);
       position: sticky;
       top: 0;
       z-index: 100;
+      gap: 8px;
     }
 
     .header-logo {
@@ -55,6 +55,8 @@
       font-size: 20px;
       font-weight: 700;
       letter-spacing: -0.5px;
+      flex: 0 0 auto;
+      padding: 12px 0;
     }
 
     .header-logo .icon { font-size: 26px; }
@@ -64,6 +66,8 @@
       display: flex;
       align-items: center;
       gap: 8px;
+      flex: 0 0 auto;
+      padding: 12px 0;
     }
 
     .network-badge {
@@ -91,13 +95,15 @@
       50% { opacity: 0.5; }
     }
 
-    /* Tabs */
+    /* Tabs — live inside the header on PC, wrap below on mobile */
     .tabs {
+      flex: 1;
       display: flex;
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
+      background: transparent;
+      border-bottom: none;
       overflow-x: auto;
       scrollbar-width: none;
+      justify-content: center;
     }
     .tabs::-webkit-scrollbar { display: none; }
 
@@ -305,6 +311,7 @@
       padding: 12px;
       max-height: 200px;
       overflow-y: auto;
+      overflow-x: hidden;
       font-family: var(--mono);
       font-size: 12px;
       line-height: 1.8;
@@ -312,6 +319,7 @@
 
     .log-entry { color: var(--text-dim); }
     .log-entry .time { color: var(--text-muted); margin-right: 8px; }
+    .log-entry .msg { word-break: break-all; overflow-wrap: break-word; }
     .log-entry.info .msg { color: var(--accent); }
     .log-entry.success .msg { color: var(--success); }
     .log-entry.warn .msg { color: var(--warning); }
@@ -372,6 +380,23 @@
     .row { display: flex; gap: 16px; }
     .row > * { flex: 1; }
 
+    /* Mobile: tabs wrap below logo + network badge */
+    @media (max-width: 900px) {
+      .header {
+        flex-wrap: wrap;
+        padding: 0 16px;
+        gap: 0;
+      }
+      .header-logo { padding: 10px 0; }
+      .header-network { padding: 10px 0; margin-left: auto; }
+      .tabs {
+        order: 10;
+        flex: 0 0 100%;
+        justify-content: flex-start;
+        border-top: 1px solid var(--border);
+      }
+    }
+
     @media (max-width: 768px) {
       .row { flex-direction: column; }
       .stats-grid { grid-template-columns: 1fr 1fr; }
@@ -382,15 +407,17 @@
     /* Toast notifications */
     .toast-container {
       position: fixed;
-      top: 16px;
+      top: 50%;
       left: 50%;
-      transform: translateX(-50%);
+      transform: translate(-50%, -50%);
       z-index: 1000;
       display: flex;
       flex-direction: column;
       align-items: center;
       gap: 8px;
+      pointer-events: none;
     }
+    .toast { pointer-events: auto; }
 
     .toast {
       padding: 12px 20px;
@@ -562,21 +589,21 @@
       <span class="icon">🧠</span>
       <span class="name">Neuron<span>Chain</span></span>
     </div>
+    <nav class="tabs" id="tabNav">
+      <button class="tab-btn active" data-tab="node"><span class="tab-icon">&#x2699;</span> Node</button>
+      <button class="tab-btn" data-tab="explorer"><span class="tab-icon">&#x1f50d;</span> Explorer</button>
+      <button class="tab-btn" data-tab="account"><span class="tab-icon">&#x1f464;</span> Accounts</button>
+      <button class="tab-btn" data-tab="transfer" disabled><span class="tab-icon">&#x21c4;</span> Transfer</button>
+      <button class="tab-btn" data-tab="contracts" disabled><span class="tab-icon">&#x1f4dc;</span> Contracts</button>
+      <button class="tab-btn" data-tab="storage" disabled><span class="tab-icon">&#x1f4be;</span> Storage</button>
+      <button class="tab-btn" data-tab="chain"><span class="tab-icon">&#x26d3;</span> Chain</button>
+      <button class="tab-btn" data-tab="help"><span class="tab-icon">&#x2753;</span> Help</button>
+    </nav>
     <div class="header-network">
       <span class="status-dot" id="statusDot"></span>
       <span class="network-badge testnet" id="networkBadge">TESTNET</span>
     </div>
   </header>
-
-  <nav class="tabs" id="tabNav">
-    <button class="tab-btn active" data-tab="node"><span class="tab-icon">&#x2699;</span> Node</button>
-    <button class="tab-btn" data-tab="explorer"><span class="tab-icon">&#x1f50d;</span> Explorer</button>
-    <button class="tab-btn" data-tab="account"><span class="tab-icon">&#x1f464;</span> Accounts</button>
-    <button class="tab-btn" data-tab="transfer" disabled><span class="tab-icon">&#x21c4;</span> Transfer</button>
-    <button class="tab-btn" data-tab="contracts" disabled><span class="tab-icon">&#x1f4dc;</span> Contracts</button>
-    <button class="tab-btn" data-tab="chain"><span class="tab-icon">&#x26d3;</span> Chain</button>
-    <button class="tab-btn" data-tab="help"><span class="tab-icon">&#x2753;</span> Help</button>
-  </nav>
 
   <main class="main">
     <!-- CHAIN TAB -->
@@ -608,21 +635,9 @@
     <div class="tab-panel active" id="tab-node">
       <div class="card">
         <div class="card-title">Node Control</div>
-        <div class="btn-group" style="margin-bottom: 16px;">
+        <div class="btn-group">
           <button class="btn btn-success" id="btnStartNode">Start Node</button>
           <button class="btn btn-danger" id="btnStopNode" disabled>Stop Node</button>
-        </div>
-        <div class="row">
-          <div class="form-group">
-            <label class="form-label">Validator Account (username)</label>
-            <input type="text" class="form-input" id="validatorAddress" placeholder="Enter username to validate..." />
-          </div>
-          <div class="form-group" style="display:flex;align-items:flex-end;">
-            <div class="btn-group">
-              <button class="btn btn-primary" id="btnStartValidating" disabled>Start Validating</button>
-              <button class="btn btn-outline" id="btnStopValidating" disabled>Stop Validating</button>
-            </div>
-          </div>
         </div>
       </div>
       <div class="card">
@@ -686,28 +701,48 @@
           </table>
         </div>
       </div>
+
     </div>
 
     <!-- TRANSFER TAB -->
     <div class="tab-panel" id="tab-transfer">
       <div class="card">
-        <div class="card-title">Send UNIT</div>
-        <div class="form-group">
-          <label class="form-label">From Account</label>
-          <select class="form-select" id="txFrom"></select>
+        <div class="card-title">Send</div>
+        <div class="row">
+          <div class="form-group">
+            <label class="form-label">From Account</label>
+            <select class="form-select" id="txFrom"></select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Asset</label>
+            <select class="form-select" id="txAsset"></select>
+          </div>
         </div>
         <div class="row">
           <div class="form-group">
-            <label class="form-label">To (username)</label>
+            <label class="form-label">To (username or public key)</label>
             <input type="text" class="form-input" id="txTo" placeholder="Recipient username" />
           </div>
           <div class="form-group">
-            <label class="form-label">Amount</label>
+            <label class="form-label" id="txAmountLabel">Amount</label>
             <input type="text" class="form-input" id="txAmount" placeholder="0.001" inputmode="decimal" />
           </div>
         </div>
-        <button class="btn btn-primary" id="btnSendTx">Send Transaction</button>
+        <button class="btn btn-primary" id="btnSendTx">Send</button>
       </div>
+
+      <!-- NFT Transfer -->
+      <div class="card" id="nftTransferCard" style="display:none;">
+        <div class="card-title">My NFTs</div>
+        <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">NFTs owned by your local accounts.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>#</th><th>Collection</th><th>Metadata</th><th>CID</th><th>Owner</th><th>Actions</th></tr></thead>
+            <tbody id="nftTransferList"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div id="unclaimedReceives" style="display:none;"></div>
     </div>
 
@@ -729,7 +764,7 @@
         <div id="explorerSyncStatus" style="margin-bottom:12px;font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:8px;"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Hash</th><th>Type</th><th>Account</th><th>Counterparty</th><th>Amount</th><th>Status</th></tr></thead>
+            <thead><tr><th>Hash</th><th>Type</th><th>Account</th><th>Counterparty / Contract</th><th>Name / Method</th><th>Amount</th><th>Status</th></tr></thead>
             <tbody id="explorerTxs"></tbody>
           </table>
         </div>
@@ -752,9 +787,17 @@
         </div>
         <div class="form-group">
           <label class="form-label">Contract Code (JavaScript)</label>
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <button class="btn btn-outline" id="btnLoadTokenExample" style="font-size:12px;padding:6px 12px;">&#x1f4b0; Load Token Example</button>
+            <button class="btn btn-outline" id="btnLoadNFTExample" style="font-size:12px;padding:6px 12px;">&#x1f5bc; Load NFT Example</button>
+          </div>
           <textarea class="form-textarea" id="contractCode" placeholder="function init() { state.counter = 0; }
 function increment() { state.counter++; return state.counter; }
 function getCount() { return state.counter; }"></textarea>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Constructor Arguments — optional, calls <code>init(...args)</code> immediately after deploy</label>
+          <input type="text" class="form-input" id="contractInitArgs" placeholder='e.g. ["MyToken", "MTK", 1000000]' />
         </div>
         <button class="btn btn-primary" id="btnDeployContract">Deploy Contract</button>
       </div>
@@ -789,6 +832,265 @@ function getCount() { return state.counter; }"></textarea>
           </table>
         </div>
       </div>
+    </div>
+
+    <!-- STORAGE TAB -->
+    <div class="tab-panel" id="tab-storage">
+
+      <!-- Serve Storage -->
+      <div class="card">
+        <div class="card-title">Serve Storage — Earn UNIT</div>
+        <p style="color:var(--text-dim);font-size:13px;margin-bottom:16px;">
+          Allocate local disk space to the NeuronChain network. The blockchain automatically mints UNIT directly into your account every day based on your contribution.
+        </p>
+
+        <!-- Earning formula -->
+        <div style="background:var(--surface2);border-radius:var(--radius);padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.9;">
+          <strong>Daily earning rate</strong><br>
+          <code style="font-size:12px;">rate = 1 UNIT &times; GB &times; uptime_factor &times; latency_factor &times; spot_check_factor</code><br>
+          <span style="color:var(--text-muted);font-size:12px;">
+            uptime_factor = heartbeat blocks today &divide; 6 &nbsp;&bull;&nbsp;
+            latency_factor = 1000ms &divide; avg_latency (capped 0.1&ndash;1) &nbsp;&bull;&nbsp;
+            spot_check_factor = checks_passed &divide; checks_received
+          </span>
+        </div>
+
+        <!-- My provider stats (shown when serving) -->
+        <div id="myStorageStats" style="display:none;margin-bottom:16px;">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Capacity</th><th>Uptime today</th><th>Score</th><th>Rate (UNIT/day)</th><th>Total earned</th><th>Last reward</th></tr></thead>
+              <tbody id="myProviderStatsRow"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Registration form (shown when not serving) -->
+        <div id="serveStorageForm">
+          <div class="row">
+            <div class="form-group">
+              <label class="form-label">Account</label>
+              <select class="form-select" id="storageProviderAccount"></select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Capacity to offer (GB)</label>
+              <input type="number" class="form-input" id="storageCapacityGB" placeholder="10" min="1" max="10000" />
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+            <button class="btn btn-primary" id="btnServeStorage">Serve Storage</button>
+            <span style="font-size:12px;color:var(--text-muted);">Face-locked — 1 provider per account (mainnet: 1 per face)</span>
+          </div>
+        </div>
+
+        <!-- Controls shown when already serving -->
+        <div id="stopServingArea" style="display:none;margin-top:12px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+            <input type="number" class="form-input" id="adjustCapacityGB" placeholder="New capacity (GB)" min="1" max="10000" style="width:180px;" />
+            <button class="btn btn-outline" id="btnAdjustCapacity">Adjust Capacity</button>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn btn-outline" id="btnManualHeartbeat">Send Heartbeat Now</button>
+            <button class="btn btn-outline" id="btnClaimReward">Claim Today's Reward</button>
+            <button class="btn btn-outline" id="btnStopServing" style="color:var(--danger);border-color:var(--danger);">Stop Serving Storage</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Storage Network -->
+      <div class="card">
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>Storage Network</span>
+          <button class="btn btn-outline" style="font-size:11px;padding:3px 10px;" id="btnRefreshProviders">Refresh</button>
+        </div>
+        <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">All registered storage providers on NeuronChain, ranked by score.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Provider</th><th>Capacity</th><th>Uptime</th><th>Avg Latency</th><th>Spot Check</th><th>Score</th><th>Rate (UNIT/day)</th><th>Total Earned</th></tr></thead>
+            <tbody id="storageProvidersList"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Store Content -->
+      <div class="card">
+        <div class="card-title">Store Content</div>
+        <p style="color:var(--text-dim);font-size:13px;margin-bottom:16px;">
+          Upload any content to Helia (IPFS). All store actions are ECDSA-signed by your account key. Choose <strong>Public</strong> for openly readable content (posts, profiles) or <strong>Private</strong> to encrypt with AES-256-GCM (only you can decrypt).
+        </p>
+
+        <div class="row">
+          <div class="form-group">
+            <label class="form-label">Account (signing key)</label>
+            <select class="form-select" id="storageContentFrom"></select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Visibility</label>
+            <select class="form-select" id="storageVisibility">
+              <option value="public">Public — no encryption, anyone can read</option>
+              <option value="private">Private — AES-256-GCM encrypted, only you</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="form-group">
+            <label class="form-label">Content Type</label>
+            <select class="form-select" id="storageContentType">
+              <option value="json">JSON</option>
+              <option value="image">Image</option>
+              <option value="video">Video</option>
+              <option value="audio">Audio</option>
+              <option value="html">HTML</option>
+              <option value="css">CSS</option>
+              <option value="js">JavaScript</option>
+              <option value="json">JSON</option>
+              <option value="other">Other File</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">&nbsp;</label>
+            <div id="visibilityBadge" style="padding:10px 14px;border-radius:var(--radius);border:1px solid;font-size:13px;font-weight:600;text-align:center;"></div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Name / Label</label>
+          <input type="text" class="form-input" id="storageContentName" placeholder="e.g. my-photo.jpg" />
+        </div>
+
+        <!-- Image fields -->
+        <div id="storageFields-image" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">Image file (JPEG, PNG, GIF, WebP, SVG, AVIF)</label>
+            <input type="file" class="form-input" id="imageFile" accept="image/*" style="padding:6px;" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Caption / Alt text</label>
+            <input type="text" class="form-input" id="imageCaption" placeholder="Describe the image..." />
+          </div>
+          <div id="imagePreview" style="display:none;margin-top:8px;">
+            <img id="imagePreviewEl" style="max-width:100%;max-height:220px;border-radius:var(--radius);border:1px solid var(--border);display:block;" alt="" />
+            <div id="imagePreviewInfo" style="font-size:12px;color:var(--text-muted);margin-top:4px;"></div>
+          </div>
+        </div>
+
+        <!-- Video fields -->
+        <div id="storageFields-video" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">Video file (MP4, WebM, Ogg, MOV)</label>
+            <input type="file" class="form-input" id="videoFile" accept="video/*" style="padding:6px;" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Title / Description</label>
+            <input type="text" class="form-input" id="videoTitle" placeholder="Video title or description" />
+          </div>
+          <div id="videoPreview" style="display:none;margin-top:8px;">
+            <video id="videoPreviewEl" controls muted style="max-width:100%;max-height:220px;border-radius:var(--radius);display:block;"></video>
+            <div id="videoPreviewInfo" style="font-size:12px;color:var(--text-muted);margin-top:4px;"></div>
+          </div>
+        </div>
+
+        <!-- Audio fields -->
+        <div id="storageFields-audio" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">Audio file (MP3, WAV, OGG, FLAC, AAC)</label>
+            <input type="file" class="form-input" id="audioFile" accept="audio/*" style="padding:6px;" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Title / Artist</label>
+            <input type="text" class="form-input" id="audioTitle" placeholder="Song title — Artist name" />
+          </div>
+          <div id="audioPreview" style="display:none;margin-top:8px;">
+            <audio id="audioPreviewEl" controls style="width:100%;"></audio>
+            <div id="audioPreviewInfo" style="font-size:12px;color:var(--text-muted);margin-top:4px;"></div>
+          </div>
+        </div>
+
+        <!-- HTML fields -->
+        <div id="storageFields-html" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">HTML content</label>
+            <textarea class="form-textarea" id="htmlContent" placeholder="&lt;!DOCTYPE html&gt;&#10;&lt;html&gt;&#10;  &lt;body&gt;Hello NeuronChain!&lt;/body&gt;&#10;&lt;/html&gt;" style="min-height:180px;font-family:var(--mono);font-size:13px;"></textarea>
+          </div>
+        </div>
+
+        <!-- CSS fields -->
+        <div id="storageFields-css" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">CSS content</label>
+            <textarea class="form-textarea" id="cssContent" placeholder="body { margin: 0; font-family: sans-serif; }" style="min-height:180px;font-family:var(--mono);font-size:13px;"></textarea>
+          </div>
+        </div>
+
+        <!-- JS fields -->
+        <div id="storageFields-js" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">JavaScript content</label>
+            <textarea class="form-textarea" id="jsContent" placeholder="// Your script here&#10;console.log('Hello NeuronChain!');" style="min-height:180px;font-family:var(--mono);font-size:13px;"></textarea>
+          </div>
+        </div>
+
+        <!-- JSON fields -->
+        <div id="storageFields-json" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <label class="form-label" style="margin-bottom:0;">JSON data</label>
+              <button class="btn btn-outline" style="font-size:11px;padding:3px 8px;" id="btnValidateJson">Validate JSON</button>
+            </div>
+            <textarea class="form-textarea" id="jsonContent" placeholder='{"title":"My Post","body":"Hello NeuronChain!","tags":["web3"]}' style="min-height:180px;font-family:var(--mono);font-size:13px;"></textarea>
+            <div id="jsonValidationResult" style="font-size:12px;margin-top:4px;"></div>
+          </div>
+        </div>
+
+        <!-- Other file -->
+        <div id="storageFields-other" class="storage-type-fields" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">File (any type)</label>
+            <input type="file" class="form-input" id="otherFile" style="padding:6px;" />
+          </div>
+          <div id="otherFileInfo" style="font-size:12px;color:var(--text-muted);margin-top:4px;"></div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:12px;margin-top:16px;flex-wrap:wrap;">
+          <button class="btn btn-primary" id="btnStoreContent">Store &amp; Get CID</button>
+          <span style="font-size:12px;color:var(--text-muted);">Signed with ECDSA P-256 regardless of visibility</span>
+        </div>
+        <div id="storageCidResult" style="margin-top:12px;font-family:var(--mono);font-size:12px;color:var(--accent);word-break:break-all;background:var(--surface2);padding:10px;border-radius:var(--radius);display:none;"></div>
+      </div>
+
+      <!-- Retrieve Content -->
+      <div class="card">
+        <div class="card-title">Retrieve Content</div>
+        <div class="row">
+          <div class="form-group" style="flex:2;">
+            <label class="form-label">CID</label>
+            <input type="text" class="form-input" id="retrieveCid" placeholder="bafy..." />
+          </div>
+          <div class="form-group" style="flex:1;">
+            <label class="form-label">Account (decryption key)</label>
+            <select class="form-select" id="retrieveContentFrom"></select>
+          </div>
+        </div>
+        <button class="btn btn-outline" id="btnRetrieveContent">Retrieve &amp; Decrypt</button>
+        <div id="retrieveResult" style="margin-top:12px;display:none;"></div>
+      </div>
+
+      <!-- Content Library -->
+      <div class="card">
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>Content Library</span>
+          <button class="btn btn-outline" style="font-size:11px;padding:3px 10px;font-weight:600;" id="btnClearLibrary">Clear List</button>
+        </div>
+        <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">Your locally tracked CIDs. Content remains on Helia regardless of this list.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Visibility</th><th>Size</th><th>Stored</th><th>CID</th><th>Actions</th></tr></thead>
+            <tbody id="contentLibraryList"></tbody>
+          </table>
+        </div>
+      </div>
+
     </div>
 
     <!-- HELP TAB -->
@@ -832,7 +1134,7 @@ function getCount() { return state.counter; }"></textarea>
             <li><strong>Quantization:</strong> The descriptor is quantized into stable bins so the same face produces the same key across sessions</li>
             <li><strong>Key derivation:</strong> Quantized descriptor &#8594; PBKDF2 (100K iterations) &#8594; AES-256-GCM encryption key</li>
             <li><strong>Key encryption:</strong> Your ECDSA key pair is encrypted with the face-derived AES key</li>
-            <li><strong>On-chain storage:</strong> The encrypted blob is stored on the Gun relay — available from any device, but only your face can decrypt it</li>
+            <li><strong>On-chain storage:</strong> The encrypted blob is stored on the libp2p network + IndexedDB — available from any device, but only your face can decrypt it</li>
             <li><strong>Local wallet:</strong> Keys are encrypted with a per-session AES key in localStorage — cleared when the browser session ends</li>
             <li><strong>Backup:</strong> A JSON key pair is shown once at creation — save it as a secondary recovery method</li>
             <li><strong>Privacy:</strong> Only a SHA-256 hash of the face map is stored publicly. No images or raw descriptors leave the browser.</li>
@@ -876,18 +1178,22 @@ function getCount() { return state.counter; }"></textarea>
 
         <div class="help-section">
           <h3>P2P Networking</h3>
-          <p><strong>Gun.js</strong> handles all P2P communication using a <strong>multi-relay, path-sharded architecture</strong>:</p>
+          <p><strong>libp2p</strong> handles all P2P communication using a <strong>decentralised, multi-transport architecture</strong>:</p>
           <ul>
-            <li><strong>Multi-relay:</strong> nodes connect to <strong>multiple independent Gun relays</strong> simultaneously — if one relay goes down or censors data, it propagates through others. Custom relays configurable via <code>localStorage.setItem('neuronchain_relays', JSON.stringify([...]))</code></li>
-            <li>Data split across <strong>4 synapse paths</strong> by <code>hash(accountPub) % 4</code></li>
-            <li><strong>Global path</strong> — shared data: accounts, votes, peers, key blobs, contracts</li>
-            <li><strong>Start:</strong> <code>npm run dev</code> starts Vite + Gun relay on one port</li>
-            <li><strong>Testing Tunnel:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL for multiple devices access</li>
-            <li><strong>Resync:</strong> on-demand when switching tabs, with a 60-second background fallback</li>
+            <li><strong>WebRTC:</strong> browser peers upgrade to direct connections after initial bootstrap</li>
+            <li><strong>GossipSub router (relay):</strong> while peers are on circuit-relay connections, the relay subscribes to all <code>neuronchain/*</code> topics and routes messages between browsers. Once peers upgrade to direct WebRTC, the relay is off the data path.</li>
+            <li><strong>Circuit relay v2:</strong> when direct WebRTC fails (NAT), connections are tunnelled through a relay peer</li>
+            <li><strong>Kademlia DHT:</strong> peer discovery is decentralised — nodes find each other via a distributed hash table, not a central registry</li>
+            <li><strong>GossipSub topics:</strong> blocks sharded across <strong>4 synapse topics</strong> by <code>hash(accountPub) % 4</code>; votes, accounts, and inbox signals each get their own topic</li>
+            <li><strong>IndexedDB persistence:</strong> each node stores the full chain locally — no relay needed to read your own data</li>
+            <li><strong>Bootstrap:</strong> <code>npm run dev</code> starts Vite + relay on port 9090. Custom bootstrap: <code>localStorage.setItem('neuronchain_bootstrap', JSON.stringify([...multiaddrs]))</code></li>
+            <li><strong>Separate relay:</strong> <code>npm run relay</code> runs the relay standalone for production</li>
+            <li><strong>Testing Tunnel:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL for multi-device testing</li>
+            <li><strong>Resync:</strong> on-demand when switching tabs, with a 60-second background fallback and 20-second re-publish cycle</li>
             <li><strong>Single-tab lock:</strong> one node per browser (prevents account farming)</li>
-            <li><strong>Auto-receive:</strong> incoming sends to local accounts are claimed automatically</li>
-            <li><strong>Signed inbox signals:</strong> senders sign transfer notifications with their ECDSA key; recipients verify the signature before processing — prevents relay fabrication of fake notifications</li>
-            <li><strong>Production scaling:</strong> synapse paths map 1:1 to separate relay URLs — point each at a different server when needed</li>
+            <li><strong>Auto-receive:</strong> incoming sends to local accounts are claimed automatically when the SEND block arrives via GossipSub. If the recipient's node was offline or briefly disconnected, the pending receive can be claimed manually (Transfer → Pending Receives). The sender re-broadcasts every 20 seconds.</li>
+            <li><strong>Signed inbox signals:</strong> senders sign transfer notifications with their ECDSA key; recipients verify before processing — prevents relay fabrication of fake notifications</li>
+            <li><strong>Production scaling:</strong> run multiple independent community relay nodes for resilience</li>
           </ul>
         </div>
 
@@ -898,9 +1204,9 @@ function getCount() { return state.counter; }"></textarea>
             <li><strong>ECDSA signatures</strong> — every block is signed by its author and verified on receipt</li>
             <li><strong>Client-side vote verification</strong> — all incoming votes are cryptographically verified client-side, not just by the relay — a malicious relay cannot fabricate or alter votes</li>
             <li><strong>Balance proofs</strong> — votes include the voter's chain head hash; receiving nodes verify the voter's balance from their own ledger instead of trusting self-reported stake</li>
-            <li><strong>Server-side validation</strong> — the Gun relay verifies ECDSA signatures before storing blocks, accounts, and votes</li>
-            <li><strong>Rate limiting</strong> — the relay enforces per-connection write limits (60 burst, 20/s sustained) to prevent flooding</li>
-            <li><strong>Null write protection</strong> — malicious deletion of protected data is blocked both server-side (relay middleware) and client-side (Gun listeners reject null critical fields)</li>
+            <li><strong>Peer-side validation</strong> — all incoming blocks, votes, and accounts are verified with ECDSA signatures before being accepted; rogue peers cannot inject unsigned data via GossipSub</li>
+            <li><strong>Noise protocol</strong> — all libp2p connections are encrypted and authenticated at the transport layer</li>
+            <li><strong>Null-write rejection</strong> — client-side null-field guards reject incomplete or malformed data from any peer</li>
             <li><strong>Signed accounts</strong> — account data is ECDSA-signed by the owner; peers and the relay reject unsigned or spoofed accounts</li>
             <li><strong>Signed inbox signals</strong> — transfer notifications are ECDSA-signed by the sender; recipients verify signatures to prevent relay fabrication</li>
             <li><strong>Key blob integrity</strong> — encrypted key blobs include a SHA-256 content hash stored on-chain; during account recovery, the blob's hash is verified to detect tampering</li>
@@ -923,41 +1229,105 @@ function getCount() { return state.counter; }"></textarea>
 
         <div class="help-section">
           <h3>Smart Contracts</h3>
-          <p>Write contracts in JavaScript. Contracts execute in an <strong>isolated Web Worker sandbox</strong> — no access to the page, network, or storage APIs. Your code has access to:</p>
-          <ul>
-            <li><code>state</code> — persistent key-value storage for the contract</li>
-            <li><code>caller</code> — public key of the account calling the contract</li>
-            <li><code>args</code> — arguments passed to the method</li>
-            <li><code>balanceOf(username)</code> — check any account's balance</li>
-            <li><code>log(...msgs)</code> — emit log messages</li>
-          </ul>
-          <p style="margin-top: 8px;">Contracts are terminated after 3 seconds if they haven't returned. Contract calls on conflicted blocks are not executed until the conflict is resolved.</p>
-          <p style="margin-top: 8px;">Example contract:</p>
-          <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 13px; overflow-x: auto;"><code>function init() {
-  state.counter = 0;
+          <p>Write contracts in JavaScript. Contracts execute in an <strong>isolated Web Worker sandbox</strong> — no access to the page, network, or storage APIs. Your code has access to <code>state</code>, <code>caller</code>, and <code>args</code>.</p>
+          <p style="margin-top: 8px;"><strong>Simple Token (ERC-20 style):</strong></p>
+          <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 12px; overflow-x: auto;"><code>// Deploy with: init("MyToken", "MTK", 1000000)
+function init(name, symbol, totalSupply) {
+  if (state.initialized) return;
+  state.name = name; state.symbol = symbol;
+  state.totalSupply = totalSupply;
+  state.balances = {};
+  state.balances[caller] = totalSupply;
+  state.initialized = true;
+  return { name, symbol, totalSupply };
 }
-
-function increment() {
-  state.counter++;
-  log("Counter is now", state.counter);
-  return state.counter;
+function transfer(to, amount) {
+  if (!state.balances[caller] || state.balances[caller] &lt; amount)
+    return { error: 'insufficient balance' };
+  state.balances[caller] -= amount;
+  state.balances[to] = (state.balances[to] || 0) + amount;
+  return { success: true };
 }
+function balanceOf(address) { return state.balances[address] || 0; }
+function getInfo() { return { name: state.name, symbol: state.symbol, totalSupply: state.totalSupply }; }</code></pre>
 
-function getCount() {
-  return state.counter;
+          <p style="margin-top: 12px;"><strong>NFT Contract (ERC-721 style) — with content CIDs:</strong></p>
+          <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 12px; overflow-x: auto;"><code>// Deploy with: init("MyNFTs", "MNFT")
+// Mint with:   mint("My artwork", "&lt;helia-cid&gt;")
+function init(name, symbol) {
+  if (state.initialized) return;
+  state.name = name; state.symbol = symbol;
+  state.tokens = {}; state.nextId = 1;
+  state.initialized = true;
+  return { name, symbol };
+}
+function mint(metadata, cid) {
+  const id = state.nextId++;
+  state.tokens[id] = { owner: caller, metadata, cid, mintedAt: Date.now() };
+  return { tokenId: id, owner: caller };
+}
+function transfer(tokenId, to) {
+  const t = state.tokens[tokenId];
+  if (!t) return { error: 'not found' };
+  if (t.owner !== caller) return { error: 'not owner' };
+  t.owner = to;
+  return { success: true, tokenId, newOwner: to };
+}
+function ownerOf(tokenId) { return state.tokens[tokenId]?.owner || null; }
+function tokenInfo(tokenId) { return state.tokens[tokenId] || null; }
+function myTokens() {
+  return Object.entries(state.tokens)
+    .filter(([,t]) =&gt; t.owner === caller)
+    .map(([id, t]) =&gt; ({ tokenId: Number(id), ...t }));
 }</code></pre>
+          <p style="margin-top: 8px;">Load these templates directly from the <strong>Contracts</strong> tab using the example buttons.</p>
+        </div>
+
+        <div class="help-section">
+          <h3>Content Storage</h3>
+          <p>NeuronChain is a full content network. Posts, images, video, audio, HTML, CSS, JS, and JSON are stored <strong>on NeuronChain</strong> using its decentralised Helia/IPFS layer — not on any central server.</p>
+          <ul>
+            <li><strong>Content-addressed:</strong> every file is stored by its SHA-256 CID. Any peer serving wrong bytes is automatically rejected — tamper-evident by construction.</li>
+            <li><strong>On-chain anchor:</strong> the CID is recorded in <code>block.contentCid</code> or smart contract state, creating an immutable provenance proof. The content hash is the receipt.</li>
+            <li><strong>ECDSA-signed:</strong> every store action is signed by your account key regardless of visibility — public content is still authentically attributed to you.</li>
+            <li><strong>Served by any peer</strong> that holds a copy via Bitswap (parallel chunk transfer, BitTorrent-style). More holders = faster delivery.</li>
+            <li><strong>IndexedDB persistence:</strong> content stored locally survives relay downtime — readable offline.</li>
+          </ul>
+          <p style="margin-top: 8px;"><strong>Dynamic visibility</strong> — choose per content item:</p>
+          <ul>
+            <li><strong>Public:</strong> stored unencrypted — anyone with the CID can read it. Use for posts, profiles, public media.</li>
+            <li><strong>Private:</strong> encrypted with AES-256-GCM before storage using your account's content key (derived via ECDH). Only you can decrypt it. Use for personal data, drafts, private media.</li>
+          </ul>
+          <p style="margin-top: 8px;">Retrieval auto-detects visibility: tries decryption first, falls back to public read. Supported types: JSON, image, video, audio, HTML, CSS, JS, and any binary file.</p>
+        </div>
+
+        <div class="help-section">
+          <h3>Storage Market</h3>
+          <p>Built-in peer storage with UNIT incentives:</p>
+          <ul>
+            <li><strong>Providers</strong> publish a <code>storage-offer</code> block announcing capacity (MB) and price (milli-UNIT / MB / day)</li>
+            <li><strong>Beneficiaries</strong> accept with a <code>storage-deal</code> block</li>
+            <li>A <strong>24h timer</strong> auto-pays from beneficiary to provider via a standard <code>send</code> block</li>
+            <li>If the beneficiary has <strong>insufficient balance</strong>, content is automatically unpinned from the provider's Helia node</li>
+            <li>Content is stored in <strong>Helia (IPFS)</strong> — content-addressed and encrypted before storage</li>
+            <li>CIDs are referenced in <code>block.contentCid</code> or smart contract state</li>
+          </ul>
         </div>
 
         <div class="help-section">
           <h3>Technical Specs</h3>
           <ul>
-            <li><strong>Key pairs:</strong> ECDSA (Gun SEA)</li>
+            <li><strong>Key pairs:</strong> ECDSA P-256 + ECDH P-256 (Web Crypto API — no external dependency)</li>
             <li><strong>Block hashing:</strong> SHA-256 (Web Crypto API)</li>
+            <li><strong>Content encryption:</strong> AES-256-GCM, key derived via PBKDF2 from ECDH private key</li>
             <li><strong>Face key derivation:</strong> PBKDF2 (100K iterations) &#8594; AES-256-GCM</li>
             <li><strong>Face descriptor:</strong> 128 dimensions, quantized to 0.05 bins</li>
             <li><strong>Consensus:</strong> Optimistic confirmation, conflict-only stake-weighted voting (&gt;2/3 threshold, 10s timeout)</li>
-            <li><strong>P2P:</strong> Gun.js (WebSocket), path-sharded relay, real-time listeners + polling fallback</li>
+            <li><strong>P2P:</strong> libp2p — WebRTC (browser&#8596;browser), WebSocket (browser&#8596;relay), circuit relay v2 (NAT traversal), GossipSub (pubsub), Kademlia DHT (peer discovery)</li>
+            <li><strong>Content storage:</strong> Helia/IPFS with Bitswap — content-addressed, encrypted, parallel chunk transfer</li>
+            <li><strong>Persistence:</strong> IndexedDB (blocks, accounts, keyblobs, contracts) — no relay dependency</li>
             <li><strong>Keep-alive:</strong> Wake Lock API + Web Worker heartbeat + silent audio (prevents tab suspension)</li>
+            <li><strong>dApp API:</strong> <code>NeuronChainAPI</code> — stable facade for building apps on NeuronChain</li>
           </ul>
         </div>
       </div>

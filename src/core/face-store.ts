@@ -2,8 +2,8 @@
  * Face-locked key storage.
  *
  * The ECDSA key pair is encrypted with an AES key derived from the
- * face descriptor. The encrypted blob is stored ON-CHAIN via Gun,
- * so it is available for recovery from any device.
+ * face descriptor. The encrypted blob is stored on the libp2p network
+ * + IndexedDB, so it is available for recovery from any device.
  *
  * Only the person whose face matches can decrypt the keys.
  */

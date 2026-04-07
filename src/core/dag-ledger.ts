@@ -2,7 +2,13 @@ import {
   AccountBlock,
   AccountBlockType,
   ConfirmedBlock,
+  StorageRegisterData,
+  StorageRewardData,
   VERIFICATION_MINT_AMOUNT,
+  BASE_STORAGE_RATE_MILLI,
+  MAX_HEARTBEATS_PER_DAY,
+  HEARTBEAT_INTERVAL_MS,
+  REWARD_EPOCH_MS,
   createAccountBlock,
   validateBlockStructure,
   verifyBlockSignature,
@@ -12,7 +18,6 @@ import { KeyPair } from './crypto';
 import { VoteManager, Vote } from './vote';
 import { EventEmitter } from './events';
 
-/** Euclidean distance threshold for face matching (same as face-verify.ts) */
 const FACE_MATCH_THRESHOLD = 0.45;
 
 export type NetworkType = 'testnet' | 'mainnet';
@@ -27,30 +32,47 @@ export interface DAGStats {
 }
 
 /**
- * Block-Lattice DAG Ledger.
- *
- * Each account has its own chain of blocks.
- * Transfers require two blocks: a send block on the sender's chain
- * and a receive block on the recipient's chain.
- * Blocks are confirmed via stake-weighted voting.
+ * Live storage provider profile — derived from on-chain blocks and updated
+ * with off-chain metrics (latency, spot-check rate) by StorageManager.
  */
+export interface StorageProvider {
+  pub: string;
+  registeredAt: number;
+  /** Offered capacity in GB from latest storage-register block */
+  capacityGB: number;
+  /** Timestamp of most recent storage-heartbeat block */
+  lastHeartbeat: number;
+  /** Heartbeat blocks in the last 24h window (recomputed on each new block) */
+  heartbeatsLast24h: number;
+  /** epochDay index of the last storage-reward block (0 = never rewarded) */
+  lastRewardEpoch: number;
+  /** Cumulative milli-UNIT minted via storage-reward blocks */
+  totalEarned: number;
+  // ── Off-chain metrics (updated by StorageManager, informational only) ────
+  /** Rolling average retrieval latency from peer-signed receipts (0 = no data) */
+  avgLatencyMs: number;
+  /** Fraction of spot-check requests answered successfully (0–1, default 1) */
+  spotCheckPassRate: number;
+  /** Composite score: uptime × latency × spot-check factors (0–1) */
+  score: number;
+  /** Projected milli-UNIT earned per day at current score */
+  earningRate: number;
+}
+
 export class DAGLedger extends EventEmitter {
-  /** Account pub → ordered list of blocks */
   accountChains: Map<string, AccountBlock[]> = new Map();
-  /** Block hash → block (all blocks, for quick lookup) */
   allBlocks: Map<string, AccountBlock> = new Map();
-  /** Account pub → Account metadata */
   accounts: Map<string, Account> = new Map();
-  /** Username → pub key */
   private usernameToPublicKey: Map<string, string> = new Map();
-  /** Voting system */
   votes: VoteManager = new VoteManager();
-  /** Contracts */
   contracts: Map<string, { owner: string; code: string; state: Record<string, unknown>; name: string; deployedAt: number }> = new Map();
-  /** Unclaimed sends: sendBlockHash → { from, to, amount } */
   unclaimedSends: Map<string, { fromPub: string; toPub: string; amount: number }> = new Map();
-  /** faceMapHash → number of accounts created with this face */
   faceAccountCount: Map<string, number> = new Map();
+  /** Per-contract execution queue — ensures calls execute sequentially, never concurrently */
+  private contractQueues: Map<string, Promise<void>> = new Map();
+
+  /** Decentralised storage ledger: provider pub → live profile */
+  storageProviders: Map<string, StorageProvider> = new Map();
 
   network: NetworkType;
   private txTimestamps: number[] = [];
@@ -60,24 +82,18 @@ export class DAGLedger extends EventEmitter {
     this.network = network;
   }
 
-  // ──── Account management ────
+  // ── Account management ────────────────────────────────────────────────────
 
   registerAccount(account: Account): boolean {
     const existing = this.accounts.get(account.pub);
     if (existing) {
-      // Update metadata if we have better info (e.g., real username replacing temp pub key)
       if (account.username && account.username !== existing.username && account.username !== account.pub) {
-        // Remove old username mapping
         this.usernameToPublicKey.delete(existing.username);
         existing.username = account.username;
         this.usernameToPublicKey.set(account.username, account.pub);
       }
-      if (account.faceMapHash && !existing.faceMapHash) {
-        existing.faceMapHash = account.faceMapHash;
-      }
-      if (account.faceDescriptor && !existing.faceDescriptor) {
-        existing.faceDescriptor = account.faceDescriptor;
-      }
+      if (account.faceMapHash && !existing.faceMapHash) existing.faceMapHash = account.faceMapHash;
+      if (account.faceDescriptor && !existing.faceDescriptor) existing.faceDescriptor = account.faceDescriptor;
       return true;
     }
     if (this.usernameToPublicKey.has(account.username) && account.username !== account.pub) return false;
@@ -89,13 +105,10 @@ export class DAGLedger extends EventEmitter {
 
   getAccountByUsername(username: string): Account | undefined {
     const pub = this.usernameToPublicKey.get(username);
-    if (!pub) return undefined;
-    return this.accounts.get(pub);
+    return pub ? this.accounts.get(pub) : undefined;
   }
 
-  getAccountByPub(pub: string): Account | undefined {
-    return this.accounts.get(pub);
-  }
+  getAccountByPub(pub: string): Account | undefined { return this.accounts.get(pub); }
 
   resolveToPublicKey(identifier: string): string | undefined {
     if (this.accounts.has(identifier)) return identifier;
@@ -104,39 +117,24 @@ export class DAGLedger extends EventEmitter {
 
   getAccountBalance(pub: string): number {
     const chain = this.accountChains.get(pub);
-    if (!chain || chain.length === 0) return 0;
-    return chain[chain.length - 1].balance;
+    return chain?.length ? chain[chain.length - 1].balance : 0;
   }
 
   getAccountHead(pub: string): AccountBlock | null {
     const chain = this.accountChains.get(pub);
-    if (!chain || chain.length === 0) return null;
-    return chain[chain.length - 1];
+    return chain?.length ? chain[chain.length - 1] : null;
   }
 
-  // ──── Block creation (by local user) ────
+  // ── Face limits ───────────────────────────────────────────────────────────
 
-  /**
-   * Max accounts per face: mainnet = 1 (1 human 1 account), testnet = 3.
-   */
-  getMaxAccountsPerFace(): number {
-    return this.network === 'mainnet' ? 1 : 3;
-  }
+  getMaxAccountsPerFace(): number { return this.network === 'mainnet' ? 1 : 3; }
+  getFaceAccountCount(faceMapHash: string): number { return this.faceAccountCount.get(faceMapHash) || 0; }
 
-  getFaceAccountCount(faceMapHash: string): number {
-    return this.faceAccountCount.get(faceMapHash) || 0;
-  }
-
-  /**
-   * Count how many existing accounts match a face descriptor using
-   * Euclidean distance (not hash equality). This catches the same face
-   * even when quantization produces slightly different hashes across sessions.
-   */
   countMatchingFaceAccounts(descriptor: number[], excludePub?: string): number {
     let count = 0;
     for (const account of this.accounts.values()) {
       if (excludePub && account.pub === excludePub) continue;
-      if (account.faceDescriptor && account.faceDescriptor.length === 128) {
+      if (account.faceDescriptor?.length === 128) {
         let sum = 0;
         for (let i = 0; i < 128; i++) sum += (descriptor[i] - account.faceDescriptor[i]) ** 2;
         if (Math.sqrt(sum) < FACE_MATCH_THRESHOLD) count++;
@@ -145,10 +143,6 @@ export class DAGLedger extends EventEmitter {
     return count;
   }
 
-  /**
-   * Rebuild faceAccountCount from existing open blocks.
-   * Call after loading/syncing blocks to restore the in-memory map.
-   */
   rebuildFaceAccountCount(): void {
     this.faceAccountCount.clear();
     for (const chain of this.accountChains.values()) {
@@ -160,174 +154,197 @@ export class DAGLedger extends EventEmitter {
     }
   }
 
-  /**
-   * Create and submit an OPEN block.
-   * Requires faceMapHash — FaceID is mandatory for account creation.
-   * Enforces per-face account limit (mainnet: 1, testnet: 3).
-   * Mints VERIFICATION_MINT_AMOUNT (1,000,000 UNIT) to the new account.
-   */
+  // ── Block creation ────────────────────────────────────────────────────────
+
   async openAccount(pub: string, faceMapHash: string, keys: KeyPair, faceDescriptor?: number[]): Promise<AccountBlock> {
-    // Primary check: compare face descriptors using Euclidean distance
-    // This catches the same face even with different quantized hashes
     let count: number;
-    if (faceDescriptor && faceDescriptor.length === 128) {
+    if (faceDescriptor?.length === 128) {
       count = this.countMatchingFaceAccounts(faceDescriptor, pub);
     } else {
-      // Fallback: hash-based count (for blocks received from network without descriptor)
       count = this.getFaceAccountCount(faceMapHash);
     }
     const max = this.getMaxAccountsPerFace();
-    if (count >= max) {
-      throw new Error(`Face already used for ${count} account(s). Limit: ${max} per face on ${this.network}.`);
-    }
+    if (count >= max) throw new Error(`Face already used for ${count} account(s). Limit: ${max} per face on ${this.network}.`);
 
     const block = await createAccountBlock({
-      accountPub: pub,
-      index: 0,
-      type: 'open',
-      previousHash: '0'.repeat(64),
-      balance: VERIFICATION_MINT_AMOUNT,
-      faceMapHash,
+      accountPub: pub, index: 0, type: 'open',
+      previousHash: '0'.repeat(64), balance: VERIFICATION_MINT_AMOUNT, faceMapHash,
     }, keys);
-
     await this.addBlock(block);
     return block;
   }
 
-  /**
-   * Create a SEND block. Returns the block; call addBlock() to submit.
-   */
-  async createSend(
-    senderPub: string,
-    recipientIdentifier: string,
-    amount: number,
-    keys: KeyPair,
-  ): Promise<{ block?: AccountBlock; error?: string }> {
+  async createSend(senderPub: string, recipientIdentifier: string, amount: number, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
     const recipientPub = this.resolveToPublicKey(recipientIdentifier);
     if (!recipientPub) return { error: 'Recipient not found' };
-
     const head = this.getAccountHead(senderPub);
     if (!head) return { error: 'Account not opened' };
-
     if (head.balance < amount) return { error: 'Insufficient balance' };
     if (amount <= 0) return { error: 'Amount must be positive' };
-
     const block = await createAccountBlock({
-      accountPub: senderPub,
-      index: head.index + 1,
-      type: 'send',
-      previousHash: head.hash,
-      balance: head.balance - amount,
-      recipient: recipientPub,
-      amount,
+      accountPub: senderPub, index: head.index + 1, type: 'send',
+      previousHash: head.hash, balance: head.balance - amount,
+      recipient: recipientPub, amount,
     }, keys);
-
     return { block };
   }
 
-  /**
-   * Create a RECEIVE block for an unclaimed send.
-   */
-  async createReceive(
-    recipientPub: string,
-    sendBlockHash: string,
-    keys: KeyPair,
-  ): Promise<{ block?: AccountBlock; error?: string }> {
+  async createReceive(recipientPub: string, sendBlockHash: string, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
     const unclaimed = this.unclaimedSends.get(sendBlockHash);
     if (!unclaimed) return { error: 'Send block not found or already claimed' };
     if (unclaimed.toPub !== recipientPub) return { error: 'This send is not addressed to you' };
-
     const head = this.getAccountHead(recipientPub);
     if (!head) return { error: 'Account not opened' };
-
     const block = await createAccountBlock({
-      accountPub: recipientPub,
-      index: head.index + 1,
-      type: 'receive',
-      previousHash: head.hash,
-      balance: head.balance + unclaimed.amount,
-      sendBlockHash,
-      sendFrom: unclaimed.fromPub,
-      receiveAmount: unclaimed.amount,
+      accountPub: recipientPub, index: head.index + 1, type: 'receive',
+      previousHash: head.hash, balance: head.balance + unclaimed.amount,
+      sendBlockHash, sendFrom: unclaimed.fromPub, receiveAmount: unclaimed.amount,
     }, keys);
-
     return { block };
   }
 
-  /**
-   * Create a DEPLOY block for a smart contract.
-   */
-  async createDeploy(
-    senderPub: string,
-    name: string,
-    code: string,
-    keys: KeyPair,
-  ): Promise<{ block?: AccountBlock; error?: string }> {
+  async createDeploy(senderPub: string, name: string, code: string, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
     const head = this.getAccountHead(senderPub);
     if (!head) return { error: 'Account not opened' };
-    const contractData = JSON.stringify({ name, code });
     const block = await createAccountBlock({
-      accountPub: senderPub,
-      index: head.index + 1,
-      type: 'deploy',
-      previousHash: head.hash,
-      balance: head.balance,
-      contractData,
+      accountPub: senderPub, index: head.index + 1, type: 'deploy',
+      previousHash: head.hash, balance: head.balance,
+      contractData: JSON.stringify({ name, code }),
     }, keys);
-
     return { block };
   }
 
-
-  /**
-   * Create a CALL block for a smart contract method.
-   */
-  async createCall(
-    senderPub: string,
-    contractId: string,
-    method: string,
-    args: unknown[],
-    keys: KeyPair,
-  ): Promise<{ block?: AccountBlock; error?: string }> {
+  async createCall(senderPub: string, contractId: string, method: string, args: unknown[], keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
     const head = this.getAccountHead(senderPub);
     if (!head) return { error: 'Account not opened' };
-    const contractData = JSON.stringify({ contractId, method, args });
     const block = await createAccountBlock({
-      accountPub: senderPub,
-      index: head.index + 1,
-      type: 'call',
-      previousHash: head.hash,
-      balance: head.balance,
-      contractData,
+      accountPub: senderPub, index: head.index + 1, type: 'call',
+      previousHash: head.hash, balance: head.balance,
+      contractData: JSON.stringify({ contractId, method, args }),
     }, keys);
-
     return { block };
   }
 
-  // ──── Block submission & validation ────
+  // ── Storage ledger block creation ─────────────────────────────────────────
 
   /**
-   * Add a block to the ledger (from local user or from peer).
-   * Validates structure, checks for conflicts, registers for voting.
+   * Register as a storage provider. capacityGB = 0 deregisters.
    */
+  async createStorageRegister(pub: string, capacityGB: number, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    if (capacityGB <= 0) return { error: 'capacityGB must be a positive number' };
+    const block = await createAccountBlock({
+      accountPub: pub, index: head.index + 1, type: 'storage-register',
+      previousHash: head.hash, balance: head.balance,
+      contractData: JSON.stringify({ type: 'storage-register', capacityGB } satisfies StorageRegisterData),
+    }, keys);
+    return { block };
+  }
+
+  /** Remove the account from the storage ledger entirely. */
+  async createStorageDeregister(pub: string, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
+    const provider = this.storageProviders.get(pub);
+    if (!provider || provider.capacityGB === 0) return { error: 'Not a registered storage provider' };
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    const block = await createAccountBlock({
+      accountPub: pub, index: head.index + 1, type: 'storage-deregister',
+      previousHash: head.hash, balance: head.balance,
+    }, keys);
+    return { block };
+  }
+
+  /**
+   * Broadcast a proof-of-uptime heartbeat. Enforces minimum 4h interval.
+   */
+  async createStorageHeartbeat(pub: string, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
+    const provider = this.storageProviders.get(pub);
+    if (!provider || provider.capacityGB === 0) return { error: 'Not a registered storage provider' };
+
+    // Enforce minimum interval between heartbeats
+    if (provider.lastHeartbeat > 0 && Date.now() - provider.lastHeartbeat < HEARTBEAT_INTERVAL_MS - 60_000) {
+      return { error: `Heartbeat interval not reached (next in ${Math.ceil((HEARTBEAT_INTERVAL_MS - (Date.now() - provider.lastHeartbeat)) / 60000)}min)` };
+    }
+
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    const block = await createAccountBlock({
+      accountPub: pub, index: head.index + 1, type: 'storage-heartbeat',
+      previousHash: head.hash, balance: head.balance,
+    }, keys);
+    return { block };
+  }
+
+  /**
+   * Issue a daily storage reward. Validates amount against on-chain heartbeat count
+   * and registered capacity. Mints new UNIT into the provider's balance.
+   */
+  async createStorageReward(pub: string, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
+    const provider = this.storageProviders.get(pub);
+    if (!provider || provider.capacityGB === 0) return { error: 'Not a registered storage provider' };
+
+    const epochDay = Math.floor(Date.now() / REWARD_EPOCH_MS);
+    if (provider.lastRewardEpoch >= epochDay) return { error: 'Storage reward already claimed for today' };
+
+    // Use capacity at epoch start — not current capacity — to prevent bumping GB just before claiming
+    const capacityAtEpochStart = this.getCapacityAtEpochStart(pub, epochDay);
+    if (capacityAtEpochStart === 0) return { error: 'Not registered at epoch start — no reward eligible' };
+
+    const heartbeatCount = this.countHeartbeatsInEpoch(pub, epochDay);
+    if (heartbeatCount === 0) return { error: 'No heartbeat blocks recorded today — cannot claim reward' };
+
+    const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1.0);
+    const amount = Math.floor(BASE_STORAGE_RATE_MILLI * capacityAtEpochStart * uptimeFactor);
+    if (amount <= 0) return { error: 'Calculated reward is zero' };
+
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+
+    const rewardData: StorageRewardData = {
+      type: 'storage-reward',
+      epochDay,
+      storedGB: capacityAtEpochStart,
+      heartbeatCount,
+      amount,
+    };
+
+    const block = await createAccountBlock({
+      accountPub: pub, index: head.index + 1, type: 'storage-reward',
+      previousHash: head.hash, balance: head.balance + amount,
+      contractData: JSON.stringify(rewardData),
+    }, keys);
+    return { block };
+  }
+
+  // ── Storage scoring (also called by StorageManager to update off-chain metrics) ──
+
+  updateProviderScore(provider: StorageProvider): void {
+    const uptimeFactor = Math.max(0.1, Math.min(1.0,
+      provider.heartbeatsLast24h / MAX_HEARTBEATS_PER_DAY));
+
+    const latencyFactor = provider.avgLatencyMs > 0
+      ? Math.max(0.1, Math.min(1.0, 1_000 / provider.avgLatencyMs)) // 1000ms target
+      : 1.0; // no receipts yet → full score
+
+    const spotFactor = Math.max(0.1, Math.min(1.0, provider.spotCheckPassRate));
+
+    provider.score = uptimeFactor * latencyFactor * spotFactor;
+    provider.earningRate = Math.floor(BASE_STORAGE_RATE_MILLI * provider.capacityGB * provider.score);
+  }
+
+  // ── Block submission ──────────────────────────────────────────────────────
+
   async addBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
-    // Already have this block?
     if (this.allBlocks.has(block.hash)) return { success: true };
 
-    // ── Phase 1: Validate everything BEFORE storing ──
-
-    // Verify signature
     const sigValid = await verifyBlockSignature(block);
     if (!sigValid) return { success: false, error: 'Invalid signature' };
 
-    // Get parent (null for open blocks)
     const parent = block.type === 'open' ? null : this.allBlocks.get(block.previousHash) || null;
-
-    // Validate structure
     const validation = validateBlockStructure(block, parent);
     if (!validation.valid) return { success: false, error: validation.error };
 
-    // For receive blocks: verify the send block exists and matches
     if (block.type === 'receive') {
       const sendBlock = this.allBlocks.get(block.sendBlockHash!);
       if (!sendBlock) return { success: false, error: 'Referenced send block not found' };
@@ -336,98 +353,203 @@ export class DAGLedger extends EventEmitter {
       if (sendBlock.amount !== block.receiveAmount) return { success: false, error: 'Amount mismatch' };
     }
 
-    // Check for conflicts before inserting (detect forks early)
+    // storage-reward semantic validation (requires chain state)
+    if (block.type === 'storage-reward' && block.contractData) {
+      const rewardErr = this.validateStorageReward(block);
+      if (rewardErr) return { success: false, error: rewardErr };
+    }
+
+    // storage-heartbeat minimum interval check
+    if (block.type === 'storage-heartbeat') {
+      const provider = this.storageProviders.get(block.accountPub);
+      if (!provider || provider.capacityGB === 0) {
+        return { success: false, error: 'storage-heartbeat: account is not a registered storage provider' };
+      }
+      if (provider.lastHeartbeat > 0 && block.timestamp - provider.lastHeartbeat < HEARTBEAT_INTERVAL_MS - 60_000) {
+        return { success: false, error: 'storage-heartbeat interval not reached' };
+      }
+    }
+
     const voteResult = this.votes.registerBlock(block.hash, block.previousHash, block.accountPub);
 
-    // ── Phase 2: All validation passed — now store and apply side effects ──
-
     this.allBlocks.set(block.hash, block);
-    if (!this.accountChains.has(block.accountPub)) {
-      this.accountChains.set(block.accountPub, []);
-    }
+    if (!this.accountChains.has(block.accountPub)) this.accountChains.set(block.accountPub, []);
     this.accountChains.get(block.accountPub)!.push(block);
 
-    // Track unclaimed sends
     if (block.type === 'send' && block.recipient && block.amount) {
-      this.unclaimedSends.set(block.hash, {
-        fromPub: block.accountPub,
-        toPub: block.recipient,
-        amount: block.amount,
-      });
+      this.unclaimedSends.set(block.hash, { fromPub: block.accountPub, toPub: block.recipient, amount: block.amount });
     }
-
-    // Process receive: remove from unclaimed
     if (block.type === 'receive' && block.sendBlockHash) {
       this.unclaimedSends.delete(block.sendBlockHash);
     }
 
-    // Process contract deploy
     if (block.type === 'deploy' && block.contractData) {
       try {
         const data = JSON.parse(block.contractData);
-        this.contracts.set(block.hash, {
-          owner: block.accountPub,
-          code: data.code,
-          state: {},
-          name: data.name || 'Unnamed',
-          deployedAt: block.timestamp,
-        });
+        this.contracts.set(block.hash, { owner: block.accountPub, code: data.code, state: {}, name: data.name || 'Unnamed', deployedAt: block.timestamp });
         this.emit('contract:deployed', { id: block.hash, name: data.name });
-      } catch { /* invalid contract data */ }
+      } catch { /* invalid */ }
     }
 
-    // Process contract call — only execute if block is confirmed (not in conflict)
     if (block.type === 'call' && block.contractData && voteResult === 'confirmed') {
       try {
         const data = JSON.parse(block.contractData);
-        this.executeContract(data.contractId, data.method, data.args || [], block.accountPub);
-      } catch { /* invalid call data */ }
+        this.enqueueContractExecution(data.contractId, data.method, data.args || [], block.accountPub);
+      } catch { /* invalid */ }
     }
 
-    // Track face → account count for open blocks
+    if (block.type === 'storage-register' && block.contractData) {
+      try {
+        const data = JSON.parse(block.contractData) as StorageRegisterData;
+        const existing = this.storageProviders.get(block.accountPub);
+        const provider: StorageProvider = {
+          pub: block.accountPub,
+          registeredAt: existing?.registeredAt ?? block.timestamp,
+          capacityGB: data.capacityGB,
+          lastHeartbeat: existing?.lastHeartbeat ?? 0,
+          heartbeatsLast24h: existing?.heartbeatsLast24h ?? 0,
+          lastRewardEpoch: existing?.lastRewardEpoch ?? 0,
+          totalEarned: existing?.totalEarned ?? 0,
+          avgLatencyMs: existing?.avgLatencyMs ?? 0,
+          spotCheckPassRate: existing?.spotCheckPassRate ?? 1.0,
+          score: existing?.score ?? 1.0,
+          earningRate: 0,
+        };
+        this.updateProviderScore(provider);
+        this.storageProviders.set(block.accountPub, provider);
+        this.emit('storage:registered', { pub: block.accountPub, capacityGB: data.capacityGB });
+      } catch { /* invalid */ }
+    }
+
+    if (block.type === 'storage-deregister') {
+      this.storageProviders.delete(block.accountPub);
+      this.emit('storage:deregistered', { pub: block.accountPub });
+    }
+
+    if (block.type === 'storage-heartbeat') {
+      const provider = this.storageProviders.get(block.accountPub);
+      if (provider) {
+        provider.lastHeartbeat = block.timestamp;
+        provider.heartbeatsLast24h = this.countHeartbeatsLast24h(block.accountPub, block.timestamp);
+        this.updateProviderScore(provider);
+        this.emit('storage:heartbeat', { pub: block.accountPub, timestamp: block.timestamp });
+      }
+    }
+
+    if (block.type === 'storage-reward' && block.contractData) {
+      try {
+        const data = JSON.parse(block.contractData) as StorageRewardData;
+        const provider = this.storageProviders.get(block.accountPub);
+        if (provider) {
+          provider.lastRewardEpoch = data.epochDay;
+          provider.totalEarned += data.amount;
+          this.updateProviderScore(provider);
+        }
+        this.emit('storage:reward', { pub: block.accountPub, amount: data.amount, epochDay: data.epochDay });
+      } catch { /* invalid */ }
+    }
+
     if (block.type === 'open' && block.faceMapHash) {
       const prev = this.faceAccountCount.get(block.faceMapHash) || 0;
       this.faceAccountCount.set(block.faceMapHash, prev + 1);
     }
 
-    // Update account metadata balance
     const acc = this.accounts.get(block.accountPub);
-    if (acc) {
-      acc.balance = block.balance;
-      acc.nonce = block.index;
-    }
+    if (acc) { acc.balance = block.balance; acc.nonce = block.index; }
 
     this.txTimestamps.push(Date.now());
-
-    if (voteResult === 'confirmed') {
-      this.emit('block:confirmed', block);
-    } else {
-      this.emit('block:conflict', block);
-    }
-
+    this.emit(voteResult === 'confirmed' ? 'block:confirmed' : 'block:conflict', block);
     this.emit('block:added', block);
     return { success: true };
   }
 
-  // ──── Conflict-Only Voting ────
+  // ── Storage reward validation (semantic, requires chain state) ────────────
+
+  private validateStorageReward(block: AccountBlock): string | null {
+    try {
+      const data = JSON.parse(block.contractData!) as StorageRewardData;
+      const provider = this.storageProviders.get(block.accountPub);
+      if (!provider || provider.capacityGB === 0) {
+        return 'storage-reward: account is not a registered storage provider';
+      }
+      if (provider.lastRewardEpoch >= data.epochDay) {
+        return `storage-reward: epoch ${data.epochDay} already rewarded`;
+      }
+      // Validate storedGB against capacity at epoch start — not current capacity
+      const capacityAtEpochStart = this.getCapacityAtEpochStart(block.accountPub, data.epochDay);
+      if (capacityAtEpochStart === 0) {
+        return 'storage-reward: not registered at epoch start';
+      }
+      if (data.storedGB !== capacityAtEpochStart) {
+        return `storage-reward: declared storedGB (${data.storedGB}) does not match epoch-start capacity (${capacityAtEpochStart})`;
+      }
+      const heartbeatCount = this.countHeartbeatsInEpoch(block.accountPub, data.epochDay);
+      if (heartbeatCount === 0) {
+        return 'storage-reward: no heartbeat blocks found for this epoch';
+      }
+      const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1.0);
+      const maxAllowed = Math.floor(BASE_STORAGE_RATE_MILLI * capacityAtEpochStart * uptimeFactor);
+      // Allow 10% tolerance for timing edge cases
+      if (data.amount > Math.ceil(maxAllowed * 1.1)) {
+        return `storage-reward: amount ${data.amount} exceeds maximum ${maxAllowed} (${capacityAtEpochStart}GB × ${uptimeFactor.toFixed(2)} uptime)`;
+      }
+      return null;
+    } catch {
+      return 'storage-reward: invalid contractData';
+    }
+  }
+
+  // ── Heartbeat helpers ─────────────────────────────────────────────────────
+
+  /** Count heartbeat blocks in the 24h window ending at refTime */
+  private countHeartbeatsLast24h(pub: string, refTime: number): number {
+    const chain = this.accountChains.get(pub) || [];
+    const cutoff = refTime - 24 * 60 * 60 * 1000;
+    return chain.filter(b => b.type === 'storage-heartbeat' && b.timestamp >= cutoff).length;
+  }
+
+  /** Count heartbeat blocks in the 24h window for a given epoch day */
+  countHeartbeatsInEpoch(pub: string, epochDay: number): number {
+    const chain = this.accountChains.get(pub) || [];
+    const epochStart = epochDay * REWARD_EPOCH_MS;
+    const epochEnd = epochStart + REWARD_EPOCH_MS;
+    return chain.filter(b => b.type === 'storage-heartbeat' && b.timestamp >= epochStart && b.timestamp < epochEnd).length;
+  }
 
   /**
-   * Cast a vote on a conflicted block.
-   * Only matters when two blocks share the same parent (fork).
+   * Return the registered capacity (GB) at the start of a given epoch day.
+   * Uses the last storage-register block committed before epochStart.
+   * Returns 0 if no registration existed at that time.
    */
-  castVote(vote: Vote): void {
-    // Verify balance proof: if vote includes a chain head hash, check that the
-    // block exists locally and its balance matches the claimed stake.
-    // If no proof, fall back to local ledger balance (backwards compat).
-    let verifiedStake: number;
+  getCapacityAtEpochStart(pub: string, epochDay: number): number {
+    const chain = this.accountChains.get(pub) || [];
+    const epochStart = epochDay * REWARD_EPOCH_MS;
+    // Walk backwards to find the last storage-register block before the epoch started
+    let capacity = 0;
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const b = chain[i];
+      if (b.timestamp >= epochStart) continue;
+      if (b.type === 'storage-deregister') { capacity = 0; break; }
+      if (b.type === 'storage-register' && b.contractData) {
+        try {
+          const d = JSON.parse(b.contractData) as StorageRegisterData;
+          capacity = d.capacityGB;
+        } catch { /* skip */ }
+        break;
+      }
+    }
+    return capacity;
+  }
 
+  // ── Voting ────────────────────────────────────────────────────────────────
+
+  castVote(vote: Vote): void {
+    let verifiedStake: number;
     if (vote.chainHeadHash) {
       const headBlock = this.allBlocks.get(vote.chainHeadHash);
       if (!headBlock) {
-        // We don't have this block — can't verify stake, use local balance
         verifiedStake = this.getAccountBalance(vote.voterPub);
       } else if (headBlock.accountPub !== vote.voterPub) {
-        // Chain head doesn't belong to voter — reject
         return;
       } else {
         verifiedStake = headBlock.balance;
@@ -435,80 +557,53 @@ export class DAGLedger extends EventEmitter {
     } else {
       verifiedStake = this.getAccountBalance(vote.voterPub);
     }
-
-    if (verifiedStake <= 0) return; // No stake = no vote
+    if (verifiedStake <= 0) return;
     this.votes.addVote({ ...vote, stake: verifiedStake });
   }
 
-  /**
-   * Resolve active conflicts. Called periodically.
-   * Only processes blocks that are in conflict (fork detected).
-   */
   processConflicts(): void {
     const { confirmed, rejected } = this.votes.resolveConflicts();
-    for (const hash of confirmed) {
-      this.emit('block:confirmed', this.allBlocks.get(hash));
-    }
-    for (const hash of rejected) {
-      this.handleRejectedBlock(hash);
-    }
+    for (const hash of confirmed) this.emit('block:confirmed', this.allBlocks.get(hash));
+    for (const hash of rejected) this.handleRejectedBlock(hash);
   }
 
   private handleRejectedBlock(blockHash: string): void {
     const block = this.allBlocks.get(blockHash);
     if (!block) return;
-
-    // Remove from account chain
     const chain = this.accountChains.get(block.accountPub);
     if (chain) {
-      const idx = chain.findIndex((b) => b.hash === blockHash);
+      const idx = chain.findIndex(b => b.hash === blockHash);
       if (idx !== -1) chain.splice(idx, 1);
     }
-
-    // Restore unclaimed send if this was a receive
     if (block.type === 'receive' && block.sendBlockHash) {
       const sendBlock = this.allBlocks.get(block.sendBlockHash);
-      if (sendBlock && sendBlock.type === 'send' && sendBlock.recipient && sendBlock.amount) {
-        this.unclaimedSends.set(block.sendBlockHash, {
-          fromPub: sendBlock.accountPub,
-          toPub: sendBlock.recipient,
-          amount: sendBlock.amount,
-        });
+      if (sendBlock?.type === 'send' && sendBlock.recipient && sendBlock.amount) {
+        this.unclaimedSends.set(block.sendBlockHash, { fromPub: sendBlock.accountPub, toPub: sendBlock.recipient, amount: sendBlock.amount });
       }
     }
-
     this.allBlocks.delete(blockHash);
     this.emit('block:rejected', block);
   }
 
-  getBlockStatus(blockHash: string): string {
-    return this.votes.getStatus(blockHash);
-  }
+  getBlockStatus(blockHash: string): string { return this.votes.getStatus(blockHash); }
 
-  // ──── Smart Contracts (Web Worker sandbox) ────
+  // ── Smart Contracts (Web Worker sandbox) ─────────────────────────────────
 
-  /** Max execution time for a contract call */
   private static readonly CONTRACT_TIMEOUT_MS = 3000;
 
-  /**
-   * Execute a contract in an isolated Web Worker.
-   *
-   * The worker has no access to the main thread's DOM, localStorage,
-   * fetch, or any other API — only `postMessage` to return a result.
-   * `importScripts` is explicitly blocked in the worker code.
-   * The worker is terminated after a timeout to prevent infinite loops.
-   */
-  private executeContract(contractId: string, method: string, args: unknown[], caller: string): unknown {
+  private enqueueContractExecution(contractId: string, method: string, args: unknown[], caller: string): void {
+    const prev = this.contractQueues.get(contractId) ?? Promise.resolve();
+    const next = prev.then(() => this.executeContractWorker(contractId, method, args, caller));
+    this.contractQueues.set(contractId, next.catch(() => { /* keep queue alive on error */ }));
+  }
+
+  private executeContractWorker(contractId: string, method: string, args: unknown[], caller: string): Promise<void> {
     const contract = this.contracts.get(contractId);
-    if (!contract) return null;
+    if (!contract) return Promise.resolve();
+    if (!/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(method)) return Promise.resolve();
 
-    // Validate method name to prevent injection
-    if (!/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(method)) return null;
-
-    // Build the worker code — runs in a completely isolated JS context
     const workerCode = `
       "use strict";
-      // Block remaining Worker globals
       const importScripts = undefined;
       const XMLHttpRequest = undefined;
       const WebSocket = undefined;
@@ -521,7 +616,6 @@ export class DAGLedger extends EventEmitter {
       self.onmessage = function(e) {
         const { state, caller, args, method } = e.data;
         try {
-          // Inject contract code into an isolated function scope
           const contractFn = new Function('state', 'caller', 'args',
             ${JSON.stringify(contract.code)} +
             "\\nif (typeof " + method + " === 'function') return " + method + "(...args);\\nreturn null;"
@@ -534,114 +628,90 @@ export class DAGLedger extends EventEmitter {
       };
     `;
 
-    try {
-      const blob = new Blob([workerCode], { type: 'application/javascript' });
-      const url = URL.createObjectURL(blob);
-      const worker = new Worker(url);
+    return new Promise((resolve) => {
+      try {
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        const worker = new Worker(url);
 
-      // Fire and forget — we can't truly await a Worker synchronously,
-      // so we handle the result via event and update state asynchronously
-      const timeout = setTimeout(() => {
-        worker.terminate();
-        URL.revokeObjectURL(url);
-        this.emit('contract:error', { contractId, method, error: 'Execution timed out' });
-      }, DAGLedger.CONTRACT_TIMEOUT_MS);
+        const timeout = setTimeout(() => {
+          worker.terminate();
+          URL.revokeObjectURL(url);
+          this.emit('contract:error', { contractId, method, error: 'Execution timed out' });
+          resolve();
+        }, DAGLedger.CONTRACT_TIMEOUT_MS);
 
-      worker.onmessage = (e: MessageEvent) => {
-        clearTimeout(timeout);
-        worker.terminate();
-        URL.revokeObjectURL(url);
+        worker.onmessage = (e: MessageEvent) => {
+          clearTimeout(timeout);
+          worker.terminate();
+          URL.revokeObjectURL(url);
+          const data = e.data as { ok: boolean; result?: unknown; state?: Record<string, unknown>; error?: string };
+          if (data.ok) {
+            if (data.state) contract.state = data.state;
+            this.emit('contract:executed', { contractId, method, result: data.result });
+          } else {
+            this.emit('contract:error', { contractId, method, error: data.error });
+          }
+          resolve();
+        };
 
-        const data = e.data as { ok: boolean; result?: unknown; state?: Record<string, unknown>; error?: string };
-        if (data.ok) {
-          if (data.state) contract.state = data.state;
-          this.emit('contract:executed', { contractId, method, result: data.result });
-        } else {
-          this.emit('contract:error', { contractId, method, error: data.error });
-        }
-      };
+        worker.onerror = (err: ErrorEvent) => {
+          clearTimeout(timeout);
+          worker.terminate();
+          URL.revokeObjectURL(url);
+          this.emit('contract:error', { contractId, method, error: err.message });
+          resolve();
+        };
 
-      worker.onerror = (err: ErrorEvent) => {
-        clearTimeout(timeout);
-        worker.terminate();
-        URL.revokeObjectURL(url);
-        this.emit('contract:error', { contractId, method, error: err.message });
-      };
-
-      worker.postMessage({
-        state: { ...contract.state },
-        caller,
-        args,
-        method,
-      });
-
-      return null; // Result delivered asynchronously via events
-    } catch (err) {
-      this.emit('contract:error', { contractId, method, error: String(err) });
-      return null;
-    }
+        worker.postMessage({ state: { ...contract.state }, caller, args, method });
+      } catch (err) {
+        this.emit('contract:error', { contractId, method, error: String(err) });
+        resolve();
+      }
+    });
   }
 
-  // ──── Queries ────
+  // ── Queries ───────────────────────────────────────────────────────────────
 
   getStats(): DAGStats {
     const now = Date.now();
-    this.txTimestamps = this.txTimestamps.filter((t) => now - t < 10000);
-    const tps = this.txTimestamps.length / 10;
-
-    let confirmedCount = 0;
-    let pendingCount = 0;
+    this.txTimestamps = this.txTimestamps.filter(t => now - t < 10000);
+    let confirmedCount = 0, pendingCount = 0;
     for (const [hash] of this.allBlocks) {
       if (this.votes.isConfirmed(hash)) confirmedCount++;
       else pendingCount++;
     }
-
     return {
-      network: this.network,
-      totalAccounts: this.accounts.size,
-      totalBlocks: this.allBlocks.size,
-      pendingBlocks: pendingCount,
-      confirmedBlocks: confirmedCount,
-      tps: tps.toFixed(1),
+      network: this.network, totalAccounts: this.accounts.size,
+      totalBlocks: this.allBlocks.size, pendingBlocks: pendingCount,
+      confirmedBlocks: confirmedCount, tps: (this.txTimestamps.length / 10).toFixed(1),
     };
   }
 
-  getAccountChain(pub: string): AccountBlock[] {
-    return this.accountChains.get(pub) || [];
-  }
+  getAccountChain(pub: string): AccountBlock[] { return this.accountChains.get(pub) || []; }
+  getAllBlocks(): AccountBlock[] { return Array.from(this.allBlocks.values()).sort((a, b) => b.timestamp - a.timestamp); }
+  getBlock(hash: string): AccountBlock | undefined { return this.allBlocks.get(hash); }
 
-  getAllBlocks(): AccountBlock[] {
-    return Array.from(this.allBlocks.values()).sort((a, b) => b.timestamp - a.timestamp);
-  }
-
-  getBlock(hash: string): AccountBlock | undefined {
-    return this.allBlocks.get(hash);
-  }
-
-  /**
-   * Get unclaimed sends for a specific recipient.
-   */
   getUnclaimedForAccount(pub: string): { sendBlockHash: string; fromPub: string; amount: number }[] {
     const result: { sendBlockHash: string; fromPub: string; amount: number }[] = [];
     for (const [hash, info] of this.unclaimedSends) {
-      if (info.toPub === pub) {
-        result.push({ sendBlockHash: hash, fromPub: info.fromPub, amount: info.amount });
-      }
+      if (info.toPub === pub) result.push({ sendBlockHash: hash, fromPub: info.fromPub, amount: info.amount });
     }
     return result;
   }
 
-  // ──── Reset ────
+  /** Get all active storage providers (capacityGB > 0), sorted by score descending */
+  getStorageProviders(): StorageProvider[] {
+    return Array.from(this.storageProviders.values())
+      .filter(p => p.capacityGB > 0)
+      .sort((a, b) => b.score - a.score);
+  }
 
   reset(): void {
-    this.accountChains.clear();
-    this.allBlocks.clear();
-    this.accounts.clear();
-    this.usernameToPublicKey.clear();
-    this.votes.clear();
-    this.contracts.clear();
-    this.unclaimedSends.clear();
-    this.faceAccountCount.clear();
+    this.accountChains.clear(); this.allBlocks.clear(); this.accounts.clear();
+    this.usernameToPublicKey.clear(); this.votes.clear(); this.contracts.clear(); this.contractQueues.clear();
+    this.unclaimedSends.clear(); this.faceAccountCount.clear();
+    this.storageProviders.clear();
     this.txTimestamps = [];
   }
 }
