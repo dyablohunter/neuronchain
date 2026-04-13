@@ -1,5 +1,7 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
-import { GunNetwork } from './gun-network';
+import { Libp2pNetwork } from './libp2p-network';
+import { HeliaStore } from './helia-store';
+import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
 import { VoteManager, Vote } from '../core/vote';
 import { KeyPair, signData, verifySignature } from '../core/crypto';
@@ -16,23 +18,32 @@ export interface NodeStats {
 
 export class NeuronNode extends EventEmitter {
   ledger: DAGLedger;
-  gunNet: GunNetwork;
+  /** libp2p P2P network layer */
+  net: Libp2pNetwork;
+  /** Helia/IPFS content store */
+  helia: HeliaStore;
+  /** Storage deal lifecycle manager */
+  storage: StorageManager;
+
   private status: 'stopped' | 'running' | 'validating' = 'stopped';
   private startTime: number | null = null;
   private voteProcessInterval: ReturnType<typeof setInterval> | null = null;
   private resyncInterval: ReturnType<typeof setInterval> | null = null;
+  private publishInterval: ReturnType<typeof setInterval> | null = null;
   private resyncDebounce: ReturnType<typeof setTimeout> | null = null;
+  private publishDebounce: ReturnType<typeof setTimeout> | null = null;
 
-  /** Keys of locally owned accounts — used for auto-voting and auto-receiving */
   localKeys: Map<string, KeyPair> = new Map();
   private processedInbox: Set<string> = new Set();
   private watchedInboxes: Set<string> = new Set();
-  private static readonly MAX_INBOX = 10000;
+  private static readonly MAX_INBOX = 10_000;
 
   constructor(network: NetworkType = 'testnet') {
     super();
     this.ledger = new DAGLedger(network);
-    this.gunNet = new GunNetwork(network);
+    this.net = new Libp2pNetwork(network);
+    this.helia = new HeliaStore();
+    this.storage = new StorageManager(this.ledger, this.net, this.helia, this.localKeys);
   }
 
   private eventsWired = false;
@@ -40,48 +51,34 @@ export class NeuronNode extends EventEmitter {
   private wireEvents(): void {
     if (this.eventsWired) return;
     this.eventsWired = true;
-    // Accounts synced from peers — register locally if new, verify signature
-    this.gunNet.on('account:synced', async (data: unknown) => {
+
+    this.net.on('account:synced', async (data: unknown) => {
       const acc = data as Record<string, unknown>;
       const pub = String(acc.pub);
       if (this.ledger.accounts.has(pub)) return;
-
-      // If the account has a signature, verify it came from the owner
       if (acc._sig) {
         const valid = await NeuronNode.verifyAccountData(acc);
-        if (!valid) {
-          console.warn(`[Node] Rejected account ${pub.slice(0, 12)}... — invalid signature`);
-          return;
-        }
+        if (!valid) { console.warn(`[Node] Rejected account ${pub.slice(0, 12)}... - invalid signature`); return; }
       }
-
       this.ledger.registerAccount({
-        username: String(acc.username),
-        pub,
-        balance: Number(acc.balance || 0),
-        nonce: Number(acc.nonce || 0),
-        createdAt: Number(acc.createdAt || 0),
-        faceMapHash: String(acc.faceMapHash || ''),
+        username: String(acc.username), pub,
+        balance: Number(acc.balance || 0), nonce: Number(acc.nonce || 0),
+        createdAt: Number(acc.createdAt || 0), faceMapHash: String(acc.faceMapHash || ''),
       });
       this.emit('account:synced', acc);
+      // A new peer has data - reply with ours so the handshake completes both ways
+      if (this.publishDebounce) clearTimeout(this.publishDebounce);
+      this.publishDebounce = setTimeout(() => {
+        this.publishDebounce = null;
+        this.publishLocalData();
+      }, 500);
     });
 
-    // Blocks from peers
-    this.gunNet.on('block:received', async (block: unknown) => {
+    this.net.on('block:received', async (block: unknown) => {
       const b = block as AccountBlock;
-
-      // If this is an open block for an unknown account, register it first
       if (b.type === 'open' && !this.ledger.accounts.has(b.accountPub)) {
-        this.ledger.registerAccount({
-          username: b.accountPub, // temporary — will be updated by account:synced
-          pub: b.accountPub,
-          balance: 0,
-          nonce: 0,
-          createdAt: b.timestamp,
-          faceMapHash: b.faceMapHash || '',
-        });
+        this.ledger.registerAccount({ username: b.accountPub, pub: b.accountPub, balance: 0, nonce: 0, createdAt: b.timestamp, faceMapHash: b.faceMapHash || '' });
       }
-
       const result = await this.ledger.addBlock(b);
       if (result.success) {
         this.emit('block:received', b);
@@ -90,316 +87,292 @@ export class NeuronNode extends EventEmitter {
       }
     });
 
-    // Votes from peers — verify signature client-side before accepting
-    this.gunNet.on('vote:received', async (vote: unknown) => {
+    this.net.on('vote:received', async (vote: unknown) => {
       const v = vote as Vote;
       const valid = await VoteManager.verifyVote(v);
-      if (!valid) {
-        console.warn(`[Node] Rejected vote from ${v.voterPub?.slice(0, 12)}... — invalid signature`);
-        return;
-      }
+      if (!valid) { console.warn(`[Node] Rejected vote from ${v.voterPub?.slice(0, 12)}... - invalid signature`); return; }
       this.ledger.castVote(v);
       this.emit('vote:received', v);
     });
 
-    // Ledger events
-    this.ledger.on('block:added', (block: unknown) => this.emit('block:added', block));
-    this.ledger.on('block:confirmed', (block: unknown) => this.emit('block:confirmed', block));
-    this.ledger.on('block:conflict', (block: unknown) => this.emit('block:conflict', block));
-    this.ledger.on('block:rejected', (block: unknown) => this.emit('block:rejected', block));
-    this.ledger.on('contract:deployed', (data: unknown) => this.emit('contract:deployed', data));
-    this.ledger.on('contract:executed', (data: unknown) => this.emit('contract:executed', data));
-    this.ledger.on('contract:error', (data: unknown) => this.emit('contract:error', data));
+    this.ledger.on('block:added',      (b: unknown) => this.emit('block:added', b));
+    this.ledger.on('block:confirmed',  (b: unknown) => this.emit('block:confirmed', b));
+    this.ledger.on('block:conflict',   (b: unknown) => this.emit('block:conflict', b));
+    this.ledger.on('block:rejected',   (b: unknown) => this.emit('block:rejected', b));
+    this.ledger.on('contract:deployed',(d: unknown) => this.emit('contract:deployed', d));
+    this.ledger.on('contract:executed',(d: unknown) => this.emit('contract:executed', d));
+    this.ledger.on('contract:error',   (d: unknown) => this.emit('contract:error', d));
 
-    this.gunNet.on('peer:connected', (peerId: unknown) => this.emit('peer:connected', peerId));
-    this.gunNet.on('peer:disconnected', (peerId: unknown) => this.emit('peer:disconnected', peerId));
+    this.net.on('peer:connected', (id: unknown) => {
+      this.emit('peer:connected', id);
+      // Re-broadcast all local accounts and blocks so the newly connected
+      // peer can sync state. Debounced so rapid multi-peer connections only
+      // trigger one publish. 2s delay lets the GossipSub mesh form first.
+      if (this.publishDebounce) clearTimeout(this.publishDebounce);
+      this.publishDebounce = setTimeout(() => {
+        this.publishDebounce = null;
+        this.publishLocalData();
+      }, 2000);
+    });
+    this.net.on('peer:disconnected', (id: unknown) => this.emit('peer:disconnected', id));
 
-    // Start inbox watches for all local keys
-    for (const pub of this.localKeys.keys()) {
-      this.startInboxWatch(pub);
-    }
+    this.net.on('generation:changed', () => {
+      // A peer broadcast a higher generation number (= testnet reset).
+      // libp2p-network.ts already wiped IndexedDB and processedBlocks when it
+      // received the message. Here we wipe the in-memory ledger so we don't
+      // (a) keep publishing zombie blocks from the old generation that peers
+      //     will reject via the `_gen < this.generation` filter, or
+      // (b) have unclaimedSends / balances from the old chain confusing new blocks.
+      // localKeys must also be cleared - the accounts those keys belong to no
+      // longer exist after a reset; they will be re-added via addLocalKey() after
+      // the user creates/recovers their account in the new generation.
+      // generation:reset → main.ts → location.reload() to fully flush JS heap.
+      this.ledger.reset();
+      this.localKeys.clear();
+      this.processedInbox.clear();
+      this.emit('generation:reset');
+    });
+
+    this.storage.on('storage:heartbeat-sent', (d: unknown) => this.emit('storage:heartbeat-sent', d));
+    this.storage.on('storage:reward-issued',  (d: unknown) => this.emit('storage:reward-issued', d));
+    this.storage.on('storage:pinned',         (d: unknown) => this.emit('storage:pinned', d));
+
+    for (const pub of this.localKeys.keys()) this.startInboxWatch(pub);
   }
 
-  /**
-   * Vote on a block — only if it's in conflict (fork detected).
-   * Uncontested blocks are confirmed optimistically without voting.
-   */
   private async voteIfConflict(block: AccountBlock): Promise<void> {
-    const status = this.ledger.votes.getStatus(block.hash);
-    if (status !== 'conflict') return; // No conflict — no vote needed
-
+    if (this.ledger.votes.getStatus(block.hash) !== 'conflict') return;
     for (const [pub, keys] of this.localKeys) {
       const balance = this.ledger.getAccountBalance(pub);
       if (balance <= 0) continue;
       const head = this.ledger.getAccountHead(pub);
-      const chainHeadHash = head?.hash;
-      const vote = await VoteManager.createVote(block.hash, true, balance, keys, chainHeadHash);
+      const vote = await VoteManager.createVote(block.hash, true, balance, keys, head?.hash);
       this.ledger.castVote(vote);
-      this.gunNet.publishVote(vote);
+      this.net.publishVote(vote);
     }
   }
 
-  /** Auto-receive sends addressed to local accounts */
   private async autoReceive(block: AccountBlock): Promise<void> {
     if (block.type !== 'send' || !block.recipient) return;
     const keys = this.localKeys.get(block.recipient);
     if (!keys) return;
-
     setTimeout(async () => {
       const result = await this.ledger.createReceive(block.recipient!, block.hash, keys);
       if (result.block) {
         await this.ledger.addBlock(result.block);
-        this.gunNet.publishBlock(result.block);
+        this.net.publishBlock(result.block);
         this.emit('auto:received', { from: block.accountPub, amount: block.amount });
       }
     }, 500);
   }
 
+  // Sweep ledger.unclaimedSends for any sends addressed to local keys and
+  // auto-receive them. This is the fallback path for missed auto-receives.
+  //
+  // Why this is needed:
+  //   autoReceive() fires from the block:received event, which is only emitted
+  //   once per block hash (processedBlocks dedup prevents re-emission on
+  //   gossipsub re-broadcasts). If the recipient's node missed that single
+  //   delivery window - e.g. the gossipsub mesh hadn't fully formed yet when
+  //   the sender first published the block - the receive is never created and
+  //   no amount of re-broadcasting will fix it via the event path.
+  //
+  //   sweepUnclaimedReceives() bypasses gossipsub entirely and works directly
+  //   off ledger.unclaimedSends, which is populated whenever a send block is
+  //   successfully added to the ledger (regardless of how it arrived).
+  //
+  // Called: 4s after node start, every 20s alongside publishLocalData(),
+  //         and 1s after addLocalKey() (covers sends that arrived before
+  //         the user recovered their keys).
+  private async sweepUnclaimedReceives(): Promise<void> {
+    for (const [pub, keys] of this.localKeys) {
+      const unclaimed = this.ledger.getUnclaimedForAccount(pub);
+      for (const { sendBlockHash, fromPub, amount } of unclaimed) {
+        const result = await this.ledger.createReceive(pub, sendBlockHash, keys);
+        if (result.block) {
+          await this.ledger.addBlock(result.block);
+          this.net.publishBlock(result.block);
+          this.emit('auto:received', { from: fromPub, amount });
+        }
+      }
+    }
+  }
+
   private startInboxWatch(pub: string): void {
     if (this.watchedInboxes.has(pub)) return;
     this.watchedInboxes.add(pub);
-    this.gunNet.watchInbox(pub, async (signal) => {
+    this.net.watchInbox(pub, async (signal) => {
       const key = `${signal.blockHash}:${signal.sender}`;
       if (this.processedInbox.has(key)) return;
-
-      // Verify inbox signal signature if present
       if (signal.signature) {
         const payload = `inbox:${signal.blockHash}:${signal.sender}:${pub}:${signal.amount}`;
         const result = await verifySignature(signal.signature, signal.sender);
-        if (result !== payload) {
-          console.warn(`[Inbox] Rejected signal from ${signal.sender.slice(0, 12)}... — invalid signature`);
-          return;
-        }
+        if (result !== payload) { console.warn(`[Inbox] Rejected signal - invalid signature`); return; }
       }
-
       this.processedInbox.add(key);
       if (this.processedInbox.size > NeuronNode.MAX_INBOX) {
         const first = this.processedInbox.values().next().value!;
         this.processedInbox.delete(first);
       }
-      console.log(`[Inbox] Signal from ${signal.sender.slice(0, 12)}... block ${signal.blockHash.slice(0, 12)}...`);
       this.emit('inbox:signal', signal);
-      if (!this.ledger.allBlocks.has(signal.blockHash)) {
-        this.resyncAccount(signal.sender);
-      }
+      if (!this.ledger.allBlocks.has(signal.blockHash)) this.resyncAccount(signal.sender);
     });
   }
 
-  /** Fast targeted resync — fetch only one account's data from Gun */
   private async resyncAccount(accountPub: string): Promise<void> {
     try {
-      // Ensure account exists locally
       if (!this.ledger.accounts.has(accountPub)) {
-        const accData = await this.gunNet.loadAccount(accountPub);
-        if (accData && accData.username) {
-          // Verify signature if present
+        const accData = await this.net.loadAccount(accountPub);
+        if (accData?.username) {
           if (accData._sig) {
             const valid = await NeuronNode.verifyAccountData(accData);
-            if (!valid) {
-              console.warn(`[Resync] Rejected account ${accountPub.slice(0, 12)}... — invalid signature`);
-              return;
-            }
+            if (!valid) { console.warn(`[Resync] Rejected account - invalid signature`); return; }
           }
           let faceDescriptor: number[] | undefined;
-          if (accData.faceDescriptor) {
-            try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch { /* ignore */ }
-          }
+          if (accData.faceDescriptor) { try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch {} }
           this.ledger.registerAccount({
-            username: String(accData.username),
-            pub: String(accData.pub || accountPub),
-            balance: Number(accData.balance || 0),
-            nonce: Number(accData.nonce || 0),
-            createdAt: Number(accData.createdAt || 0),
-            faceMapHash: String(accData.faceMapHash || ''),
+            username: String(accData.username), pub: String(accData.pub || accountPub),
+            balance: Number(accData.balance || 0), nonce: Number(accData.nonce || 0),
+            createdAt: Number(accData.createdAt || 0), faceMapHash: String(accData.faceMapHash || ''),
             faceDescriptor,
           });
         }
       }
-
-      // Fetch just this account's chain
-      const blocks = await this.gunNet.loadAccountChain(accountPub);
+      const blocks = await this.net.loadAccountChain(accountPub);
       let newBlocks = 0;
       for (const block of blocks) {
         if (!this.ledger.allBlocks.has(block.hash)) {
           const result = await this.ledger.addBlock(block);
-          if (result.success) {
-            newBlocks++;
-            this.voteIfConflict(block);
-            this.autoReceive(block);
-          }
+          if (result.success) { newBlocks++; this.voteIfConflict(block); this.autoReceive(block); }
         }
       }
-      if (newBlocks > 0) {
-        console.log(`[Inbox resync] +${newBlocks} blocks for ${accountPub.slice(0, 12)}...`);
-        this.emit('resync', { newAccounts: 0, newBlocks });
-      }
-    } catch (err) {
-      console.error('[Inbox resync] error:', err);
-    }
+      if (newBlocks > 0) { this.emit('resync', { newAccounts: 0, newBlocks }); }
+    } catch (err) { console.error('[Resync] error:', err); }
   }
 
-  /** Register a local key and start watching its inbox if the node is running */
   addLocalKey(pub: string, keys: KeyPair): void {
     this.localKeys.set(pub, keys);
     if (this.status !== 'stopped') {
       this.startInboxWatch(pub);
+      setTimeout(() => this.sweepUnclaimedReceives(), 1000);
     }
   }
 
-  // ──── Lifecycle ────
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   async start(): Promise<void> {
     if (this.status !== 'stopped') return;
-
-    await this.gunNet.start();
+    await this.net.start();
+    // Pass the NeuronChain libp2p node so Helia shares peer connections instead
+    // of bootstrapping its own separate node off public IPFS infrastructure.
+    await this.helia.start(this.net.libp2p);
+    this.storage.start();
     this.wireEvents();
 
-    // Load persisted data
-    const chains = await this.gunNet.loadAccountChains();
-    const accounts = await this.gunNet.loadAccounts();
-    const contracts = await this.gunNet.loadContracts();
+    const [chains, accounts, contracts] = await Promise.all([
+      this.net.loadAccountChains(),
+      this.net.loadAccounts(),
+      this.net.loadContracts(),
+    ]);
 
     for (const [pub, accData] of accounts) {
       let faceDescriptor: number[] | undefined;
-      if (accData.faceDescriptor) {
-        try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch { /* ignore */ }
-      }
+      if (accData.faceDescriptor) { try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch {} }
       this.ledger.registerAccount({
-        username: String(accData.username || ''),
-        pub: String(accData.pub || pub),
-        balance: Number(accData.balance || 0),
-        nonce: Number(accData.nonce || 0),
-        createdAt: Number(accData.createdAt || 0),
-        faceMapHash: String(accData.faceMapHash || ''),
+        username: String(accData.username || ''), pub: String(accData.pub || pub),
+        balance: Number(accData.balance || 0), nonce: Number(accData.nonce || 0),
+        createdAt: Number(accData.createdAt || 0), faceMapHash: String(accData.faceMapHash || ''),
         faceDescriptor,
       });
     }
 
     for (const [, chain] of chains) {
-      for (const block of chain) {
-        await this.ledger.addBlock(block);
-      }
+      for (const block of chain) await this.ledger.addBlock(block);
     }
 
-    // Rebuild face account count from loaded blocks
     this.ledger.rebuildFaceAccountCount();
 
     for (const [id, cData] of contracts) {
       if (!this.ledger.contracts.has(id)) {
         this.ledger.contracts.set(id, {
-          owner: String(cData.owner || ''),
-          code: String(cData.code || ''),
-          state: {},
-          name: String(cData.name || ''),
-          deployedAt: Number(cData.deployedAt || 0),
+          owner: String(cData.owner || ''), code: String(cData.code || ''),
+          state: {}, name: String(cData.name || ''), deployedAt: Number(cData.deployedAt || 0),
         });
       }
     }
 
-    // Periodic vote processing
-    this.voteProcessInterval = setInterval(() => {
-      this.ledger.processConflicts();
-    }, 3000);
+    this.voteProcessInterval = setInterval(() => this.ledger.processConflicts(), 3000);
+    this.resyncInterval = setInterval(() => this.resyncFromNet(), 60_000);
+    // Re-publish every 20s so late-joining peers receive our data within one cycle
+    this.publishInterval = setInterval(() => {
+      this.publishLocalData();
+      this.sweepUnclaimedReceives();
+    }, 20_000);
 
-    // Background resync — infrequent, just a safety net for missed events
-    this.resyncInterval = setInterval(() => this.resyncFromGun(), 60000);
+    // Publish local state once on startup so any already-connected peers receive it
+    setTimeout(() => this.publishLocalData(), 3000);
+    // Sweep for any unclaimed sends that arrived before keys were loaded
+    setTimeout(() => this.sweepUnclaimedReceives(), 4000);
 
     this.status = 'running';
     this.startTime = Date.now();
     this.emit('node:started');
   }
 
-  /** Poll Gun for accounts and blocks we may have missed */
-  private async resyncFromGun(): Promise<void> {
+  private async resyncFromNet(): Promise<void> {
     try {
-      // Resync accounts first (so blocks can reference them)
-      const accounts = await this.gunNet.loadAccounts();
+      const accounts = await this.net.loadAccounts();
       let newAccounts = 0;
       for (const [pub, accData] of accounts) {
-        if (!accData.username) continue; // Skip null/deleted entries
-        // Verify signature if present — reject spoofed accounts
+        if (!accData.username) continue;
         if (accData._sig) {
           const valid = await NeuronNode.verifyAccountData(accData);
-          if (!valid) {
-            console.warn(`[Resync] Rejected account ${pub.slice(0, 12)}... — invalid signature`);
-            continue;
-          }
+          if (!valid) continue;
         }
         const existing = this.ledger.accounts.has(pub);
         let faceDescriptor: number[] | undefined;
-        if (accData.faceDescriptor) {
-          try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch { /* ignore */ }
-        }
+        if (accData.faceDescriptor) { try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch {} }
         this.ledger.registerAccount({
-          username: String(accData.username),
-          pub: String(accData.pub || pub),
-          balance: Number(accData.balance || 0),
-          nonce: Number(accData.nonce || 0),
-          createdAt: Number(accData.createdAt || 0),
-          faceMapHash: String(accData.faceMapHash || ''),
+          username: String(accData.username), pub: String(accData.pub || pub),
+          balance: Number(accData.balance || 0), nonce: Number(accData.nonce || 0),
+          createdAt: Number(accData.createdAt || 0), faceMapHash: String(accData.faceMapHash || ''),
           faceDescriptor,
         });
         if (!existing) newAccounts++;
       }
 
-      // Resync blocks
-      const chains = await this.gunNet.loadAccountChains();
+      const chains = await this.net.loadAccountChains();
       let newBlocks = 0;
       for (const [accountPub, chain] of chains) {
-        // Ensure account exists before adding blocks
         if (!this.ledger.accounts.has(accountPub)) {
-          this.ledger.registerAccount({
-            username: accountPub.slice(0, 16),
-            pub: accountPub,
-            balance: 0,
-            nonce: 0,
-            createdAt: Date.now(),
-            faceMapHash: '',
-          });
+          this.ledger.registerAccount({ username: accountPub.slice(0, 16), pub: accountPub, balance: 0, nonce: 0, createdAt: Date.now(), faceMapHash: '' });
         }
-
         for (const block of chain) {
           if (!this.ledger.allBlocks.has(block.hash)) {
             const result = await this.ledger.addBlock(block);
-            if (result.success) {
-              newBlocks++;
-              this.voteIfConflict(block);
-              this.autoReceive(block);
-            } else {
-              console.log(`[Resync] Failed to add block ${block.hash.slice(0, 12)}: ${result.error}`);
-            }
+            if (result.success) { newBlocks++; this.voteIfConflict(block); this.autoReceive(block); }
           }
         }
       }
-
       if (newAccounts > 0 || newBlocks > 0) {
         this.ledger.rebuildFaceAccountCount();
-        console.log(`[Resync] +${newAccounts} accounts, +${newBlocks} blocks`);
         this.emit('resync', { newAccounts, newBlocks });
       }
-    } catch (err) {
-      console.error('Resync error:', err);
-    }
+    } catch (err) { console.error('[Resync] error:', err); }
   }
 
-  /** On-demand resync — debounced so rapid calls don't spam Gun */
   requestResync(): void {
     if (this.status === 'stopped') return;
     if (this.resyncDebounce) clearTimeout(this.resyncDebounce);
-    this.resyncDebounce = setTimeout(() => {
-      this.resyncDebounce = null;
-      this.resyncFromGun();
-    }, 500);
+    this.resyncDebounce = setTimeout(() => { this.resyncDebounce = null; this.resyncFromNet(); }, 500);
   }
 
-  /** Sign account data so peers can verify authenticity */
   private async signAccountData(acc: Record<string, unknown>, keys: KeyPair): Promise<Record<string, unknown>> {
     const payload = `account:${acc.pub}:${acc.username}:${acc.createdAt}:${acc.faceMapHash}`;
     const signature = await signData(payload, keys);
     return { ...acc, _sig: signature };
   }
 
-  /** Verify that account data was signed by the claimed pub key owner */
   private static async verifyAccountData(acc: Record<string, unknown>): Promise<boolean> {
     if (!acc._sig || !acc.pub) return false;
     const payload = `account:${acc.pub}:${acc.username}:${acc.createdAt}:${acc.faceMapHash}`;
@@ -407,56 +380,32 @@ export class NeuronNode extends EventEmitter {
     return result === payload;
   }
 
-  /** Publish all local accounts and blocks to Gun (call after registering accounts) */
   async publishLocalData(): Promise<void> {
     let published = 0;
-
-    // Publish all accounts (signed with owner's keys)
     for (const [pub, acc] of this.ledger.accounts) {
       const keys = this.localKeys.get(pub);
       const accData: Record<string, unknown> = {
-        username: acc.username,
-        pub: acc.pub,
-        balance: acc.balance,
-        nonce: acc.nonce,
-        createdAt: acc.createdAt,
-        faceMapHash: acc.faceMapHash,
+        username: acc.username, pub: acc.pub, balance: acc.balance, nonce: acc.nonce,
+        createdAt: acc.createdAt, faceMapHash: acc.faceMapHash,
         faceDescriptor: acc.faceDescriptor ? JSON.stringify(acc.faceDescriptor) : undefined,
       };
-      if (keys) {
-        this.gunNet.saveAccount(pub, await this.signAccountData(accData, keys));
-      } else {
-        this.gunNet.saveAccount(pub, accData);
-      }
+      this.net.saveAccount(pub, keys ? await this.signAccountData(accData, keys) : accData);
     }
-
-    // Publish all blocks
-    for (const [, block] of this.ledger.allBlocks) {
-      this.gunNet.publishBlock(block);
-      published++;
-    }
-
-    if (published > 0) {
-      console.log(`[Node] Published ${this.ledger.accounts.size} accounts and ${published} blocks to Gun`);
-    }
+    for (const [, block] of this.ledger.allBlocks) { this.net.publishBlock(block); published++; }
+    if (published > 0) { /* published */ }
   }
 
   async stop(): Promise<void> {
     this.stopValidating();
-    if (this.voteProcessInterval) {
-      clearInterval(this.voteProcessInterval);
-      this.voteProcessInterval = null;
-    }
-    if (this.resyncInterval) {
-      clearInterval(this.resyncInterval);
-      this.resyncInterval = null;
-    }
-    if (this.resyncDebounce) {
-      clearTimeout(this.resyncDebounce);
-      this.resyncDebounce = null;
-    }
-    await this.gunNet.stop();
-    this.gunNet.removeAllListeners();
+    if (this.voteProcessInterval) { clearInterval(this.voteProcessInterval); this.voteProcessInterval = null; }
+    if (this.resyncInterval) { clearInterval(this.resyncInterval); this.resyncInterval = null; }
+    if (this.publishInterval) { clearInterval(this.publishInterval); this.publishInterval = null; }
+    if (this.resyncDebounce) { clearTimeout(this.resyncDebounce); this.resyncDebounce = null; }
+    if (this.publishDebounce) { clearTimeout(this.publishDebounce); this.publishDebounce = null; }
+    this.storage.stop();
+    await this.helia.stop();
+    await this.net.stop();
+    this.net.removeAllListeners();
     this.ledger.removeAllListeners();
     this.eventsWired = false;
     this.processedInbox.clear();
@@ -466,8 +415,6 @@ export class NeuronNode extends EventEmitter {
     this.emit('node:stopped');
   }
 
-  // ──── Validating (participate in consensus voting) ────
-
   startValidating(): void {
     if (this.status === 'stopped') return;
     this.status = 'validating';
@@ -475,42 +422,54 @@ export class NeuronNode extends EventEmitter {
   }
 
   stopValidating(): void {
-    if (this.status === 'validating') {
-      this.status = 'running';
-      this.emit('validating:stopped');
-    }
+    if (this.status === 'validating') { this.status = 'running'; this.emit('validating:stopped'); }
   }
 
-  // ──── Public API ────
+  // ── Public API ────────────────────────────────────────────────────────────
 
   async submitBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
     const result = await this.ledger.addBlock(block);
     if (result.success) {
-      this.gunNet.publishBlock(block);
+      this.net.publishBlock(block);
       this.voteIfConflict(block);
       if (block.type === 'send' && block.recipient) {
-        // Sign inbox signal so recipients can verify the sender
         const keys = this.localKeys.get(block.accountPub);
         let inboxSig: string | undefined;
         if (keys) {
           const payload = `inbox:${block.hash}:${block.accountPub}:${block.recipient}:${block.amount ?? 0}`;
           inboxSig = await signData(payload, keys);
         }
-        this.gunNet.publishInboxSignal(block.recipient, block.accountPub, block.hash, block.amount ?? 0, inboxSig);
+        this.net.publishInboxSignal(block.recipient, block.accountPub, block.hash, block.amount ?? 0, inboxSig);
       }
     }
     return result;
   }
 
+  /** Register as a storage provider. capacityGB = 0 deregisters. */
+  async registerStorage(pub: string, capacityGB: number, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
+    const result = await this.ledger.createStorageRegister(pub, capacityGB, keys);
+    if (!result.block) return { success: false, error: result.error };
+    return this.submitBlock(result.block);
+  }
+
+  /** Deregister from the storage ledger entirely. */
+  async deregisterStorage(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
+    const result = await this.ledger.createStorageDeregister(pub, keys);
+    if (!result.block) return { success: false, error: result.error };
+    return this.submitBlock(result.block);
+  }
+
+  /** Distribute a stored CID to up to 10 network providers. */
+  async distributeContent(cid: string, uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {
+    return this.storage.distributeContent(cid, uploaderPub, keys);
+  }
+
   getStats(): NodeStats {
-    const netStats = this.gunNet.getStats();
+    const netStats = this.net.getStats();
     return {
-      status: this.status,
-      uptime: this.startTime ? Date.now() - this.startTime : 0,
-      network: this.ledger.network,
-      peerId: netStats.peerId,
-      peerCount: netStats.peerCount,
-      synapses: netStats.synapses,
+      status: this.status, uptime: this.startTime ? Date.now() - this.startTime : 0,
+      network: this.ledger.network, peerId: netStats.peerId,
+      peerCount: netStats.peerCount, synapses: netStats.synapses,
     };
   }
 
@@ -518,7 +477,7 @@ export class NeuronNode extends EventEmitter {
     const wasRunning = this.status !== 'stopped';
     if (wasRunning) await this.stop();
     this.ledger = new DAGLedger(network);
-    this.gunNet = new GunNetwork(network);
+    this.net = new Libp2pNetwork(network);
     this.emit('network:switched', network);
   }
 }

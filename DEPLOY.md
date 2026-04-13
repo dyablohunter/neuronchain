@@ -3,8 +3,8 @@
 ## Overview
 
 NeuronChain consists of two parts:
-1. **Static frontend** — the built `dist/` folder (HTML/JS/CSS + face-api.js models)
-2. **Gun relay server** — a Node.js process that handles WebSocket P2P sync
+1. **Static frontend** - the built `dist/` folder (HTML/JS/CSS + face-api.js models)
+2. **Gun relay server** - a Node.js process that handles WebSocket P2P sync
 
 Both can run on the same server or be split across multiple servers for scale.
 
@@ -142,7 +142,7 @@ pm2 startup  # auto-start on reboot
 
 ### Step 5: Update the relay URL
 
-In `src/network/gun-network.ts`, the `getRelayUrl()` function auto-detects the origin. Since nginx proxies `/gun` to the Gun relay, no code changes needed — it just works.
+In `src/network/gun-network.ts`, the `getRelayUrl()` function auto-detects the origin. Since nginx proxies `/gun` to the Gun relay, no code changes needed - it just works.
 
 For a custom relay URL, set it explicitly:
 
@@ -302,9 +302,9 @@ Create a new Web Service → point to repo → set start command to `node server
 The `dist/models/` directory contains the face recognition model weights (~7MB). These must be served alongside the app. If using a CDN, ensure the models are included in the deployment.
 
 The models are:
-- `tiny_face_detector_model-*` — face detection
-- `face_landmark_68_model-*` — facial landmarks
-- `face_recognition_model-*` — 128-D face descriptors
+- `tiny_face_detector_model-*` - face detection
+- `face_landmark_68_model-*` - facial landmarks
+- `face_recognition_model-*` - 128-D face descriptors
 
 ---
 
@@ -357,7 +357,7 @@ du -sh relay-data/
 | 1,000-10,000 | 2-3 relay servers behind load balancer |
 | 10,000+ | Multiple relay clusters + CDN for static assets |
 
-The block-lattice DAG with optimistic confirmation means throughput scales with the number of active accounts, not the number of nodes. The relay is the bottleneck — add more relay servers for more capacity.
+The block-lattice DAG with optimistic confirmation means throughput scales with the number of active accounts, not the number of nodes. The relay is the bottleneck - add more relay servers for more capacity.
 
 ---
 

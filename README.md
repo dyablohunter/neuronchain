@@ -1,13 +1,13 @@
 # NeuronChain
 
-A browser-based blockchain using a **block-lattice DAG** with **stake-weighted voting** and **face-locked keys**. Everything runs in the browser — the Gun relay is embedded in the Vite dev server.
+A browser-based blockchain using a **block-lattice DAG** with **stake-weighted voting** and **face-locked keys**. Powered by **libp2p** (WebRTC + GossipSub + Kademlia DHT) and **Helia/IPFS** for decentralised content storage - no central relay on the data path.
 
 ## Currency: Neuron Unit (UNIT)
 
 - **1,000,000 UNIT** minted per account upon creation (FaceID mandatory)
-- **3 decimal precision** (milli-UNIT) — smallest transferable unit is 0.001 UNIT
+- **3 decimal precision** (milli-UNIT) - smallest transferable unit is 0.001 UNIT
 - All operations are **zero fee**
-- Inflationary: total supply grows with each new account (limited to the total number of people)
+- Inflationary: total supply grows with each new account (limited to total number of humans)
 - **Mainnet:** 1 account per face (1 human = 1 account)
 - **Testnet:** up to 3 accounts per face (for testing)
 
@@ -15,347 +15,241 @@ A browser-based blockchain using a **block-lattice DAG** with **stake-weighted v
 
 ```bash
 npm install
-npm run dev        # Starts Vite + Gun relay on one port
-npm run tunnel     # (second terminal) HTTPS tunnel for multiple devices testing
+npm run dev        # Starts Vite + libp2p relay on port 9090
+npm run tunnel     # (second terminal) HTTPS tunnel for multiple-device testing
 ```
 
-**For mobile:** open the tunnel URL (e.g., `https://xxx.trycloudflare.com`) on your phone.
+**For mobile / multi-device:** open the tunnel URL on your phone.
 
 ### First Steps
 
-1. **Create account** — Account tab → choose username → face scan → 1,000,000 UNIT minted
-2. **Start node** — Node tab → Start Node (connects to Gun relay, starts syncing)
-3. **Send UNIT** — Transfer tab → recipient username → amount
-4. **Claim receives** — Transfer tab → Pending Receives → Claim
-5. **Recover account** — Account tab → enter username → face scan (from any device)
+1. **Create account** - Account tab → choose username → face scan → 1,000,000 UNIT minted
+2. **Start node** - Node tab → Start Node (connects to relay, starts syncing via libp2p + Helia)
+3. **Send UNIT** - Transfer tab → recipient username → amount
+4. **Claim receives** - Transfer tab → Pending Receives → Claim
+5. **Recover account** - Account tab → enter username → face scan (from any device)
+6. **Store content** - Storage tab → select account → paste JSON or upload file → get CID
+7. **Deploy contract** - Contracts tab → load Token or NFT template → deploy
 
-### Important
+### Production Relay
 
-- **Start Node first** on each device before creating accounts — ensures data syncs to the relay immediately
-- Only **one tab per browser** is allowed (prevents account farming)
-- Usernames are always **lowercase** (auto-converted)
-- Accounts and blocks sync across devices every ~8 seconds via Gun relay polling
+Run the relay server independently (separate from the app):
 
-## Face-Locked Keys
-
-Your private key is **encrypted with your face**. No seed phrases, no passwords.
-
-### How It Works
-
-1. Choose a username (3-24 chars, lowercase alphanumeric + dot)
-2. **Liveness check** — slowly turn your head left/right (requires 30px nose travel + 2 direction reversals — prevents photo and video replay attacks)
-3. **Face enrollment** — 3 captures averaged into a stable 128-D face descriptor (face-api.js, 99.38% accuracy)
-4. Descriptor is **quantized** into stable bins for repeatability across sessions
-5. Quantized descriptor → **PBKDF2** (100K iterations) → AES-256-GCM encryption key
-6. ECDSA key pair is generated and **encrypted with the face-derived key**
-7. Encrypted key blob is stored **on-chain via Gun** (available from any device worldwide)
-8. A backup key pair JSON is shown once — save it as a secondary recovery method
-9. Open block is created with face map hash → **1,000,000 UNIT minted**
-
-### Account Recovery
-
-Two methods:
-
-- **FaceID (primary):** Enter username → encrypted key blob fetched from Gun → face scan → keys decrypted
-- **Key pair JSON (backup):** Paste the JSON you saved at creation
-
-### Privacy
-
-- Face descriptors are quantized and used only to derive an AES key — never stored raw
-- Only a SHA-256 hash of the face map goes on-chain
-- The encrypted key blob is on-chain but useless without the matching face
-- No images stored — only a 128-D numerical descriptor used transiently
-
-## Block-Lattice DAG
-
-Every account has its own chain. The first block (`open`) includes FaceID verification and mints 1M UNIT:
-
-```
-Alice:   [open +1M] → [send 50 to Bob] → [send 20 to Charlie]
-Bob:     [open +1M] → [receive 50 from Alice]
-Charlie: [open +1M] → [receive 20 from Alice]
+```bash
+node relay-server.js       # Defaults to port 9090
+PORT=443 node relay-server.js   # Or any port
 ```
 
-Transfers require two blocks: a `send` on the sender's chain and a `receive` on the recipient's chain. Accounts transact in parallel.
-
-### Block Types
-
-| Type | Purpose | Balance Effect |
-|------|---------|---------------|
-| `open` | Account creation (FaceID + 1M UNIT mint) | +1,000,000 UNIT |
-| `send` | Transfer UNIT to another account | -amount |
-| `receive` | Accept UNIT from a confirmed send | +amount |
-| `deploy` | Deploy a smart contract | No change |
-| `call` | Call a smart contract method | No change |
-
-### Optimistic Confirmation
-
-Blocks are **confirmed instantly** if they pass local validation:
-
-1. Block created → SHA-256 hashed → signed with ECDSA → **confirmed immediately** (no voting)
-2. Block published to Gun relays (relay verifies signature server-side before storing) → propagates to other nodes
-3. Other nodes validate signatures client-side and confirm optimistically (no vote needed)
-4. **Only if a fork is detected** (two blocks with same parent) → stake-weighted voting triggers
-5. Voting: peers vote weighted by **verified on-chain UNIT balance** — votes carry the voter's chain head hash as a balance proof, so receiving nodes can independently verify stake instead of trusting self-reported values → >2/3 stake wins → loser rejected
-6. Vote signatures are verified **both** at the relay (spam filter) and at each receiving client (trust-independent verification)
-7. Vote replay protection: duplicate signatures rejected, votes older than 60 seconds ignored
-
-### Double-Spend Prevention
-
-Two blocks from the same account with the same parent hash = fork. Peers detect this and vote on which to keep. The loser is rejected.
-
-## P2P Networking
-
-Gun.js handles all peer-to-peer communication using a **multi-relay, path-sharded architecture**:
-
-```
-Browser Node ──► Multiple Gun relays (configurable)
-  ├── neuronchain/{network}/accounts/...         → account metadata (global)
-  ├── neuronchain/{network}/votes/...            → conflict votes (global)
-  ├── neuronchain/{network}/peers/...            → peer presence (global)
-  ├── neuronchain/{network}/keyblobs/...         → encrypted key blobs (global)
-  ├── neuronchain/{network}/contracts/...        → contracts (global)
-  ├── neuronchain/{network}/synapse-0/dag/...    → blocks for hash(pub) % 4 === 0
-  ├── neuronchain/{network}/synapse-1/dag/...    → blocks for hash(pub) % 4 === 1
-  ├── neuronchain/{network}/synapse-2/dag/...    → blocks for hash(pub) % 4 === 2
-  └── neuronchain/{network}/synapse-3/dag/...    → blocks for hash(pub) % 4 === 3
-```
-
-- **Multi-relay:** nodes connect to multiple independent Gun relays simultaneously for redundancy — if one relay censors or goes down, data propagates through others. Custom relays configurable via `localStorage.setItem('neuronchain_relays', JSON.stringify([...]))`
-- **Path-sharded:** block data split across 4 synapse paths by `hash(pub) % 4`
-- **Global data:** accounts, votes, peers, key blobs, contracts share the same relay
-- **Production scaling:** synapse paths map 1:1 to separate relay URLs — point each at a different server when needed
-- **Single command:** `npm run dev` starts Vite + Gun relay
-- **Cross-device:** `npm run tunnel` for HTTPS multiple devices access
-- **On-demand resync:** nodes resync when switching to relevant tabs, with a 60-second background fallback
-- **Single-tab lock:** one node per browser (prevents account farming)
-- **Auto-receive:** incoming sends to local accounts are claimed automatically
-- **Signed inbox signals:** senders sign notifications with their ECDSA key; recipients verify the signature before processing — prevents relay fabrication of fake transfer notifications
-
-## Features
-
-- **Face-locked keys** — private key encrypted with face-derived AES-256 key
-- **Face recovery** — scan face on any device to decrypt keys from the chain
-- **Key blob integrity** — encrypted key blobs include a SHA-256 content hash stored on-chain; on recovery, the hash is verified to detect relay tampering
-- **Backup key pair** — JSON key pair shown at creation for secondary recovery
-- **1M UNIT per account** — inflationary, minted at creation
-- **Zero fees** — all operations free
-- **Block-lattice DAG** — per-account chains, parallel transactions
-- **SHA-256 block hashing** — all block hashes computed via Web Crypto API
-- **Optimistic confirmation** — blocks confirmed instantly, voting only on conflicts
-- **Double-spend prevention** — fork detection triggers stake-weighted voting with verified on-chain balances
-- **Balance proofs in votes** — votes include the voter's chain head hash so receiving nodes can independently verify the voter's balance instead of trusting self-reported stake
-- **Client-side vote verification** — all incoming votes are cryptographically verified client-side before acceptance, not just by the relay
-- **Vote replay protection** — duplicate signatures rejected, stale votes ignored
-- **Multi-relay P2P** — nodes connect to multiple independent Gun relays for redundancy; custom relays configurable via localStorage
-- **Server-side validation** — relay verifies ECDSA signatures on blocks, accounts, and votes before storing
-- **Rate limiting** — per-connection write limits on the relay (60 burst, 20/s sustained)
-- **Null write protection** — malicious null writes blocked both server-side (relay middleware) and client-side (Gun listeners reject null critical fields)
-- **Signed accounts** — account data ECDSA-signed by owner, verified by peers and relay
-- **Signed inbox signals** — transfer notifications are ECDSA-signed by the sender; recipients verify before processing
-- **Movement liveness** — head movement + direction reversal detection prevents photo/video attacks
-- **Smart contracts** — JavaScript in isolated Web Worker sandbox (3s timeout, no DOM/network access)
-- **Encrypted local wallet** — keys in localStorage encrypted with per-session AES-256 key
-- **Balance overflow protection** — all values validated against safe integer range
-- **Generation governance** — testnet resets increment generation counter (any client); mainnet resets require a signed message from a known operator key
-- **XSS protection** — all peer-supplied data HTML-escaped before rendering
-- **Keep-alive** — Wake Lock + Web Worker + silent audio prevents tab freezing
-- **Single-tab lock** — one node per browser
-- **Testnet reset** — wipe all data and start fresh
-
-## Tabs
-
-| Tab | Description |
-|-----|-------------|
-| **Node** | Start/stop node, start/stop validating, node stats, relay connection, live log |
-| **Explorer** | Sync status, block list with lazy loading, search by hash or username, vote tallies |
-| **Accounts** | Create account with FaceID, recover by face or key pair, view balances |
-| **Transfer** | Send UNIT, claim pending receives *(requires running node)* |
-| **Contracts** | Deploy and call JavaScript smart contracts *(requires running node)* |
-| **Chain** | Network stats, DAG overview, recent blocks, testnet reset |
-| **Help** | Full documentation |
-
-**Note:** Transfer and Contracts tabs are disabled until the node is started.
+The relay serves three roles:
+- **GossipSub router** - subscribes to all `neuronchain/*` topics and routes messages between browser peers (required while browsers remain on circuit-relay connections; once browsers upgrade to direct WebRTC the relay is off the data path)
+- **Circuit relay v2** - NAT traversal: relays connections when direct WebRTC fails
+- **Bootstrap / DHT server** - provides initial peer addresses and Kademlia routing
 
 ## Architecture
 
+### Block-Lattice DAG
+
+Each account has its own chain of blocks. Transfers require two blocks:
+- **Send block** on the sender's chain (deducts balance)
+- **Receive block** on the recipient's chain (credits balance)
+
+Uncontested blocks are confirmed immediately (**optimistic confirmation**). When two blocks reference the same parent (fork), **conflict-only stake-weighted voting** kicks in:
+
+1. Network detects conflict
+2. Nodes broadcast votes (ECDSA-signed, include `chainHeadHash` balance proof)
+3. Ledger verifies vote stake against local chain state
+4. First side to reach >2/3 of total stake wins (10s timeout)
+5. Rejected chain rolled back, unclaimed sends restored
+
+### P2P Networking (libp2p)
+
+| Layer | Technology | Role |
+|---|---|---|
+| Transport | WebRTC | Browser-to-browser direct connections |
+| Transport | WebSockets | Browser-to-relay (bootstrap only) |
+| NAT traversal | Circuit Relay v2 | Relayed connection when WebRTC fails |
+| Peer discovery | Kademlia DHT | Decentralised - no central peer registry |
+| Pubsub | GossipSub | Blocks, votes, accounts, inbox signals |
+| Persistence | IndexedDB | Full chain stored locally - no relay dependency |
+| Content | Helia/Bitswap | Large content - parallel chunk transfer |
+
+**Bootstrap address** (dev): `ws://localhost:9090`  
+**Custom bootstrap**: `localStorage.setItem('neuronchain_bootstrap', JSON.stringify(['/dns4/relay.example.com/tcp/9090/ws/p2p/<peerID>']))`
+
+GossipSub topics are sharded across 4 synapse paths by `hash(accountPub) % 4`.
+
+### Content Storage
+
+NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON are stored **on NeuronChain** using its decentralised Helia/IPFS layer. Each piece of content is:
+
+- **Content-addressed** by SHA-256 CID - tamper-evident: any peer serving a wrong byte is rejected
+- **Anchored on-chain** - the CID is recorded in `block.contentCid` or smart contract state, creating an immutable provenance proof
+- **ECDSA-signed** - every store action is signed by the account key regardless of visibility
+- **Served by any peer** that holds a copy via Bitswap (parallel chunk transfer, BitTorrent-style)
+- **Persisted locally** in IndexedDB - readable offline without a relay
+
+Content has **dynamic visibility**:
+
+| Visibility | Storage | Who can read |
+|---|---|---|
+| **Public** | Raw bytes, no encryption | Anyone with the CID |
+| **Private** | AES-256-GCM encrypted with the account's content key | Only the key holder |
+
+Retrieval auto-detects visibility: tries decryption first, falls back to public read.
+
+### Decentralised Storage Ledger
+
+NeuronChain has a built-in automated storage incentive system - no marketplace, no manual deals:
+
+| Step | Action | On-chain |
+|---|---|---|
+| Provider registers | `storage-register` block (capacityGB) | Yes |
+| Proof of uptime | `storage-heartbeat` block every ~4h | Yes |
+| Daily reward | `storage-reward` block - mints new UNIT | Yes |
+| Content distribution | Pin request via GossipSub → Helia/Bitswap | Off-chain |
+| Off-chain metrics | Retrieval receipts (latency, spot-check) | Off-chain |
+
+**Earning rate formula:**
 ```
-src/
-  core/
-    crypto.ts       — Gun SEA: ECDSA key pairs, signing, SHA-256
-    face-verify.ts  — face-api.js: detection, descriptors, quantization, AES key derivation
-    face-store.ts   — Face-encrypted key blob creation and recovery
-    dag-block.ts    — AccountBlock types (open, send, receive, deploy, call)
-    dag-ledger.ts   — Block-lattice ledger: account chains, balances, contracts
-    vote.ts         — Stake-weighted voting: tallies, conflict detection, confirmation
-    account.ts      — Account model with faceMapHash
-    events.ts       — Event emitter
-    keepalive.ts    — Wake Lock + Web Worker + silent audio
-    tab-lock.ts     — Single-tab lock (prevents multi-tab account farming)
-  network/
-    gun-network.ts  — Gun.js P2P: block/vote/account sync, key blob storage
-    node.ts         — Node controller: auto-voting, auto-receiving, resync polling
-  main.ts           — UI controller
-vite-gun-plugin.ts  — Vite plugin: embeds Gun relay in dev server
-gun-middleware.ts   — Server-side: signature validation, rate limiting, null write protection
+daily_rate = 1 UNIT × capacityGB × uptime_factor × latency_factor × spot_check_factor
+
+uptime_factor    = heartbeat_blocks_today / 6       (max 1.0)
+latency_factor   = 1000ms / avg_retrieval_latency   (max 1.0)
+spot_check_factor = checks_passed / checks_received (max 1.0)
 ```
 
-## Tech Stack
+Rewards are self-issued daily via a `storage-reward` block. Other nodes verify the amount against the on-chain heartbeat count before accepting. Over-claiming is rejected by the ledger.
 
-- **TypeScript** + **Vite** — build toolchain
-- **Gun.js** — P2P networking, data sync, persistence, embedded relay
-- **Gun SEA** — ECDSA/ECDH cryptography, signing, verification
-- **face-api.js** — face detection, 128-D descriptors (99.38% accuracy on LFW)
-- **Web Crypto API** — AES-256-GCM encryption, PBKDF2 key derivation
-- **untun** — Cloudflare tunnel for multiple devices HTTPS access
-- **Wake Lock API** + **Web Workers** + **AudioContext** — tab keep-alive
+**Content distribution:** uploaders select up to 10 providers via weighted-random (weight = capacityGB × score), publish a signed pin request, and providers fetch via Helia/Bitswap. Providers re-pin on startup from their local blockstore.
 
-## Development
+**Sybil resistance:** face-lock enforces 1 account per face on mainnet → 1 storage provider registration per person.
 
-```bash
-npm install          # Install dependencies
-npm run dev          # Start dev server + Gun relay
-npm run tunnel       # HTTPS tunnel for multiple devices testing
-npm run build        # Production build to dist/
-npm run preview      # Preview production build
+### Smart Contracts
+
+JavaScript contracts execute in an isolated **Web Worker sandbox**:
+
+- No access to DOM, `fetch`, `localStorage`, `WebSocket`, or any browser API
+- Execution timeout: 3 seconds
+- Contract calls on conflicted blocks are deferred until conflict resolved
+- Contract state is persistent across calls
+
+**Built-in examples** (load from Contracts tab):
+
+**Simple Token (ERC-20 style)**
+```javascript
+function init(name, symbol, totalSupply) { ... }
+function transfer(to, amount) { ... }
+function balanceOf(address) { ... }
 ```
 
-### Networks
+**NFT Collection (ERC-721 style)**
+```javascript
+function init(name, symbol) { ... }
+function mint(metadata, cid) { ... }   // cid = Helia CID of media content
+function transfer(tokenId, to) { ... }
+function ownerOf(tokenId) { ... }
+function myTokens() { ... }
+```
 
-| | Testnet | Mainnet |
-|---|---------|---------|
-| UNIT per account | 1,000,000 | 1,000,000 |
-| Accounts per face | 3 | 1 |
-| Fees | Zero | Zero |
-| Reset | Yes | No |
+NFT media is stored in Helia - the CID passed to `mint()` is a content pointer to the encrypted image/video/audio.
 
-### Production Deployment
+### dApp API
 
-For production, deploy with a proper domain and SSL certificate. The Gun relay needs to be accessible from all nodes — either embedded in the same server or as a separate Gun relay instance.
+Build applications on NeuronChain using the `NeuronChainAPI` facade in [`src/api/neuronchain-api.ts`](src/api/neuronchain-api.ts).
 
-## Technical Specifications
+See **[CONTENT_API.md](CONTENT_API.md)** for the full API reference including content types, schemas, events, and code examples.
 
-### Currency
+### Face-Locked Keys
 
-| Property | Value |
-|----------|-------|
-| Name | Neuron Unit |
-| Symbol | UNIT |
-| Decimals | 3 (milli-UNIT precision) |
-| Smallest unit | 0.001 UNIT |
-| Mint per account | 1,000,000 UNIT |
-| Fees | Zero (all operations free) |
+- **Liveness check** (head movement detection, 15s timeout)
+- **Face enrollment** - 3 captures averaged into a 128-dim descriptor
+- **Quantization** - stable bins so the same face produces the same key across sessions
+- **Key derivation** - PBKDF2 (100K iterations) → AES-256-GCM
+- **Encryption** - ECDSA key pair encrypted with face-derived key
+- **On-chain storage** - encrypted blob stored on libp2p network + local IndexedDB
+- **Key blob integrity** - SHA-256 hash of blob stored on-chain; verified on recovery
+- **Backup** - JSON key pair shown once at creation
 
-### Cryptography
+### Security
 
-| Component | Algorithm |
-|-----------|-----------|
-| Key pairs | ECDSA (Gun SEA) |
-| Signing | ECDSA SHA-256 |
+| Layer | Protection |
+|---|---|
+| Transport | Noise protocol (libp2p) - all peer connections encrypted + authenticated |
+| Blocks | ECDSA P-256 signatures on every block |
+| Accounts | ECDSA-signed account data - peers reject unsigned accounts |
+| Votes | ECDSA-signed votes + balance proofs (`chainHeadHash`) |
+| Inbox signals | ECDSA-signed by sender - recipients verify before accepting |
+| Key blobs | SHA-256 content hash stored on-chain - tamper detection on recovery |
+| Smart contracts | Web Worker sandbox - no DOM/network/storage access |
+| Content | AES-256-GCM encryption before IPFS storage |
+| Generation governance | Mainnet resets require signed message from known operator keys |
+| Null-write rejection | Client-side null-field guards on all received data |
+| Balance overflow | `Number.isSafeInteger` validation on all amounts |
+| Peer gossip | GossipSub message signing - rogue peers can't inject unsigned messages |
+
+## Technical Specs
+
+| Spec | Value |
+|---|---|
+| Key pairs | ECDSA P-256 + ECDH P-256 (Web Crypto API - zero external dependency) |
+| Block hashing | SHA-256 (Web Crypto API) |
+| Content encryption | AES-256-GCM, key via PBKDF2 from ECDH private key |
 | Face key derivation | PBKDF2 (100K iterations) → AES-256-GCM |
-| Block hashing | SHA-256 (Web Crypto API, 64 hex chars) |
-| Face map hash | SHA-256 (Web Crypto API) |
-| Local wallet encryption | AES-256-GCM (per-session key in sessionStorage) |
-| Account authentication | ECDSA-signed account data, verified by peers and relay |
+| Face descriptor | 128 dimensions, quantized to 0.05 bins |
+| Consensus | Optimistic confirmation + conflict-only stake-weighted voting (>2/3, 10s timeout) |
+| P2P | libp2p - WebRTC, WebSockets, circuit relay v2, GossipSub, Kademlia DHT |
+| Content storage | Helia/IPFS with Bitswap - content-addressed, encrypted, parallel chunks |
+| Local persistence | IndexedDB - blocks, accounts, keyblobs, contracts survive relay downtime |
+| Max safe balance | `Number.MAX_SAFE_INTEGER` (milli-UNIT) |
+| Smart contract timeout | 3 seconds |
+| Storage payment interval | 24 hours (configurable) |
 
-### Consensus: Optimistic Confirmation
+## File Structure
 
-| Property | Value |
-|----------|-------|
-| Type | Block-lattice DAG with optimistic confirmation |
-| Normal blocks | **Confirmed instantly** (no voting needed) |
-| Conflict blocks | Stake-weighted voting (verified on-chain balance), >2/3 threshold |
-| Balance proofs | Votes carry voter's chain head hash; receivers verify balance independently |
-| Vote verification | Signatures verified both server-side (relay) and client-side (each node) |
-| Conflict timeout | 10 seconds (highest stake wins) |
-| Fork detection | Two blocks with same parent = conflict |
-| Vote replay protection | Signature deduplication + 60s staleness window |
-| Balance validation | All values checked against `Number.isSafeInteger` |
-| Block types | open, send, receive, deploy, call |
+```
+neuronchain/
+├── src/
+│   ├── api/
+│   │   └── neuronchain-api.ts    # dApp API facade
+│   ├── core/
+│   │   ├── crypto.ts             # Web Crypto API - ECDSA/ECDH/AES
+│   │   ├── dag-block.ts          # Block types + hashing + validation
+│   │   ├── dag-ledger.ts         # Block-lattice state machine + storage deals
+│   │   ├── vote.ts               # Stake-weighted voting + balance proofs
+│   │   ├── account.ts            # Account model
+│   │   ├── face-verify.ts        # FaceID liveness + enrollment
+│   │   ├── face-store.ts         # Face-locked key encryption/decryption
+│   │   └── events.ts             # EventEmitter
+│   └── network/
+│       ├── libp2p-network.ts     # libp2p + GossipSub + IndexedDB
+│       ├── helia-store.ts        # Helia/IPFS content storage
+│       ├── storage-manager.ts    # Storage deal lifecycle + 24h payments
+│       └── node.ts               # NeuronNode - orchestrates all layers
+├── relay-server.js               # libp2p relay + circuit relay v2 (Node.js)
+├── vite-libp2p-plugin.ts         # Vite plugin: spawns relay in dev
+├── vite.config.ts
+├── index.html                    # Browser UI
+└── package.json
+```
 
-**How it works:** Blocks are confirmed the moment they pass local validation (valid SHA-256 hash, ECDSA signature, sufficient balance, no fork). No voting, no waiting. Voting only engages when a **fork is detected** (two blocks sharing the same parent hash = double-spend attempt). Votes include a balance proof (the voter's chain head hash) so receiving nodes can independently verify the voter's stake from their local ledger, rather than trusting self-reported values. Vote signatures are verified at both the relay and each client node. 99.9% of blocks confirm instantly.
+## Remaining Architectural Notes
 
-### Estimated Performance
+- **Bootstrap dependency**: libp2p still needs bootstrap nodes to find initial peers. Run multiple community bootstrap/relay nodes for mainnet.
+- **Relay on gossipsub path**: while browser-to-browser connections run over circuit relay (before WebRTC upgrade), the relay node must also participate in GossipSub to route messages between those peers. Once peers upgrade to direct WebRTC, the relay is off the data path. For true relay-independence, run multiple independent community relays.
+- **Auto-receive timing window**: `autoReceive` fires when the recipient's node receives the SEND block via GossipSub. If the recipient was briefly disconnected, they can claim the pending receive manually (Transfer → Pending Receives). The sender re-broadcasts every 20s so auto-receive will eventually fire.
+- **Waku alternative**: Waku (built on libp2p) provides a ready bootstrap fleet and built-in message store, but has a 150KB message size limit that prevents direct content storage. libp2p + Helia is the correct choice when storing arbitrary content.
+- **Face uniqueness**: enforced locally via Euclidean distance on 128-dim descriptors. A global uniqueness proof (ZK biometrics) is an open research problem.
+- **BFT finality**: optimistic confirmation with conflict voting is not BFT. Under a 33%+ Sybil attack, forks can persist. Full BFT (e.g., HotStuff) is a future upgrade path.
 
-With optimistic confirmation, throughput scales with the number of active accounts:
+## GossipSub Compatibility Patches
 
-| Nodes | Estimated TPS | Confirmation Time | Notes |
-|-------|--------------|-------------------|-------|
-| **~100** | 5,000-10,000 | **<1ms local** / 1-3s cross-device | Relay fan-out is the bottleneck |
-| **~1,000** | 1,000-5,000 | **<1ms local** / 3-8s cross-device | Multiple relays recommended |
-| **~10,000** | 500-2,000 | **<1ms local** / 5-15s cross-device | Synapse relays needed |
+libp2p and gossipsub ship as separate packages and their internal APIs drifted across minor versions. Three prototype-level patches are applied at startup (in both `relay-server.js` and `src/network/libp2p-network.ts`) to bridge the mismatches in the currently pinned versions:
 
-**Why it's fast:**
-- **Optimistic confirmation** — no voting for uncontested blocks (99.9% of transactions)
-- **Block-lattice parallelism** — Alice→Bob doesn't block Charlie→Dave; TPS scales with active accounts
-- **Local finality in <1ms** — the block is applied to local state immediately on creation
-- **Cross-device propagation** — limited by Gun relay throughput (on-demand resync, 60s fallback)
-- **Conflict-only voting** — voting overhead only incurred during actual double-spend attempts
+**Fix A - `AbstractMessageStream` missing `.sink` / `.source`**  
+New libp2p streams expose `Symbol.asyncIterator` + `send()` but not the `.sink` / `.source` duplex interface that `it-pipe` requires (`isDuplex(s) = s.sink != null && s.source != null`). Without this, gossipsub's `OutboundStream` constructor throws synchronously inside `createOutboundStream`, is silently caught, and `streamsOutbound` is never populated - no messages flow. Fixed by `Object.defineProperty(AbstractMessageStream.prototype, 'source/sink', ...)`.
 
-### Network
+**Fix B - `multiaddr.tuples()` API mismatch in `GossipSub.addPeer`**  
+Gossipsub 14.x calls `multiaddr.tuples()` on peer addresses for IP scoring. When two different installations of `@multiformats/multiaddr` are resolved by Node (the common split-package scenario), libp2p's internal Multiaddr instances lack `.tuples()`, causing `addPeer()` to throw *before* `outboundInflightQueue.push()` - peers are never queued for stream creation. Fixed by wrapping `addPeer` in try/catch and manually inserting the peer into `this.peers`, `this.score`, and `this.outbound`.
 
-| Property | Value |
-|----------|-------|
-| P2P protocol | Gun.js (WebSocket) |
-| Relay architecture | **Multi-relay, path-sharded** — multiple Gun relays, 4 synapse paths + global (scalable to separate servers) |
-| Multi-relay | Nodes connect to multiple independent relays simultaneously; configurable via localStorage |
-| Synapse routing | `hash(accountPub) % NUM_SYNAPSES` |
-| Global path | Accounts, votes, peers, key blobs, contracts |
-| Synapse paths | Block data (each handles 1/N of accounts) |
-| Server-side validation | ECDSA signature verification on all blocks, accounts, and votes |
-| Client-side validation | All incoming blocks, votes, and inbox signals are signature-verified client-side |
-| Rate limiting | Token bucket: 60 burst, 20 writes/s per connection |
-| Null write protection | `put(null)` blocked on protected paths (relay-side) + null critical fields rejected (client-side) |
-| Inbox signals | ECDSA-signed by sender, verified by recipient |
-| Key blob integrity | SHA-256 content hash stored on-chain, verified on recovery |
-| Generation governance | Testnet: any client; Mainnet: requires signed message from known operator |
-| Sync method | Real-time listeners + signed inbox signals + on-demand resync (60s fallback) |
-| Peer discovery | Gun relay peer tracking |
-| Data persistence | Gun server-side file storage |
-| Tab limit | 1 per browser (prevents account farming) |
-
-### Face Recognition
-
-| Property | Value |
-|----------|-------|
-| Library | face-api.js |
-| Accuracy | 99.38% (LFW benchmark) |
-| Descriptor size | 128 dimensions (float) |
-| Quantization | Binned to 0.05 increments |
-| Liveness | 30px nose travel + 2 direction reversals (15s timeout) |
-| Key encryption | AES-256-GCM with face-derived key |
-| Storage | Encrypted blob on Gun relay (signed by owner); hash on-chain |
-
-## Security
-
-### Relay Protection
-
-The Gun relay runs server-side middleware (`gun-middleware.ts`) that intercepts all incoming writes:
-
-- **Signature verification** — blocks, accounts, and votes must carry valid ECDSA signatures matching their claimed author. Unsigned or spoofed data is rejected before storage.
-- **Rate limiting** — token bucket per connection (60 write burst, 20 writes/s sustained). Flooding clients are silently dropped.
-- **Null write protection** — `put(null)` to protected paths (accounts, keyblobs, contracts, votes, inbox) is blocked unless accompanied by a generation counter bump (testnet reset).
-- **Stats endpoint** — `/gun-stats` exposes accepted/rejected counts for monitoring.
-
-### Client-Side Protection
-
-- **SHA-256 block hashing** — all block hashes via Web Crypto API (not a custom hash)
-- **ECDSA signature verification** — every block verified on receipt before adding to the ledger
-- **Client-side vote signature verification** — all incoming votes are cryptographically verified client-side (not just by the relay), so a malicious relay cannot fabricate or alter votes
-- **Balance proofs** — votes include the voter's chain head block hash; receiving nodes look up the block and use its balance as the verified stake, preventing stake inflation attacks
-- **Signed account data** — account records include an ECDSA signature; peers reject unsigned or mismatched accounts
-- **Signed inbox signals** — transfer notifications are ECDSA-signed by the sender; recipients verify signatures before processing, preventing relay fabrication of fake notifications
-- **Null write rejection** — clients reject data from Gun where critical fields (hash, accountPub, signature, etc.) are `null`, complementing the server-side null write protection
-- **Key blob integrity verification** — encrypted key blobs include a SHA-256 content hash stored in on-chain account data; during recovery, the loaded blob's hash is verified against the on-chain hash to detect tampering by a malicious relay
-- **Vote replay protection** — duplicate vote signatures are rejected; votes older than 60 seconds are ignored
-- **Balance overflow protection** — all balances and amounts validated against `Number.isSafeInteger`
-- **Validate-before-store** — blocks are fully validated (signature, structure, conflicts) before being added to the ledger
-- **Contract sandboxing** — smart contracts execute in an isolated Web Worker with no DOM, localStorage, fetch, or network access; terminated after 3 seconds
-- **Encrypted local wallet** — private keys in localStorage are AES-256-GCM encrypted with a per-session key stored in sessionStorage
-- **Generation governance** — testnet resets are open (any client can increment generation); mainnet generation bumps require a signed message from a key in the `KNOWN_OPERATORS` list, preventing unilateral network wipes
-- **XSS prevention** — all peer-supplied data (usernames, hashes, contract names) is HTML-escaped before rendering
-- **Single-tab lock** — one node per browser via localStorage heartbeat
-
-## License
-
-See [LICENSE](LICENSE).
+**Fix C - `onIncomingStream` handler signature mismatch**  
+This version of libp2p calls registered protocol handlers as `handler(stream, connection)` (two positional args). Gossipsub 14.x expects `handler({ stream, connection })` (one destructured object). The mismatch means `connection` is always `undefined` inside gossipsub, `createInboundStream` is never called, `streamsInbound` stays empty, subscriptions are never exchanged, the mesh never forms, and messages are never delivered. Fixed by patching `onIncomingStream` to detect the two-arg calling convention and wrap into the expected object form.

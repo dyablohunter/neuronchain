@@ -1,0 +1,261 @@
+/**
+ * NeuronChain dApp API
+ *
+ * A clean, stable facade for building decentralised applications on NeuronChain.
+ * Import this in your dApp instead of accessing NeuronNode internals directly.
+ *
+ * Quick start:
+ *
+ *   import { NeuronChainAPI } from './api/neuronchain-api';
+ *
+ *   const api = new NeuronChainAPI('testnet');
+ *   await api.start();
+ *
+ *   // Transfers
+ *   const block = await api.send(fromPub, toPub, 100_000, keys);
+ *
+ *   // Store encrypted content (returns CID)
+ *   const cid = await api.storeContent(imageBytes, 'image/jpeg', keys);
+ *
+ *   // Retrieve content
+ *   const bytes = await api.retrieveContent(cid, keys);
+ *
+ *   // Deploy NFT contract
+ *   const contractId = await api.deployContract('MyNFT', nftCode, keys);
+ *
+ *   // Mint NFT
+ *   await api.callContract(contractId, 'mint', ['token metadata', cid], keys);
+ *
+ *   // Listen for events
+ *   api.on('block:confirmed', (block) => console.log('Confirmed!', block));
+ */
+
+import { NeuronNode } from '../network/node';
+import { AccountBlock, formatUNIT, parseUNIT } from '../core/dag-block';
+import { KeyPair } from '../core/crypto';
+import { NetworkType, StorageProvider } from '../core/dag-ledger';
+import { EventEmitter } from '../core/events';
+
+export { formatUNIT, parseUNIT };
+
+export interface ContentHandle {
+  /** IPFS CID - store in block.contentCid or contract state */
+  cid: string;
+  /** Original size in bytes */
+  size: number;
+  mimeType: string;
+  timestamp: number;
+}
+
+export type { StorageProvider };
+
+export class NeuronChainAPI extends EventEmitter {
+  private node: NeuronNode;
+
+  constructor(network: NetworkType = 'testnet') {
+    super();
+    this.node = new NeuronNode(network);
+    // Forward all node events
+    const events = [
+      'block:added', 'block:confirmed', 'block:conflict', 'block:rejected',
+      'account:synced', 'vote:received', 'peer:connected', 'peer:disconnected',
+      'contract:deployed', 'contract:executed', 'contract:error',
+      'inbox:signal', 'auto:received', 'resync',
+      'storage:registered', 'storage:deregistered', 'storage:heartbeat-sent',
+      'storage:reward-issued', 'storage:pinned',
+      'node:started', 'node:stopped',
+    ];
+    for (const ev of events) {
+      this.node.on(ev, (...args: unknown[]) => this.emit(ev, ...args));
+    }
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+  async start(): Promise<void> { await this.node.start(); }
+  async stop(): Promise<void>  { await this.node.stop(); }
+
+  getStats() { return this.node.getStats(); }
+  get network(): NetworkType { return this.node.ledger.network; }
+
+  // ── Keys ──────────────────────────────────────────────────────────────────
+
+  /** Register a local key so the node can auto-receive and auto-vote */
+  registerKey(pub: string, keys: KeyPair): void {
+    this.node.addLocalKey(pub, keys);
+  }
+
+  // ── Accounts ─────────────────────────────────────────────────────────────
+
+  getBalance(pub: string): number { return this.node.ledger.getAccountBalance(pub); }
+  getBalanceFormatted(pub: string): string { return formatUNIT(this.getBalance(pub)); }
+
+  getAccount(pub: string) { return this.node.ledger.getAccountByPub(pub); }
+  getAccountByUsername(username: string) { return this.node.ledger.getAccountByUsername(username); }
+  resolveAddress(identifier: string): string | undefined { return this.node.ledger.resolveToPublicKey(identifier); }
+
+  // ── Transfers ─────────────────────────────────────────────────────────────
+
+  /**
+   * Send UNIT from one account to another.
+   * `amount` is in milli-UNIT (use parseUNIT() to convert from display string).
+   */
+  async send(
+    fromPub: string,
+    toIdentifier: string,
+    amount: number,
+    keys: KeyPair,
+  ): Promise<{ block?: AccountBlock; error?: string }> {
+    const result = await this.node.ledger.createSend(fromPub, toIdentifier, amount, keys);
+    if (!result.block) return result;
+    const submitResult = await this.node.submitBlock(result.block);
+    if (!submitResult.success) return { error: submitResult.error };
+    return { block: result.block };
+  }
+
+  // ── Content storage (Helia/IPFS) ─────────────────────────────────────────
+
+  /**
+   * Store encrypted content. Returns a ContentHandle with the CID.
+   * Use handle.cid as block.contentCid or in NFT contract state.
+   *
+   * Supported types: any binary data - images, video, audio, HTML, CSS, JS, JSON, text.
+   * All content is encrypted with the account's content key before storing.
+   */
+  async storeContent(
+    data: Uint8Array,
+    mimeType: string,
+    keys: KeyPair,
+    name?: string,
+  ): Promise<ContentHandle> {
+    if (!this.node.helia.isStarted()) throw new Error('Node not started');
+    const result = await this.node.helia.storeWithMeta(data, { mimeType, name }, keys);
+    return { cid: result.cid, size: data.length, mimeType, timestamp: result.meta.timestamp };
+  }
+
+  /** Retrieve and decrypt content by CID. */
+  async retrieveContent(cid: string, keys: KeyPair): Promise<Uint8Array> {
+    if (!this.node.helia.isStarted()) throw new Error('Node not started');
+    const result = await this.node.helia.retrieveWithMeta(cid, keys);
+    if (!result) throw new Error(`Content not found or decryption failed: ${cid}`);
+    return result.data;
+  }
+
+  /** Store a JSON object encrypted. Returns CID. */
+  async storeJSON(data: unknown, keys: KeyPair): Promise<string> {
+    if (!this.node.helia.isStarted()) throw new Error('Node not started');
+    return this.node.helia.storeJSON(data, keys);
+  }
+
+  /** Retrieve and decrypt a JSON object. */
+  async retrieveJSON<T>(cid: string, keys: KeyPair): Promise<T | undefined> {
+    if (!this.node.helia.isStarted()) throw new Error('Node not started');
+    return this.node.helia.retrieveJSON<T>(cid, keys);
+  }
+
+  /** Store raw text (HTML, CSS, JS, markdown) encrypted. Returns CID. */
+  async storeText(text: string, keys: KeyPair): Promise<string> {
+    if (!this.node.helia.isStarted()) throw new Error('Node not started');
+    return this.node.helia.storeText(text, keys);
+  }
+
+  async retrieveText(cid: string, keys: KeyPair): Promise<string | undefined> {
+    if (!this.node.helia.isStarted()) throw new Error('Node not started');
+    return this.node.helia.retrieveText(cid, keys);
+  }
+
+  // ── Smart Contracts ───────────────────────────────────────────────────────
+
+  /**
+   * Deploy a smart contract. Returns the contract ID (block hash).
+   * The contract ID is permanent - use it for all future calls.
+   */
+  async deployContract(name: string, code: string, fromPub: string, keys: KeyPair): Promise<{ contractId?: string; error?: string }> {
+    const result = await this.node.ledger.createDeploy(fromPub, name, code, keys);
+    if (!result.block) return { error: result.error };
+    const submitResult = await this.node.submitBlock(result.block);
+    if (!submitResult.success) return { error: submitResult.error };
+    return { contractId: result.block.hash };
+  }
+
+  /**
+   * Call a contract method. Result is delivered asynchronously via the
+   * 'contract:executed' event (fire-and-forget from the chain's perspective).
+   */
+  async callContract(
+    contractId: string,
+    method: string,
+    args: unknown[],
+    fromPub: string,
+    keys: KeyPair,
+  ): Promise<{ block?: AccountBlock; error?: string }> {
+    const result = await this.node.ledger.createCall(fromPub, contractId, method, args, keys);
+    if (!result.block) return { error: result.error };
+    const submitResult = await this.node.submitBlock(result.block);
+    if (!submitResult.success) return { error: submitResult.error };
+    return { block: result.block };
+  }
+
+  /** Get current contract state (read-only, local) */
+  getContractState(contractId: string): Record<string, unknown> | undefined {
+    return this.node.ledger.contracts.get(contractId)?.state;
+  }
+
+  listContracts(): { id: string; name: string; owner: string; deployedAt: number }[] {
+    return Array.from(this.node.ledger.contracts.entries()).map(([id, c]) => ({
+      id, name: c.name, owner: c.owner, deployedAt: c.deployedAt,
+    }));
+  }
+
+  // ── Decentralised storage ledger ──────────────────────────────────────────
+
+  /**
+   * Register as a storage provider.
+   * Publishes a storage-register block on-chain. Heartbeats and daily rewards
+   * are then managed automatically by StorageManager while the node is running.
+   */
+  async registerStorage(pub: string, capacityGB: number, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
+    return this.node.registerStorage(pub, capacityGB, keys);
+  }
+
+  /** Deregister from the storage ledger (sets capacityGB = 0). */
+  async deregisterStorage(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
+    return this.node.deregisterStorage(pub, keys);
+  }
+
+  /** Get all active storage providers sorted by score (highest first). */
+  getStorageProviders(): StorageProvider[] {
+    return this.node.ledger.getStorageProviders();
+  }
+
+  /** Get a specific provider's live profile (undefined if not registered). */
+  getStorageProvider(pub: string): StorageProvider | undefined {
+    return this.node.ledger.storageProviders.get(pub);
+  }
+
+  /**
+   * Distribute a stored CID to up to 10 network providers.
+   * Providers fetch the content via Helia/Bitswap and pin it locally.
+   * Returns the list of selected provider pub keys.
+   */
+  async distributeContent(cid: string, uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {
+    return this.node.distributeContent(cid, uploaderPub, keys);
+  }
+
+  /** Manually trigger a heartbeat for a local provider account (normally automatic). */
+  async broadcastHeartbeat(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
+    return this.node.storage.broadcastHeartbeat(pub, keys);
+  }
+
+  /** Manually trigger today's storage reward if eligible (normally automatic). */
+  async issueStorageReward(): Promise<void> {
+    return this.node.storage.issueRewardsIfEligible();
+  }
+
+  // ── Block explorer ────────────────────────────────────────────────────────
+
+  getBlock(hash: string): AccountBlock | undefined { return this.node.ledger.getBlock(hash); }
+  getChain(pub: string): AccountBlock[] { return this.node.ledger.getAccountChain(pub); }
+  getRecentBlocks(limit = 50): AccountBlock[] { return this.node.ledger.getAllBlocks().slice(0, limit); }
+  getLedgerStats() { return this.node.ledger.getStats(); }
+}

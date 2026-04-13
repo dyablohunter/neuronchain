@@ -28,14 +28,14 @@ export function validateUsername(username: string): { valid: boolean; error?: st
 /**
  * Generate a new ECDSA key pair for account creation.
  * The key pair will be encrypted with the face-derived AES key
- * before storage — this function only generates the raw keys.
+ * before storage - this function only generates the raw keys.
  */
 export async function generateAccountKeys(): Promise<KeyPair> {
   return generateKeyPair();
 }
 
 /**
- * Build an Account object (without keys — keys are face-locked).
+ * Build an Account object (without keys - keys are face-locked).
  */
 export function buildAccount(
   username: string,

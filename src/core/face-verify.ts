@@ -1,11 +1,12 @@
-import * as faceapi from 'face-api.js';
+import * as tf from '@tensorflow/tfjs';
+import * as faceapi from '@vladmandic/face-api';
 
 let modelsLoaded = false;
 
 const MODEL_URL = '/models';
 const MATCH_THRESHOLD = 0.45;
 const ENROLLMENT_SAMPLES = 3;
-/** Quantization bin size — coarser = more stable across sessions, less unique */
+/** Quantization bin size - coarser = more stable across sessions, less unique */
 const QUANT_BIN = 0.05;
 
 export interface FaceDescriptor {
@@ -25,6 +26,7 @@ export interface FaceMap {
 
 export async function loadModels(): Promise<void> {
   if (modelsLoaded) return;
+  await tf.ready();
   await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
   await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
   await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
@@ -55,17 +57,21 @@ export function stopCamera(stream: MediaStream): void {
 // ──── Face Descriptor Capture ────
 
 export async function captureFaceDescriptor(video: HTMLVideoElement): Promise<FaceDescriptor | null> {
-  const detection = await faceapi
-    .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
-    .withFaceLandmarks()
-    .withFaceDescriptor();
+  try {
+    const detection = await faceapi
+      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
+      .withFaceLandmarks()
+      .withFaceDescriptor();
 
-  if (!detection) return null;
+    if (!detection) return null;
 
-  return {
-    data: Array.from(detection.descriptor),
-    capturedAt: Date.now(),
-  };
+    return {
+      data: Array.from(detection.descriptor),
+      capturedAt: Date.now(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -130,12 +136,18 @@ export async function detectLiveness(
   const MIN_MOVEMENT = 30; // pixels of nose travel required (higher = harder to spoof with photo)
   const MIN_DIRECTION_CHANGES = 2; // must reverse direction at least twice (rules out linear pan)
 
-  onStatus?.('Face detected — slowly turn your head left and right...');
+  onStatus?.('Face detected - slowly turn your head left and right...');
 
   while (Date.now() - startTime < timeoutMs) {
-    const detection = await faceapi
-      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
-      .withFaceLandmarks();
+    let detection;
+    try {
+      detection = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+        .withFaceLandmarks();
+    } catch {
+      await sleep(200);
+      continue;
+    }
 
     if (detection) {
       framesWithFace++;
@@ -160,19 +172,19 @@ export async function detectLiveness(
         const dirPct = Math.min(50, Math.round((dirChanges / MIN_DIRECTION_CHANGES) * 50));
         const progress = movementPct + dirPct;
 
-        onStatus?.(`Liveness: ${progress}% — turn head left then right`);
+        onStatus?.(`Liveness: ${progress}% - turn head left then right`);
 
         if (totalRange >= MIN_MOVEMENT && dirChanges >= MIN_DIRECTION_CHANGES) {
           onStatus?.('Liveness confirmed!');
           return true;
         }
       } else {
-        onStatus?.(`Face detected (${framesWithFace}) — slowly move your head...`);
+        onStatus?.(`Face detected (${framesWithFace}) - slowly move your head...`);
       }
     } else {
       framesWithoutFace++;
       if (framesWithoutFace % 8 === 0) {
-        onStatus?.('No face detected — move closer, ensure good lighting.');
+        onStatus?.('No face detected - move closer, ensure good lighting.');
       }
     }
     await sleep(100);
@@ -256,7 +268,7 @@ export async function decryptWithFaceKey(encrypted: string, faceKey: CryptoKey):
     );
     return new TextDecoder().decode(decrypted);
   } catch {
-    return null; // Wrong face — decryption failed
+    return null; // Wrong face - decryption failed
   }
 }
 
