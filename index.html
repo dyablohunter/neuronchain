@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NeuronChain — Browser Blockchain</title>
+  <title>NeuronChain - Browser Blockchain</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>" />
   <style>
     :root {
@@ -95,7 +95,7 @@
       50% { opacity: 0.5; }
     }
 
-    /* Tabs — live inside the header on PC, wrap below on mobile */
+    /* Tabs - live inside the header on PC, wrap below on mobile */
     .tabs {
       flex: 1;
       display: flex;
@@ -576,7 +576,7 @@
   <div class="dialog-overlay" id="resetDialog">
     <div class="dialog">
       <h3>Reset Testnet</h3>
-      <p>This will permanently delete <strong>everything</strong> — chain history, accounts, contracts, balances, and local wallet. You will need to create a new account with FaceID. This cannot be undone.</p>
+      <p>This will permanently delete <strong>everything</strong> - chain history, accounts, contracts, balances, and local wallet. You will need to create a new account with FaceID. This cannot be undone.</p>
       <div class="btn-group">
         <button class="btn btn-outline" id="btnResetCancel">Cancel</button>
         <button class="btn btn-danger" id="btnResetConfirm">Reset Testnet</button>
@@ -656,7 +656,7 @@
         <div class="card">
           <div class="card-title">Create Account with FaceID</div>
           <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-            Choose a username, then verify with FaceID. Your private key is generated and <strong>encrypted with your face</strong> — only you can decrypt it. You receive <strong>1,000,000 UNIT</strong> upon creation.
+            Choose a username, then verify with FaceID. Your private key is generated and <strong>encrypted with your face</strong> - only you can decrypt it. You receive <strong>1,000,000 UNIT</strong> upon creation.
           </p>
           <div class="form-group">
             <label class="form-label">Choose Username</label>
@@ -671,7 +671,7 @@
         <div class="card">
           <div class="card-title">Recover Account</div>
           <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-            <strong>Option A:</strong> Scan your face — your encrypted keys are on-chain.<br>
+            <strong>Option A:</strong> Scan your face - your encrypted keys are on-chain.<br>
             <strong>Option B:</strong> Paste your backup key pair JSON.
           </p>
           <div class="form-group">
@@ -796,7 +796,7 @@ function increment() { state.counter++; return state.counter; }
 function getCount() { return state.counter; }"></textarea>
         </div>
         <div class="form-group">
-          <label class="form-label">Constructor Arguments — optional, calls <code>init(...args)</code> immediately after deploy</label>
+          <label class="form-label">Constructor Arguments - optional, calls <code>init(...args)</code> immediately after deploy</label>
           <input type="text" class="form-input" id="contractInitArgs" placeholder='e.g. ["MyToken", "MTK", 1000000]' />
         </div>
         <button class="btn btn-primary" id="btnDeployContract">Deploy Contract</button>
@@ -839,7 +839,7 @@ function getCount() { return state.counter; }"></textarea>
 
       <!-- Serve Storage -->
       <div class="card">
-        <div class="card-title">Serve Storage — Earn UNIT</div>
+        <div class="card-title">Serve Storage - Earn UNIT</div>
         <p style="color:var(--text-dim);font-size:13px;margin-bottom:16px;">
           Allocate local disk space to the NeuronChain network. The blockchain automatically mints UNIT directly into your account every day based on your contribution.
         </p>
@@ -879,7 +879,7 @@ function getCount() { return state.counter; }"></textarea>
           </div>
           <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
             <button class="btn btn-primary" id="btnServeStorage">Serve Storage</button>
-            <span style="font-size:12px;color:var(--text-muted);">Face-locked — 1 provider per account (mainnet: 1 per face)</span>
+            <span style="font-size:12px;color:var(--text-muted);">Face-locked - 1 provider per account (mainnet: 1 per face)</span>
           </div>
         </div>
 
@@ -927,8 +927,8 @@ function getCount() { return state.counter; }"></textarea>
           <div class="form-group">
             <label class="form-label">Visibility</label>
             <select class="form-select" id="storageVisibility">
-              <option value="public">Public — no encryption, anyone can read</option>
-              <option value="private">Private — AES-256-GCM encrypted, only you</option>
+              <option value="public">Public - no encryption, anyone can read</option>
+              <option value="private">Private - AES-256-GCM encrypted, only you</option>
             </select>
           </div>
         </div>
@@ -999,7 +999,7 @@ function getCount() { return state.counter; }"></textarea>
           </div>
           <div class="form-group">
             <label class="form-label">Title / Artist</label>
-            <input type="text" class="form-input" id="audioTitle" placeholder="Song title — Artist name" />
+            <input type="text" class="form-input" id="audioTitle" placeholder="Song title - Artist name" />
           </div>
           <div id="audioPreview" style="display:none;margin-top:8px;">
             <audio id="audioPreviewEl" controls style="width:100%;"></audio>
@@ -1098,16 +1098,16 @@ function getCount() { return state.counter; }"></textarea>
       <div class="card">
         <div class="help-section">
           <h3>Welcome to NeuronChain</h3>
-          <p>NeuronChain is a browser-based blockchain using a <strong>block-lattice DAG</strong> with <strong>stake-weighted voting</strong> and <strong>face-locked keys</strong>. Your private key is encrypted with your face — no seed phrases, no passwords. The native currency is the <strong>Neuron Unit (UNIT)</strong>.</p>
+          <p>NeuronChain is a browser-based blockchain using a <strong>block-lattice DAG</strong> with <strong>stake-weighted voting</strong> and <strong>face-locked keys</strong>. Your private key is encrypted with your face - no seed phrases, no passwords. The native currency is the <strong>Neuron Unit (UNIT)</strong>.</p>
         </div>
 
         <div class="help-section">
           <h3>Getting Started</h3>
           <ul>
-            <li><strong>Step 1:</strong> Go to the <strong>Node</strong> tab and click <strong>Start Node</strong> to connect to the relay network. Do this first — Transfer and Contracts tabs are disabled until the node is running.</li>
+            <li><strong>Step 1:</strong> Go to the <strong>Node</strong> tab and click <strong>Start Node</strong> to connect to the relay network. Do this first - Transfer and Contracts tabs are disabled until the node is running.</li>
             <li><strong>Step 2:</strong> Go to the <strong>Accounts</strong> tab, choose a username (3-24 chars, lowercase alphanumeric + dot), and scan your face. You receive <strong>1,000,000 UNIT</strong>.</li>
             <li><strong>Step 3:</strong> Save the backup key pair JSON shown after creation (secondary recovery method).</li>
-            <li><strong>Step 4:</strong> Send UNIT in the <strong>Transfer</strong> tab — enter a recipient username and amount.</li>
+            <li><strong>Step 4:</strong> Send UNIT in the <strong>Transfer</strong> tab - enter a recipient username and amount.</li>
             <li><strong>Step 5:</strong> Check the <strong>Explorer</strong> tab to see your transactions syncing across the network.</li>
           </ul>
         </div>
@@ -1116,9 +1116,9 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Neuron Unit (UNIT)</h3>
           <ul>
             <li><strong>1,000,000 UNIT</strong> minted per new account at creation</li>
-            <li><strong>3 decimal precision</strong> (milli-UNIT) — smallest transferable unit is 0.001 UNIT</li>
-            <li>All operations are <strong>zero fee</strong> — transfers, contracts, everything</li>
-            <li>Inflationary — total supply grows as new accounts are created (limited to the total number of people)</li>
+            <li><strong>3 decimal precision</strong> (milli-UNIT) - smallest transferable unit is 0.001 UNIT</li>
+            <li>All operations are <strong>zero fee</strong> - transfers, contracts, everything</li>
+            <li>Inflationary - total supply grows as new accounts are created (limited to the total number of people)</li>
             <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account)</li>
             <li><strong>Testnet:</strong> up to 3 accounts per face (for testing)</li>
             <li>Usernames are always lowercase (auto-converted)</li>
@@ -1129,14 +1129,14 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Face-Locked Keys</h3>
           <p>Account creation requires a face scan. Your private key is <strong>encrypted with your face</strong>:</p>
           <ul>
-            <li><strong>Liveness check:</strong> Slowly turn your head left and right — movement detection requires at least 30 pixels of nose travel and 2 direction reversals to prevent photo and video replay attacks</li>
+            <li><strong>Liveness check:</strong> Slowly turn your head left and right - movement detection requires at least 30 pixels of nose travel and 2 direction reversals to prevent photo and video replay attacks</li>
             <li><strong>Face enrollment:</strong> 3 captures are averaged into a stable 128-dimensional face descriptor (face-api.js, 99.38% accuracy on LFW)</li>
             <li><strong>Quantization:</strong> The descriptor is quantized into stable bins so the same face produces the same key across sessions</li>
             <li><strong>Key derivation:</strong> Quantized descriptor &#8594; PBKDF2 (100K iterations) &#8594; AES-256-GCM encryption key</li>
             <li><strong>Key encryption:</strong> Your ECDSA key pair is encrypted with the face-derived AES key</li>
-            <li><strong>On-chain storage:</strong> The encrypted blob is stored on the libp2p network + IndexedDB — available from any device, but only your face can decrypt it</li>
-            <li><strong>Local wallet:</strong> Keys are encrypted with a per-session AES key in localStorage — cleared when the browser session ends</li>
-            <li><strong>Backup:</strong> A JSON key pair is shown once at creation — save it as a secondary recovery method</li>
+            <li><strong>On-chain storage:</strong> The encrypted blob is stored on the libp2p network + IndexedDB - available from any device, but only your face can decrypt it</li>
+            <li><strong>Local wallet:</strong> Keys are encrypted with a per-session AES key in localStorage - cleared when the browser session ends</li>
+            <li><strong>Backup:</strong> A JSON key pair is shown once at creation - save it as a secondary recovery method</li>
             <li><strong>Privacy:</strong> Only a SHA-256 hash of the face map is stored publicly. No images or raw descriptors leave the browser.</li>
           </ul>
         </div>
@@ -1153,21 +1153,21 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Block-Lattice DAG</h3>
           <p>Instead of one global chain, every account has its own chain of blocks:</p>
           <ul>
-            <li><strong><code>open</code></strong> — first block, created with FaceID, mints 1,000,000 UNIT</li>
-            <li><strong><code>send</code></strong> — transfer UNIT (deducts from sender)</li>
-            <li><strong><code>receive</code></strong> — accept UNIT from a confirmed send (credits recipient)</li>
-            <li><strong><code>deploy</code></strong> — deploy a smart contract</li>
-            <li><strong><code>call</code></strong> — call a smart contract method</li>
+            <li><strong><code>open</code></strong> - first block, created with FaceID, mints 1,000,000 UNIT</li>
+            <li><strong><code>send</code></strong> - transfer UNIT (deducts from sender)</li>
+            <li><strong><code>receive</code></strong> - accept UNIT from a confirmed send (credits recipient)</li>
+            <li><strong><code>deploy</code></strong> - deploy a smart contract</li>
+            <li><strong><code>call</code></strong> - call a smart contract method</li>
           </ul>
           <p style="margin-top: 8px;">Transfers require two blocks: a <code>send</code> on the sender's chain and a <code>receive</code> on the recipient's chain. The recipient must <strong>claim</strong> the receive in the Transfer tab (or it is auto-claimed if their node is online).</p>
         </div>
 
         <div class="help-section">
           <h3>Optimistic Confirmation</h3>
-          <p>Blocks are <strong>confirmed instantly</strong> — no voting needed for normal transactions:</p>
+          <p>Blocks are <strong>confirmed instantly</strong> - no voting needed for normal transactions:</p>
           <ul>
             <li>A block passes local validation (valid SHA-256 hash, ECDSA signature, sufficient balance, no fork) &#8594; <strong>confirmed immediately</strong></li>
-            <li>No waiting for peer votes — 99.9% of transactions confirm in &lt;1ms</li>
+            <li>No waiting for peer votes - 99.9% of transactions confirm in &lt;1ms</li>
             <li>Voting only triggers when a <strong>fork is detected</strong> (two blocks sharing the same parent = double-spend attempt)</li>
             <li>During conflicts: peers vote weighted by their <strong>verified on-chain UNIT balance</strong>. Votes include a <strong>balance proof</strong> (the voter's chain head hash) so each node can independently verify the voter's stake from its own ledger instead of trusting self-reported values. &gt;2/3 stake wins, loser rejected</li>
             <li>Vote signatures are verified <strong>both</strong> at the relay (spam filter) and at each receiving client (trust-independent verification)</li>
@@ -1183,16 +1183,16 @@ function getCount() { return state.counter; }"></textarea>
             <li><strong>WebRTC:</strong> browser peers upgrade to direct connections after initial bootstrap</li>
             <li><strong>GossipSub router (relay):</strong> while peers are on circuit-relay connections, the relay subscribes to all <code>neuronchain/*</code> topics and routes messages between browsers. Once peers upgrade to direct WebRTC, the relay is off the data path.</li>
             <li><strong>Circuit relay v2:</strong> when direct WebRTC fails (NAT), connections are tunnelled through a relay peer</li>
-            <li><strong>Kademlia DHT:</strong> peer discovery is decentralised — nodes find each other via a distributed hash table, not a central registry</li>
+            <li><strong>Kademlia DHT:</strong> peer discovery is decentralised - nodes find each other via a distributed hash table, not a central registry</li>
             <li><strong>GossipSub topics:</strong> blocks sharded across <strong>4 synapse topics</strong> by <code>hash(accountPub) % 4</code>; votes, accounts, and inbox signals each get their own topic</li>
-            <li><strong>IndexedDB persistence:</strong> each node stores the full chain locally — no relay needed to read your own data</li>
+            <li><strong>IndexedDB persistence:</strong> each node stores the full chain locally - no relay needed to read your own data</li>
             <li><strong>Bootstrap:</strong> <code>npm run dev</code> starts Vite + relay on port 9090. Custom bootstrap: <code>localStorage.setItem('neuronchain_bootstrap', JSON.stringify([...multiaddrs]))</code></li>
             <li><strong>Separate relay:</strong> <code>npm run relay</code> runs the relay standalone for production</li>
             <li><strong>Testing Tunnel:</strong> <code>npm run tunnel</code> creates an HTTPS tunnel URL for multi-device testing</li>
             <li><strong>Resync:</strong> on-demand when switching tabs, with a 60-second background fallback and 20-second re-publish cycle</li>
             <li><strong>Single-tab lock:</strong> one node per browser (prevents account farming)</li>
             <li><strong>Auto-receive:</strong> incoming sends to local accounts are claimed automatically when the SEND block arrives via GossipSub. If the recipient's node was offline or briefly disconnected, the pending receive can be claimed manually (Transfer → Pending Receives). The sender re-broadcasts every 20 seconds.</li>
-            <li><strong>Signed inbox signals:</strong> senders sign transfer notifications with their ECDSA key; recipients verify before processing — prevents relay fabrication of fake notifications</li>
+            <li><strong>Signed inbox signals:</strong> senders sign transfer notifications with their ECDSA key; recipients verify before processing - prevents relay fabrication of fake notifications</li>
             <li><strong>Production scaling:</strong> run multiple independent community relay nodes for resilience</li>
           </ul>
         </div>
@@ -1200,21 +1200,21 @@ function getCount() { return state.counter; }"></textarea>
         <div class="help-section">
           <h3>Security</h3>
           <ul>
-            <li><strong>SHA-256 block hashing</strong> — all block hashes computed via Web Crypto API</li>
-            <li><strong>ECDSA signatures</strong> — every block is signed by its author and verified on receipt</li>
-            <li><strong>Client-side vote verification</strong> — all incoming votes are cryptographically verified client-side, not just by the relay — a malicious relay cannot fabricate or alter votes</li>
-            <li><strong>Balance proofs</strong> — votes include the voter's chain head hash; receiving nodes verify the voter's balance from their own ledger instead of trusting self-reported stake</li>
-            <li><strong>Peer-side validation</strong> — all incoming blocks, votes, and accounts are verified with ECDSA signatures before being accepted; rogue peers cannot inject unsigned data via GossipSub</li>
-            <li><strong>Noise protocol</strong> — all libp2p connections are encrypted and authenticated at the transport layer</li>
-            <li><strong>Null-write rejection</strong> — client-side null-field guards reject incomplete or malformed data from any peer</li>
-            <li><strong>Signed accounts</strong> — account data is ECDSA-signed by the owner; peers and the relay reject unsigned or spoofed accounts</li>
-            <li><strong>Signed inbox signals</strong> — transfer notifications are ECDSA-signed by the sender; recipients verify signatures to prevent relay fabrication</li>
-            <li><strong>Key blob integrity</strong> — encrypted key blobs include a SHA-256 content hash stored on-chain; during account recovery, the blob's hash is verified to detect tampering</li>
-            <li><strong>Sandboxed contracts</strong> — smart contracts execute in an isolated Web Worker with no access to DOM, localStorage, fetch, or other browser APIs; terminated after 3 seconds to prevent infinite loops</li>
-            <li><strong>Balance overflow protection</strong> — all balances and amounts are validated against <code>Number.isSafeInteger</code> before acceptance</li>
-            <li><strong>Generation governance</strong> — testnet resets are open; mainnet generation bumps require a signed message from a known operator key, preventing unilateral network wipes</li>
-            <li><strong>Encrypted local wallet</strong> — keys in localStorage are AES-256-GCM encrypted with a per-session key (cleared when the browser session ends)</li>
-            <li><strong>XSS protection</strong> — all peer-supplied data (usernames, hashes, contract names) is HTML-escaped before rendering</li>
+            <li><strong>SHA-256 block hashing</strong> - all block hashes computed via Web Crypto API</li>
+            <li><strong>ECDSA signatures</strong> - every block is signed by its author and verified on receipt</li>
+            <li><strong>Client-side vote verification</strong> - all incoming votes are cryptographically verified client-side, not just by the relay - a malicious relay cannot fabricate or alter votes</li>
+            <li><strong>Balance proofs</strong> - votes include the voter's chain head hash; receiving nodes verify the voter's balance from their own ledger instead of trusting self-reported stake</li>
+            <li><strong>Peer-side validation</strong> - all incoming blocks, votes, and accounts are verified with ECDSA signatures before being accepted; rogue peers cannot inject unsigned data via GossipSub</li>
+            <li><strong>Noise protocol</strong> - all libp2p connections are encrypted and authenticated at the transport layer</li>
+            <li><strong>Null-write rejection</strong> - client-side null-field guards reject incomplete or malformed data from any peer</li>
+            <li><strong>Signed accounts</strong> - account data is ECDSA-signed by the owner; peers and the relay reject unsigned or spoofed accounts</li>
+            <li><strong>Signed inbox signals</strong> - transfer notifications are ECDSA-signed by the sender; recipients verify signatures to prevent relay fabrication</li>
+            <li><strong>Key blob integrity</strong> - encrypted key blobs include a SHA-256 content hash stored on-chain; during account recovery, the blob's hash is verified to detect tampering</li>
+            <li><strong>Sandboxed contracts</strong> - smart contracts execute in an isolated Web Worker with no access to DOM, localStorage, fetch, or other browser APIs; terminated after 3 seconds to prevent infinite loops</li>
+            <li><strong>Balance overflow protection</strong> - all balances and amounts are validated against <code>Number.isSafeInteger</code> before acceptance</li>
+            <li><strong>Generation governance</strong> - testnet resets are open; mainnet generation bumps require a signed message from a known operator key, preventing unilateral network wipes</li>
+            <li><strong>Encrypted local wallet</strong> - keys in localStorage are AES-256-GCM encrypted with a per-session key (cleared when the browser session ends)</li>
+            <li><strong>XSS protection</strong> - all peer-supplied data (usernames, hashes, contract names) is HTML-escaped before rendering</li>
           </ul>
         </div>
 
@@ -1222,14 +1222,14 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Networks</h3>
           <ul>
             <li><strong>Testnet:</strong> Up to 3 accounts per face. Can be reset from the Chain tab (wipes everything, increments generation counter). Any client can trigger a reset. For development and testing.</li>
-            <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account). Generation resets require a signed message from a known operator key — no single client can wipe the network. Production network.</li>
+            <li><strong>Mainnet:</strong> 1 account per face (1 human = 1 account). Generation resets require a signed message from a known operator key - no single client can wipe the network. Production network.</li>
           </ul>
           <p style="margin-top: 8px;">Both networks mint 1,000,000 UNIT per account and have zero fees.</p>
         </div>
 
         <div class="help-section">
           <h3>Smart Contracts</h3>
-          <p>Write contracts in JavaScript. Contracts execute in an <strong>isolated Web Worker sandbox</strong> — no access to the page, network, or storage APIs. Your code has access to <code>state</code>, <code>caller</code>, and <code>args</code>.</p>
+          <p>Write contracts in JavaScript. Contracts execute in an <strong>isolated Web Worker sandbox</strong> - no access to the page, network, or storage APIs. Your code has access to <code>state</code>, <code>caller</code>, and <code>args</code>.</p>
           <p style="margin-top: 8px;"><strong>Simple Token (ERC-20 style):</strong></p>
           <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 12px; overflow-x: auto;"><code>// Deploy with: init("MyToken", "MTK", 1000000)
 function init(name, symbol, totalSupply) {
@@ -1251,7 +1251,7 @@ function transfer(to, amount) {
 function balanceOf(address) { return state.balances[address] || 0; }
 function getInfo() { return { name: state.name, symbol: state.symbol, totalSupply: state.totalSupply }; }</code></pre>
 
-          <p style="margin-top: 12px;"><strong>NFT Contract (ERC-721 style) — with content CIDs:</strong></p>
+          <p style="margin-top: 12px;"><strong>NFT Contract (ERC-721 style) - with content CIDs:</strong></p>
           <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 12px; overflow-x: auto;"><code>// Deploy with: init("MyNFTs", "MNFT")
 // Mint with:   mint("My artwork", "&lt;helia-cid&gt;")
 function init(name, symbol) {
@@ -1285,17 +1285,17 @@ function myTokens() {
 
         <div class="help-section">
           <h3>Content Storage</h3>
-          <p>NeuronChain is a full content network. Posts, images, video, audio, HTML, CSS, JS, and JSON are stored <strong>on NeuronChain</strong> using its decentralised Helia/IPFS layer — not on any central server.</p>
+          <p>NeuronChain is a full content network. Posts, images, video, audio, HTML, CSS, JS, and JSON are stored <strong>on NeuronChain</strong> using its decentralised Helia/IPFS layer - not on any central server.</p>
           <ul>
-            <li><strong>Content-addressed:</strong> every file is stored by its SHA-256 CID. Any peer serving wrong bytes is automatically rejected — tamper-evident by construction.</li>
+            <li><strong>Content-addressed:</strong> every file is stored by its SHA-256 CID. Any peer serving wrong bytes is automatically rejected - tamper-evident by construction.</li>
             <li><strong>On-chain anchor:</strong> the CID is recorded in <code>block.contentCid</code> or smart contract state, creating an immutable provenance proof. The content hash is the receipt.</li>
-            <li><strong>ECDSA-signed:</strong> every store action is signed by your account key regardless of visibility — public content is still authentically attributed to you.</li>
+            <li><strong>ECDSA-signed:</strong> every store action is signed by your account key regardless of visibility - public content is still authentically attributed to you.</li>
             <li><strong>Served by any peer</strong> that holds a copy via Bitswap (parallel chunk transfer, BitTorrent-style). More holders = faster delivery.</li>
-            <li><strong>IndexedDB persistence:</strong> content stored locally survives relay downtime — readable offline.</li>
+            <li><strong>IndexedDB persistence:</strong> content stored locally survives relay downtime - readable offline.</li>
           </ul>
-          <p style="margin-top: 8px;"><strong>Dynamic visibility</strong> — choose per content item:</p>
+          <p style="margin-top: 8px;"><strong>Dynamic visibility</strong> - choose per content item:</p>
           <ul>
-            <li><strong>Public:</strong> stored unencrypted — anyone with the CID can read it. Use for posts, profiles, public media.</li>
+            <li><strong>Public:</strong> stored unencrypted - anyone with the CID can read it. Use for posts, profiles, public media.</li>
             <li><strong>Private:</strong> encrypted with AES-256-GCM before storage using your account's content key (derived via ECDH). Only you can decrypt it. Use for personal data, drafts, private media.</li>
           </ul>
           <p style="margin-top: 8px;">Retrieval auto-detects visibility: tries decryption first, falls back to public read. Supported types: JSON, image, video, audio, HTML, CSS, JS, and any binary file.</p>
@@ -1309,7 +1309,7 @@ function myTokens() {
             <li><strong>Beneficiaries</strong> accept with a <code>storage-deal</code> block</li>
             <li>A <strong>24h timer</strong> auto-pays from beneficiary to provider via a standard <code>send</code> block</li>
             <li>If the beneficiary has <strong>insufficient balance</strong>, content is automatically unpinned from the provider's Helia node</li>
-            <li>Content is stored in <strong>Helia (IPFS)</strong> — content-addressed and encrypted before storage</li>
+            <li>Content is stored in <strong>Helia (IPFS)</strong> - content-addressed and encrypted before storage</li>
             <li>CIDs are referenced in <code>block.contentCid</code> or smart contract state</li>
           </ul>
         </div>
@@ -1317,17 +1317,17 @@ function myTokens() {
         <div class="help-section">
           <h3>Technical Specs</h3>
           <ul>
-            <li><strong>Key pairs:</strong> ECDSA P-256 + ECDH P-256 (Web Crypto API — no external dependency)</li>
+            <li><strong>Key pairs:</strong> ECDSA P-256 + ECDH P-256 (Web Crypto API - no external dependency)</li>
             <li><strong>Block hashing:</strong> SHA-256 (Web Crypto API)</li>
             <li><strong>Content encryption:</strong> AES-256-GCM, key derived via PBKDF2 from ECDH private key</li>
             <li><strong>Face key derivation:</strong> PBKDF2 (100K iterations) &#8594; AES-256-GCM</li>
             <li><strong>Face descriptor:</strong> 128 dimensions, quantized to 0.05 bins</li>
             <li><strong>Consensus:</strong> Optimistic confirmation, conflict-only stake-weighted voting (&gt;2/3 threshold, 10s timeout)</li>
-            <li><strong>P2P:</strong> libp2p — WebRTC (browser&#8596;browser), WebSocket (browser&#8596;relay), circuit relay v2 (NAT traversal), GossipSub (pubsub), Kademlia DHT (peer discovery)</li>
-            <li><strong>Content storage:</strong> Helia/IPFS with Bitswap — content-addressed, encrypted, parallel chunk transfer</li>
-            <li><strong>Persistence:</strong> IndexedDB (blocks, accounts, keyblobs, contracts) — no relay dependency</li>
+            <li><strong>P2P:</strong> libp2p - WebRTC (browser&#8596;browser), WebSocket (browser&#8596;relay), circuit relay v2 (NAT traversal), GossipSub (pubsub), Kademlia DHT (peer discovery)</li>
+            <li><strong>Content storage:</strong> Helia/IPFS with Bitswap - content-addressed, encrypted, parallel chunk transfer</li>
+            <li><strong>Persistence:</strong> IndexedDB (blocks, accounts, keyblobs, contracts) - no relay dependency</li>
             <li><strong>Keep-alive:</strong> Wake Lock API + Web Worker heartbeat + silent audio (prevents tab suspension)</li>
-            <li><strong>dApp API:</strong> <code>NeuronChainAPI</code> — stable facade for building apps on NeuronChain</li>
+            <li><strong>dApp API:</strong> <code>NeuronChainAPI</code> - stable facade for building apps on NeuronChain</li>
           </ul>
         </div>
       </div>

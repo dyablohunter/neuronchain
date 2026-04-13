@@ -58,7 +58,7 @@ export class NeuronNode extends EventEmitter {
       if (this.ledger.accounts.has(pub)) return;
       if (acc._sig) {
         const valid = await NeuronNode.verifyAccountData(acc);
-        if (!valid) { console.warn(`[Node] Rejected account ${pub.slice(0, 12)}... — invalid signature`); return; }
+        if (!valid) { console.warn(`[Node] Rejected account ${pub.slice(0, 12)}... - invalid signature`); return; }
       }
       this.ledger.registerAccount({
         username: String(acc.username), pub,
@@ -66,7 +66,7 @@ export class NeuronNode extends EventEmitter {
         createdAt: Number(acc.createdAt || 0), faceMapHash: String(acc.faceMapHash || ''),
       });
       this.emit('account:synced', acc);
-      // A new peer has data — reply with ours so the handshake completes both ways
+      // A new peer has data - reply with ours so the handshake completes both ways
       if (this.publishDebounce) clearTimeout(this.publishDebounce);
       this.publishDebounce = setTimeout(() => {
         this.publishDebounce = null;
@@ -90,7 +90,7 @@ export class NeuronNode extends EventEmitter {
     this.net.on('vote:received', async (vote: unknown) => {
       const v = vote as Vote;
       const valid = await VoteManager.verifyVote(v);
-      if (!valid) { console.warn(`[Node] Rejected vote from ${v.voterPub?.slice(0, 12)}... — invalid signature`); return; }
+      if (!valid) { console.warn(`[Node] Rejected vote from ${v.voterPub?.slice(0, 12)}... - invalid signature`); return; }
       this.ledger.castVote(v);
       this.emit('vote:received', v);
     });
@@ -123,7 +123,7 @@ export class NeuronNode extends EventEmitter {
       // (a) keep publishing zombie blocks from the old generation that peers
       //     will reject via the `_gen < this.generation` filter, or
       // (b) have unclaimedSends / balances from the old chain confusing new blocks.
-      // localKeys must also be cleared — the accounts those keys belong to no
+      // localKeys must also be cleared - the accounts those keys belong to no
       // longer exist after a reset; they will be re-added via addLocalKey() after
       // the user creates/recovers their account in the new generation.
       // generation:reset → main.ts → location.reload() to fully flush JS heap.
@@ -173,8 +173,8 @@ export class NeuronNode extends EventEmitter {
   //   autoReceive() fires from the block:received event, which is only emitted
   //   once per block hash (processedBlocks dedup prevents re-emission on
   //   gossipsub re-broadcasts). If the recipient's node missed that single
-  //   delivery window — e.g. the gossipsub mesh hadn't fully formed yet when
-  //   the sender first published the block — the receive is never created and
+  //   delivery window - e.g. the gossipsub mesh hadn't fully formed yet when
+  //   the sender first published the block - the receive is never created and
   //   no amount of re-broadcasting will fix it via the event path.
   //
   //   sweepUnclaimedReceives() bypasses gossipsub entirely and works directly
@@ -207,7 +207,7 @@ export class NeuronNode extends EventEmitter {
       if (signal.signature) {
         const payload = `inbox:${signal.blockHash}:${signal.sender}:${pub}:${signal.amount}`;
         const result = await verifySignature(signal.signature, signal.sender);
-        if (result !== payload) { console.warn(`[Inbox] Rejected signal — invalid signature`); return; }
+        if (result !== payload) { console.warn(`[Inbox] Rejected signal - invalid signature`); return; }
       }
       this.processedInbox.add(key);
       if (this.processedInbox.size > NeuronNode.MAX_INBOX) {
@@ -226,7 +226,7 @@ export class NeuronNode extends EventEmitter {
         if (accData?.username) {
           if (accData._sig) {
             const valid = await NeuronNode.verifyAccountData(accData);
-            if (!valid) { console.warn(`[Resync] Rejected account — invalid signature`); return; }
+            if (!valid) { console.warn(`[Resync] Rejected account - invalid signature`); return; }
           }
           let faceDescriptor: number[] | undefined;
           if (accData.faceDescriptor) { try { faceDescriptor = JSON.parse(String(accData.faceDescriptor)); } catch {} }

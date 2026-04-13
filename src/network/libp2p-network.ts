@@ -9,7 +9,7 @@
  *  - WebSocket transport to connect to bootstrap relay node(s)
  *
  * The relay server (relay-server.js) only assists with NAT traversal and
- * initial peer discovery — no application data passes through it.
+ * initial peer discovery - no application data passes through it.
  */
 
 import { createLibp2p } from 'libp2p';
@@ -33,7 +33,7 @@ import { GossipSub } from '@chainsafe/libp2p-gossipsub';
 // ── Fix A: libp2p stream API mismatch with it-pipe ────────────────────────────
 // New libp2p streams (AbstractMessageStream) have Symbol.asyncIterator + send()
 // but NOT the .sink / .source duplex interface that it-pipe expects.
-// gossipsub's OutboundStream calls pipe(pushable, rawStream) — it-pipe checks
+// gossipsub's OutboundStream calls pipe(pushable, rawStream) - it-pipe checks
 // isDuplex(rawStream) which needs .sink and .source; without them it throws TypeError
 // that is silently swallowed, leaving streamsOutbound empty and no messages flowing.
 if (!('source' in AbstractMessageStream.prototype)) {
@@ -60,7 +60,7 @@ if (!('source' in AbstractMessageStream.prototype)) {
 // ── Fix B: multiaddr.tuples() API mismatch in GossipSub.addPeer ──────────────
 // gossipsub 14.x calls multiaddr.tuples() for IP scoring but libp2p's internal
 // multiaddr objects (different class instance) don't have this method, causing
-// addPeer() to throw before pushing to outboundInflightQueue — so no streams form.
+// addPeer() to throw before pushing to outboundInflightQueue - so no streams form.
 const _gsOrigAddPeer = (GossipSub.prototype as unknown as Record<string, unknown>)['addPeer'] as (p: unknown, d: unknown, a: unknown) => void;
 (GossipSub.prototype as unknown as Record<string, unknown>)['addPeer'] = function(
   this: Record<string, unknown>,
@@ -141,7 +141,7 @@ interface RelayInfo {
  * Retries are essential: when the page reloads immediately after a testnet reset,
  * the relay process (spawned by the Vite plugin) may not have finished starting yet.
  * Without retries, fetchRelayInfo returns null, bootstrapList is empty, gsDirectPeers
- * is empty, and the node starts completely isolated — no relay connection, no gossipsub
+ * is empty, and the node starts completely isolated - no relay connection, no gossipsub
  * streams, no sync. The retry loop (5× at 1.5s) covers the typical relay startup window.
  *
  * If retries are exhausted a background dial is attempted 3s after node.start()
@@ -173,7 +173,7 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
   return null;
 }
 
-/** Bootstrap relay multiaddresses — always includes /p2p/<peerId> suffix. */
+/** Bootstrap relay multiaddresses - always includes /p2p/<peerId> suffix. */
 function buildBootstrapList(relayInfo: RelayInfo | null): string[] {
   if (typeof window !== 'undefined') {
     try {
@@ -238,7 +238,7 @@ export const KNOWN_OPERATORS: string[] = [];
 // ── Main class ────────────────────────────────────────────────────────────────
 
 export class Libp2pNetwork extends EventEmitter {
-  /** The underlying libp2p node — exposed so Helia can share it instead of creating its own */
+  /** The underlying libp2p node - exposed so Helia can share it instead of creating its own */
   libp2p!: Awaited<ReturnType<typeof createLibp2p>>;
   private db!: IDBPDatabase<NeuronDB>;
   private network: string;
@@ -270,10 +270,10 @@ export class Libp2pNetwork extends EventEmitter {
     this.db = await openNeuronDB(this.network);
 
     const relayInfo = await fetchRelayInfo();
-    if (!relayInfo) console.warn('[Libp2p] Could not fetch relay info — bootstrap will be skipped');
+    if (!relayInfo) console.warn('[Libp2p] Could not fetch relay info - bootstrap will be skipped');
     const bootstrapList = buildBootstrapList(relayInfo);
 
-    // Build directPeers for gossipsub — forces a gossipsub stream to the relay
+    // Build directPeers for gossipsub - forces a gossipsub stream to the relay
     // regardless of mesh formation heuristics. Without this, gossipsub streams
     // never form and no messages flow between browser peers.
     const gsDirectPeers = relayInfo ? [{
@@ -349,7 +349,7 @@ export class Libp2pNetwork extends EventEmitter {
 
     // Fallback: if the relay wasn't up during fetchRelayInfo (all retries exhausted),
     // try one more time after the node has been running for 3s. This covers the edge
-    // case where the relay process was still initialising when start() was called —
+    // case where the relay process was still initialising when start() was called -
     // common when the page reloads immediately after a testnet reset.
     if (!relayInfo) {
       setTimeout(async () => {
@@ -358,7 +358,7 @@ export class Libp2pNetwork extends EventEmitter {
         if (info) {
           try {
             await this.libp2p.dial(multiaddr(info.bootstrapAddr));
-          } catch { /* ignore — bootstrap will retry automatically */ }
+          } catch { /* ignore - bootstrap will retry automatically */ }
         }
       }, 3000);
     }
@@ -415,7 +415,7 @@ export class Libp2pNetwork extends EventEmitter {
         const block = this.deserializeBlock(raw);
         // processedBlocks dedup is intentional: it prevents gossipsub relay loops
         // (a block we published coming back to us from a peer). The side effect is
-        // that block:received only fires ONCE per hash — autoReceive in node.ts
+        // that block:received only fires ONCE per hash - autoReceive in node.ts
         // therefore also only fires once. If the recipient's node missed that window
         // (e.g. gossipsub mesh wasn't formed yet), it will never auto-receive from
         // re-broadcasts. That's why sweepUnclaimedReceives() in node.ts periodically
@@ -638,7 +638,7 @@ export class Libp2pNetwork extends EventEmitter {
       await this.db.clear('accounts');
       await this.db.clear('votes');
       await this.db.clear('contracts');
-      // Keep keyblobs — user still needs to recover their account
+      // Keep keyblobs - user still needs to recover their account
     } catch { /* ignore */ }
 
     this.processedBlocks.clear();
@@ -651,7 +651,7 @@ export class Libp2pNetwork extends EventEmitter {
     if (!this.running) return;
     const pubsub = this.libp2p.services.pubsub as ReturnType<typeof gossipsub>;
     pubsub.publish(topic, encode(obj)).catch((e: unknown) => {
-      // "not enough peers" is expected when offline — suppress
+      // "not enough peers" is expected when offline - suppress
       const msg = e instanceof Error ? e.message : String(e);
       if (!msg.includes('not enough peers') && !msg.includes('no peers')) {
         console.warn('[Libp2p] publish error:', msg);

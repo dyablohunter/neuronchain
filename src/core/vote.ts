@@ -20,7 +20,7 @@ export interface Vote {
   stake: number;
   timestamp: number;
   signature: string;
-  /** Head block hash of voter's chain — allows receivers to verify balance */
+  /** Head block hash of voter's chain - allows receivers to verify balance */
   chainHeadHash?: string;
 }
 
@@ -46,7 +46,7 @@ export class VoteManager {
   private parentToBlocks: Map<string, Set<string>> = new Map();
   /** Only blocks in conflict get tallies */
   private tallies: Map<string, VoteTally> = new Map();
-  /** Seen vote signatures — prevents replaying the exact same signed vote */
+  /** Seen vote signatures - prevents replaying the exact same signed vote */
   private seenSignatures: Set<string> = new Set();
 
   /**
@@ -66,12 +66,12 @@ export class VoteManager {
     siblings.add(blockHash);
 
     if (siblings.size === 1) {
-      // No conflict — optimistic confirmation
+      // No conflict - optimistic confirmation
       this.confirmedBlocks.add(blockHash);
       return 'confirmed';
     }
 
-    // CONFLICT DETECTED — revoke optimistic confirmations and start voting
+    // CONFLICT DETECTED - revoke optimistic confirmations and start voting
     for (const hash of siblings) {
       this.confirmedBlocks.delete(hash);
       if (!this.tallies.has(hash)) {
@@ -95,7 +95,7 @@ export class VoteManager {
    */
   addVote(vote: Vote): void {
     const tally = this.tallies.get(vote.blockHash);
-    if (!tally) return; // Not in conflict — no vote needed
+    if (!tally) return; // Not in conflict - no vote needed
     if (tally.votes.has(vote.voterPub)) return; // Already voted
 
     // Reject replayed signatures

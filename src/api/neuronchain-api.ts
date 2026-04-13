@@ -39,7 +39,7 @@ import { EventEmitter } from '../core/events';
 export { formatUNIT, parseUNIT };
 
 export interface ContentHandle {
-  /** IPFS CID — store in block.contentCid or contract state */
+  /** IPFS CID - store in block.contentCid or contract state */
   cid: string;
   /** Original size in bytes */
   size: number;
@@ -119,7 +119,7 @@ export class NeuronChainAPI extends EventEmitter {
    * Store encrypted content. Returns a ContentHandle with the CID.
    * Use handle.cid as block.contentCid or in NFT contract state.
    *
-   * Supported types: any binary data — images, video, audio, HTML, CSS, JS, JSON, text.
+   * Supported types: any binary data - images, video, audio, HTML, CSS, JS, JSON, text.
    * All content is encrypted with the account's content key before storing.
    */
   async storeContent(
@@ -168,7 +168,7 @@ export class NeuronChainAPI extends EventEmitter {
 
   /**
    * Deploy a smart contract. Returns the contract ID (block hash).
-   * The contract ID is permanent — use it for all future calls.
+   * The contract ID is permanent - use it for all future calls.
    */
   async deployContract(name: string, code: string, fromPub: string, keys: KeyPair): Promise<{ contractId?: string; error?: string }> {
     const result = await this.node.ledger.createDeploy(fromPub, name, code, keys);

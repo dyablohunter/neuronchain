@@ -1,5 +1,5 @@
 /**
- * Cryptographic primitives — pure Web Crypto API, no external dependencies.
+ * Cryptographic primitives - pure Web Crypto API, no external dependencies.
  *
  * Key pairs use ECDSA P-256 for signing and ECDH P-256 for encryption.
  * Keys are serialised as base64-encoded JWK JSON strings so they can be
@@ -10,10 +10,10 @@
  */
 
 export interface KeyPair {
-  pub: string;   // ECDSA P-256 public key  — base64(JSON(JWK))
-  priv: string;  // ECDSA P-256 private key — base64(JSON(JWK))
-  epub: string;  // ECDH  P-256 public key  — base64(JSON(JWK))
-  epriv: string; // ECDH  P-256 private key — base64(JSON(JWK))
+  pub: string;   // ECDSA P-256 public key  - base64(JSON(JWK))
+  priv: string;  // ECDSA P-256 private key - base64(JSON(JWK))
+  epub: string;  // ECDH  P-256 public key  - base64(JSON(JWK))
+  epriv: string; // ECDH  P-256 private key - base64(JSON(JWK))
 }
 
 // ── Byte helpers ──────────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ async function importSignPriv(b64: string): Promise<CryptoKey> {
 }
 
 async function importVerifyPub(b64: string): Promise<CryptoKey> {
-  // Strip private scalar (d) if present — public-key-only import
+  // Strip private scalar (d) if present - public-key-only import
   const jwk = JSON.parse(atob(b64)) as Record<string, unknown>;
   const { d: _ignored, key_ops: _ko, ...pubJwk } = jwk;
   void _ignored; void _ko;

@@ -27,7 +27,7 @@ export interface EncryptedKeyBlob {
   pub: string;
   /** Timestamp */
   createdAt: number;
-  /** SHA-256 hash of the blob contents — stored on-chain for verification */
+  /** SHA-256 hash of the blob contents - stored on-chain for verification */
   blobHash?: string;
 }
 

@@ -4,7 +4,7 @@ import { signData, verifySignature, KeyPair } from './crypto';
  * Block types in the block-lattice:
  *
  * Core ledger:
- * - open:              First block — FaceID verified, mints 1,000,000 UNIT
+ * - open:              First block - FaceID verified, mints 1,000,000 UNIT
  * - send:              Transfer UNIT to another account (deducts from sender)
  * - receive:           Accept UNIT from a confirmed send block (credits recipient)
  * - deploy:            Deploy a smart contract
@@ -13,8 +13,8 @@ import { signData, verifySignature, KeyPair } from './crypto';
  * Decentralised storage ledger:
  * - storage-register:    Register as a storage provider (capacityGB > 0) or adjust capacity
  * - storage-deregister:  Leave the storage ledger entirely
- * - storage-heartbeat:   Periodic proof-of-uptime block (every ~4h) — used to validate reward amounts
- * - storage-reward:      Daily self-issued block — mints new UNIT proportional to stored GB × uptime factor
+ * - storage-heartbeat:   Periodic proof-of-uptime block (every ~4h) - used to validate reward amounts
+ * - storage-reward:      Daily self-issued block - mints new UNIT proportional to stored GB × uptime factor
  */
 export type AccountBlockType =
   | 'open' | 'send' | 'receive' | 'deploy' | 'call'

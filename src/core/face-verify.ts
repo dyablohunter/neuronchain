@@ -6,7 +6,7 @@ let modelsLoaded = false;
 const MODEL_URL = '/models';
 const MATCH_THRESHOLD = 0.45;
 const ENROLLMENT_SAMPLES = 3;
-/** Quantization bin size — coarser = more stable across sessions, less unique */
+/** Quantization bin size - coarser = more stable across sessions, less unique */
 const QUANT_BIN = 0.05;
 
 export interface FaceDescriptor {
@@ -136,7 +136,7 @@ export async function detectLiveness(
   const MIN_MOVEMENT = 30; // pixels of nose travel required (higher = harder to spoof with photo)
   const MIN_DIRECTION_CHANGES = 2; // must reverse direction at least twice (rules out linear pan)
 
-  onStatus?.('Face detected — slowly turn your head left and right...');
+  onStatus?.('Face detected - slowly turn your head left and right...');
 
   while (Date.now() - startTime < timeoutMs) {
     let detection;
@@ -172,19 +172,19 @@ export async function detectLiveness(
         const dirPct = Math.min(50, Math.round((dirChanges / MIN_DIRECTION_CHANGES) * 50));
         const progress = movementPct + dirPct;
 
-        onStatus?.(`Liveness: ${progress}% — turn head left then right`);
+        onStatus?.(`Liveness: ${progress}% - turn head left then right`);
 
         if (totalRange >= MIN_MOVEMENT && dirChanges >= MIN_DIRECTION_CHANGES) {
           onStatus?.('Liveness confirmed!');
           return true;
         }
       } else {
-        onStatus?.(`Face detected (${framesWithFace}) — slowly move your head...`);
+        onStatus?.(`Face detected (${framesWithFace}) - slowly move your head...`);
       }
     } else {
       framesWithoutFace++;
       if (framesWithoutFace % 8 === 0) {
-        onStatus?.('No face detected — move closer, ensure good lighting.');
+        onStatus?.('No face detected - move closer, ensure good lighting.');
       }
     }
     await sleep(100);
@@ -268,7 +268,7 @@ export async function decryptWithFaceKey(encrypted: string, faceKey: CryptoKey):
     );
     return new TextDecoder().decode(decrypted);
   } catch {
-    return null; // Wrong face — decryption failed
+    return null; // Wrong face - decryption failed
   }
 }
 

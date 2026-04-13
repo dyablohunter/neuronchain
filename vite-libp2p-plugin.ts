@@ -38,7 +38,7 @@ export function libp2pRelay(): Plugin {
 
       // Proxy /relay-info to the relay's info HTTP endpoint (port 9092)
       server.middlewares.use('/relay-info', (_req, res) => {
-        const proxyReq = createServer().listen(); // dummy — use http.get instead
+        const proxyReq = createServer().listen(); // dummy - use http.get instead
         proxyReq.close();
         import('http').then(({ get }) => {
           get('http://localhost:9092/relay-info', (proxyRes) => {

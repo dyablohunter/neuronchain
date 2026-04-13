@@ -18,7 +18,7 @@ if (!acquireTabLock()) {
         <p style="color:#94a3b8;font-size:14px;">Only one node per browser is allowed to prevent account farming.<br>Close the other tab first, then refresh this page.</p>
       </div>
     </div>`;
-  throw new Error('Tab locked — another NeuronChain tab is active');
+  throw new Error('Tab locked - another NeuronChain tab is active');
 }
 
 // ──── State ────
@@ -62,14 +62,14 @@ function addLog(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'inf
 }
 
 function resolveNamePlain(pub: string): string {
-  if (!pub) return '—';
+  if (!pub) return '-';
   for (const a of localAccounts) if (a.pub === pub) return a.username;
   for (const [, acc] of node.ledger.accounts) if (acc.pub === pub) return acc.username;
   return trunc(pub);
 }
 
 function resolveName(pub: string): string {
-  if (!pub) return '—';
+  if (!pub) return '-';
   const name = resolveNamePlain(pub);
   return `<a class="account-link" style="cursor:pointer;color:var(--primary);text-decoration:underline;" data-pub="${escHtml(pub)}">${escHtml(name)}</a>`;
 }
@@ -103,7 +103,7 @@ function showAccountDetail(pub: string) {
     for (const [tokenId, token] of Object.entries(tokens)) {
       if (token.owner !== pub) continue;
       const meta = typeof token.metadata === 'string' ? token.metadata : JSON.stringify(token.metadata ?? '');
-      nftRows.push(`<tr><td>#${escHtml(tokenId)}</td><td><a class="explorer-contract-link" style="cursor:pointer;color:var(--primary);text-decoration:underline;" data-contract-id="${escHtml(contractId)}">${escHtml(contract.name)}</a></td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(meta)}">${escHtml(meta)}</td><td>${token.cid ? escHtml(trunc(token.cid, 16)) : '—'}</td></tr>`);
+      nftRows.push(`<tr><td>#${escHtml(tokenId)}</td><td><a class="explorer-contract-link" style="cursor:pointer;color:var(--primary);text-decoration:underline;" data-contract-id="${escHtml(contractId)}">${escHtml(contract.name)}</a></td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(meta)}">${escHtml(meta)}</td><td>${token.cid ? escHtml(trunc(token.cid, 16)) : '-'}</td></tr>`);
     }
   }
 
@@ -124,7 +124,7 @@ function showAccountDetail(pub: string) {
         <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${(provider.heartbeatsLast24h / 6 * 100).toFixed(0)}%</div></div>
         <div class="stat-item"><div class="stat-label">Rate</div><div class="stat-value">${formatUNIT(provider.earningRate)} UNIT/day</div></div>
         <div class="stat-item"><div class="stat-label">Total Earned</div><div class="stat-value">${formatUNIT(provider.totalEarned)} UNIT</div></div>
-        <div class="stat-item"><div class="stat-label">Avg Latency</div><div class="stat-value">${provider.avgLatencyMs > 0 ? provider.avgLatencyMs + ' ms' : '—'}</div></div>
+        <div class="stat-item"><div class="stat-label">Avg Latency</div><div class="stat-value">${provider.avgLatencyMs > 0 ? provider.avgLatencyMs + ' ms' : '-'}</div></div>
       </div>
     </div>` : '';
 
@@ -133,7 +133,7 @@ function showAccountDetail(pub: string) {
     const status = node.ledger.getBlockStatus(b.hash);
     const statusColor = status === 'confirmed' ? 'var(--success)' : status === 'rejected' ? 'var(--danger)' : 'var(--warning)';
     const typeClass = b.type === 'send' ? 'badge-transfer' : b.type === 'receive' ? 'badge-create' : b.type === 'deploy' ? 'badge-deploy' : 'badge-call';
-    let detail2 = '—';
+    let detail2 = '-';
     if (b.type === 'send') detail2 = `→ ${resolveName(b.recipient || '')} ${formatUNIT(b.amount || 0)} UNIT`;
     else if (b.type === 'receive') detail2 = `← ${resolveName(b.sendFrom || '')} +${formatUNIT(b.receiveAmount || 0)} UNIT`;
     else if (b.type === 'open') detail2 = `+${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT (genesis)`;
@@ -206,7 +206,7 @@ function showAccountDetail(pub: string) {
   detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
-// ──── Wallet (localStorage — encrypted with session key) ────
+// ──── Wallet (localStorage - encrypted with session key) ────
 const SESSION_KEY_NAME = 'neuronchain_session_key';
 
 async function getOrCreateSessionKey(): Promise<CryptoKey> {
@@ -442,18 +442,18 @@ function refreshTxAssets() {
   const prevAsset = assetSelect.value;
 
   const options: string[] = [
-    `<option value="__unit__">UNIT — ${formatUNIT(node.ledger.getAccountBalance(fromPub))} available</option>`,
+    `<option value="__unit__">UNIT - ${formatUNIT(node.ledger.getAccountBalance(fromPub))} available</option>`,
   ];
 
   for (const [contractId, contract] of node.ledger.contracts) {
     const state = contract.state as Record<string, unknown>;
     if (state.balances && typeof state.balances === 'object' && state.symbol) {
       const balances = state.balances as Record<string, number>;
-      // Check by pub key (correct) or username (legacy — pre-fix transfers)
+      // Check by pub key (correct) or username (legacy - pre-fix transfers)
       const bal = (balances[fromPub] ?? 0) + (fromUsername ? (balances[fromUsername] ?? 0) : 0);
       if (bal <= 0) continue;
       const sym = escHtml(String(state.symbol));
-      options.push(`<option value="${escHtml(contractId)}">${escHtml(contract.name)} (${sym}) — ${bal.toLocaleString()} available</option>`);
+      options.push(`<option value="${escHtml(contractId)}">${escHtml(contract.name)} (${sym}) - ${bal.toLocaleString()} available</option>`);
     }
   }
 
@@ -483,12 +483,12 @@ function refreshNFTTransferList() {
       if (!localPubs.has(token.owner)) continue;
       const ownerAcc = localAccounts.find(a => a.pub === token.owner)!;
       const meta = typeof token.metadata === 'string' ? token.metadata : JSON.stringify(token.metadata ?? '');
-      const cidStr = token.cid ? escHtml(token.cid) : '—';
+      const cidStr = token.cid ? escHtml(token.cid) : '-';
       rows.push(`<tr>
         <td>#${escHtml(tokenId)}</td>
         <td title="${escHtml(contractId)}">${escHtml(contract.name)}</td>
         <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(meta)}">${escHtml(meta)}</td>
-        <td><span class="hash truncate" title="${cidStr}">${cidStr !== '—' ? trunc(cidStr, 16) : '—'}</span></td>
+        <td><span class="hash truncate" title="${cidStr}">${cidStr !== '-' ? trunc(cidStr, 16) : '-'}</span></td>
         <td>${escHtml(ownerAcc.username)}</td>
         <td><button class="btn btn-outline btn-nft-xfer"
           data-contract="${escHtml(contractId)}"
@@ -510,7 +510,7 @@ function refreshNFTTransferList() {
         const fromPub = btn.getAttribute('data-from')!;
         const acc = localAccounts.find(a => a.pub === fromPub);
         if (!acc) return;
-        const to = prompt(`Transfer NFT #${tokenId} — enter recipient username or public key:`);
+        const to = prompt(`Transfer NFT #${tokenId} - enter recipient username or public key:`);
         if (!to) return;
         const toPub = node.ledger.resolveToPublicKey(to) ?? to;
         const result = await node.ledger.createCall(fromPub, contractId, 'transfer', [tokenId, toPub], acc.keys);
@@ -647,13 +647,13 @@ function refreshExplorer() {
   const isSyncing = recentlyStarted || stableFor < 10000;
 
   if (!isRunning) {
-    syncEl.innerHTML = '<span style="color:var(--danger)">Node offline — start node to sync</span>';
+    syncEl.innerHTML = '<span style="color:var(--danger)">Node offline - start node to sync</span>';
   } else if (total === 0 && isSyncing) {
     syncEl.innerHTML = '<span class="spinner"></span> Connecting to relay and syncing...';
   } else if (isSyncing) {
-    syncEl.innerHTML = `<span class="spinner"></span> Syncing — ${total} blocks &middot; ${accounts} accounts &middot; ${pending > 0 ? pending + ' pending' : 'confirming...'}`;
+    syncEl.innerHTML = `<span class="spinner"></span> Syncing - ${total} blocks &middot; ${accounts} accounts &middot; ${pending > 0 ? pending + ' pending' : 'confirming...'}`;
   } else {
-    syncEl.innerHTML = `<span style="color:var(--success)">&#10003;</span> Synced — ${total} blocks &middot; ${accounts} accounts &middot; ${nodeStats.synapses} synapses`;
+    syncEl.innerHTML = `<span style="color:var(--success)">&#10003;</span> Synced - ${total} blocks &middot; ${accounts} accounts &middot; ${nodeStats.synapses} synapses`;
   }
 
   if (blocks.length === 0) {
@@ -716,7 +716,7 @@ $('#btnResetConfirm').addEventListener('click', async () => {
   localStorage.removeItem('neuronchain_tab');
   localStorage.removeItem('neuronchain_facemaps');
   // Reload page to fully clear in-memory state
-  toast('Testnet reset — reloading...', 'success');
+  toast('Testnet reset - reloading...', 'success');
   setTimeout(() => location.reload(), 500);
 });
 
@@ -804,13 +804,13 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       overlay.textContent = msg;
     });
     if (!isLive) {
-      addLog('FaceID: Liveness FAILED — not enough movement detected', 'error');
-      toast('Liveness failed — try moving your head more', 'error');
+      addLog('FaceID: Liveness FAILED - not enough movement detected', 'error');
+      toast('Liveness failed - try moving your head more', 'error');
       statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
       hideCameraModal(); restoreCreateBtn(); return;
     }
     // Step 2: Face enrollment
-    setCameraStatus('<span class="spinner"></span> Step 2/2: Hold still — capturing face map');
+    setCameraStatus('<span class="spinner"></span> Step 2/2: Hold still - capturing face map');
     const faceMap = await enrollFace(video, (step, total, status) => {
       overlay.textContent = `[${step}/${total}] ${status}`;
       setCameraStatus(`<span class="spinner"></span> Step 2/2: Sample ${step}/${total}`);
@@ -818,7 +818,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     hideCameraModal();
 
     if (!faceMap) {
-      addLog('FaceID: Face enrollment FAILED — could not capture enough samples', 'error');
+      addLog('FaceID: Face enrollment FAILED - could not capture enough samples', 'error');
       toast('Face enrollment failed', 'error');
       statusEl.innerHTML = '<span style="color:var(--danger)">Face enrollment failed. Try again with better lighting.</span>';
       restoreCreateBtn(); return;
@@ -859,13 +859,13 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Public Key</div><div class="stat-value small" style="user-select:all;">${trunc(keys.pub, 40)}</div></div>
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Face Map Hash</div><div class="stat-value small" style="user-select:all;">${trunc(faceMap.hash, 24)}</div></div>
       <div class="secret-box" style="margin-top:12px;">
-        <div class="warn-text">&#9888; BACKUP KEY PAIR — save this as a secondary recovery method.</div>
+        <div class="warn-text">&#9888; BACKUP KEY PAIR - save this as a secondary recovery method.</div>
         <pre class="secret-value" style="white-space:pre-wrap;font-size:11px;">${keysJson}</pre>
       </div>
       <p style="color:var(--accent);font-size:12px;margin-top:8px;">Primary recovery: scan your face on any device. Backup: paste this key pair.</p>
     </div>`;
 
-    toast(`${username} created — ${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT`, 'success');
+    toast(`${username} created - ${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT`, 'success');
     addLog(`Account created: ${username} (+1M UNIT, face-locked)`, 'success');
     refreshAccount(); refreshTransfer(); refreshContracts();
   } catch (err) {
@@ -932,7 +932,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
       const { verifyKeyBlobHash } = await import('./core/face-store');
       const hashValid = await verifyKeyBlobHash(blob, String(onChainAccount.keyBlobHash));
       if (!hashValid) {
-        toast('Key blob hash mismatch — blob may be tampered', 'error');
+        toast('Key blob hash mismatch - blob may be tampered', 'error');
         hideCameraModal();
         $('#btnRecoverFace').removeAttribute('disabled');
         statusEl.innerHTML = '<span style="color:var(--danger)">Key blob integrity check failed. The relay may have served a tampered blob.</span>';
@@ -943,7 +943,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
 
-    setCameraStatus('<span class="spinner"></span> Look at the camera — capturing face...');
+    setCameraStatus('<span class="spinner"></span> Look at the camera - capturing face...');
     await new Promise((r) => setTimeout(r, 1500));
 
     const desc = await captureFaceDescriptor(video);
@@ -957,7 +957,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
 
     if (!keys) {
       statusEl.innerHTML = '<span style="color:var(--danger)">Face did not match. Decryption failed. Try again with better lighting.</span>';
-      toast('Face mismatch — recovery failed', 'error');
+      toast('Face mismatch - recovery failed', 'error');
       $('#btnRecoverFace').removeAttribute('disabled');
       return;
     }
@@ -997,7 +997,7 @@ $('#btnRecoverKeys').addEventListener('click', () => {
 
   try {
     const keys = JSON.parse(keysRaw) as KeyPair;
-    if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) { toast('Invalid key format — needs pub, priv, epub, epriv', 'error'); return; }
+    if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) { toast('Invalid key format - needs pub, priv, epub, epriv', 'error'); return; }
 
     const existing = node.ledger.getAccountByUsername(username);
     if (existing && existing.pub !== keys.pub) { toast('Key does not match this username', 'error'); return; }
@@ -1170,8 +1170,8 @@ $('#btnDeployContract').addEventListener('click', async () => {
 
   if (initArgsStr) {
     let initArgs: unknown[];
-    try { initArgs = JSON.parse(initArgsStr); } catch { toast('Deployed, but constructor args are invalid JSON — call init() manually', 'error'); refreshContracts(); return; }
-    if (!Array.isArray(initArgs)) { toast('Deployed, but constructor args must be a JSON array — call init() manually', 'error'); refreshContracts(); return; }
+    try { initArgs = JSON.parse(initArgsStr); } catch { toast('Deployed, but constructor args are invalid JSON - call init() manually', 'error'); refreshContracts(); return; }
+    if (!Array.isArray(initArgs)) { toast('Deployed, but constructor args must be a JSON array - call init() manually', 'error'); refreshContracts(); return; }
     const callResult = await node.ledger.createCall(sender.pub, contractId, 'init', initArgs, sender.keys);
     if (callResult.error) { toast(`Deployed but init() failed: ${callResult.error}`, 'error'); refreshContracts(); return; }
     const callSub = await node.submitBlock(callResult.block!);
@@ -1214,7 +1214,7 @@ function wireNodeEvents() {
   });
   node.on('block:conflict', (b: unknown) => {
     const block = b as { hash: string; type: string; accountPub: string };
-    addLog(`CONFLICT: fork detected for ${block.type} by ${resolveNamePlain(block.accountPub)} — voting started`, 'warn');
+    addLog(`CONFLICT: fork detected for ${block.type} by ${resolveNamePlain(block.accountPub)} - voting started`, 'warn');
     refreshTab();
   });
   node.on('block:rejected', (b: unknown) => {
@@ -1257,10 +1257,10 @@ function wireNodeEvents() {
     }
   });
   node.on('generation:reset', () => {
-    // Another peer broadcast a higher generation reset — reload to clear all in-memory state
+    // Another peer broadcast a higher generation reset - reload to clear all in-memory state
     localAccounts = [];
     localStorage.removeItem(WALLET_KEY);
-    toast('Network reset received — reloading...', 'warn');
+    toast('Network reset received - reloading...', 'warn');
     setTimeout(() => location.reload(), 800);
   });
   node.net.on('peer:connected', (url: unknown) => {
@@ -1371,7 +1371,7 @@ function refreshStorage() {
     const p = node.ledger.storageProviders.get(servingAccount.pub);
     if (p) {
       const uptime = `${node.storage.getUptimePct(p.pub)}%`;
-      const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '—';
+      const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
       const lastReward = p.lastRewardEpoch > 0
         ? `${Math.round((Date.now() - p.lastRewardEpoch * 24 * 60 * 60 * 1000) / 3_600_000)}h ago`
         : 'Never';
@@ -1400,7 +1400,7 @@ function refreshStorage() {
     providersList.innerHTML = providers.map(p => {
       const isMine = myPubs.has(p.pub);
       const uptime = `${Math.round((p.heartbeatsLast24h / 6) * 100)}%`;
-      const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '—';
+      const latency = p.avgLatencyMs > 0 ? `${p.avgLatencyMs.toFixed(0)}ms` : '-';
       const spotCheck = `${Math.round(p.spotCheckPassRate * 100)}%`;
       const scoreColor = p.score >= 0.8 ? 'var(--success)' : p.score >= 0.4 ? 'var(--warning)' : 'var(--danger)';
       return `<tr${isMine ? ' style="background:rgba(34,211,238,0.04);"' : ''}>
@@ -1466,10 +1466,10 @@ function updateVisibilityBadge(): void {
   if (!badge) return;
   if (vis === 'private') {
     badge.style.cssText = 'padding:10px 14px;border-radius:var(--radius);border:1px solid rgba(245,158,11,0.4);font-size:12px;font-weight:600;text-align:center;background:rgba(245,158,11,0.08);color:var(--warning);';
-    badge.textContent = 'Private — AES-256-GCM';
+    badge.textContent = 'Private - AES-256-GCM';
   } else {
     badge.style.cssText = 'padding:10px 14px;border-radius:var(--radius);border:1px solid rgba(34,211,238,0.3);font-size:12px;font-weight:600;text-align:center;background:rgba(34,211,238,0.07);color:var(--accent);';
-    badge.textContent = 'Public — unencrypted';
+    badge.textContent = 'Public - unencrypted';
   }
 }
 $('#storageVisibility')?.addEventListener('change', updateVisibilityBadge);
@@ -1483,7 +1483,7 @@ $('#imageFile')?.addEventListener('change', () => {
   if (file) {
     previewEl.src = URL.createObjectURL(file);
     preview.style.display = 'block';
-    $('#imagePreviewInfo').textContent = `${file.name} — ${(file.size / 1024).toFixed(1)} KB — ${file.type || 'unknown'}`;
+    $('#imagePreviewInfo').textContent = `${file.name} - ${(file.size / 1024).toFixed(1)} KB - ${file.type || 'unknown'}`;
   } else { preview.style.display = 'none'; }
 });
 
@@ -1493,7 +1493,7 @@ $('#videoFile')?.addEventListener('change', () => {
   if (file) {
     $<HTMLVideoElement>('#videoPreviewEl').src = URL.createObjectURL(file);
     preview.style.display = 'block';
-    $('#videoPreviewInfo').textContent = `${file.name} — ${(file.size / 1024 / 1024).toFixed(2)} MB — ${file.type || 'unknown'}`;
+    $('#videoPreviewInfo').textContent = `${file.name} - ${(file.size / 1024 / 1024).toFixed(2)} MB - ${file.type || 'unknown'}`;
   } else { preview.style.display = 'none'; }
 });
 
@@ -1503,14 +1503,14 @@ $('#audioFile')?.addEventListener('change', () => {
   if (file) {
     $<HTMLAudioElement>('#audioPreviewEl').src = URL.createObjectURL(file);
     preview.style.display = 'block';
-    $('#audioPreviewInfo').textContent = `${file.name} — ${(file.size / 1024).toFixed(1)} KB — ${file.type || 'unknown'}`;
+    $('#audioPreviewInfo').textContent = `${file.name} - ${(file.size / 1024).toFixed(1)} KB - ${file.type || 'unknown'}`;
   } else { preview.style.display = 'none'; }
 });
 
 $('#otherFile')?.addEventListener('change', () => {
   const file = $<HTMLInputElement>('#otherFile').files?.[0];
   $('#otherFileInfo').textContent = file
-    ? `${file.name} — ${(file.size / 1024).toFixed(1)} KB — ${file.type || 'unknown type'}`
+    ? `${file.name} - ${(file.size / 1024).toFixed(1)} KB - ${file.type || 'unknown type'}`
     : '';
 });
 
@@ -1581,7 +1581,7 @@ $('#btnClaimReward')?.addEventListener('click', async () => {
   if (!servingAcc) { toast('Not currently serving storage', 'error'); return; }
 
   await node.storage.issueRewardsIfEligible();
-  toast('Reward check complete — see balance if minted', 'info');
+  toast('Reward check complete - see balance if minted', 'info');
   refreshStorage();
 });
 
@@ -1647,7 +1647,7 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     case 'json': {
       const content = $<HTMLTextAreaElement>('#jsonContent').value.trim();
       if (!content) { toast('Enter JSON content', 'error'); return; }
-      try { JSON.parse(content); } catch { toast('Invalid JSON — fix errors before storing', 'error'); return; }
+      try { JSON.parse(content); } catch { toast('Invalid JSON - fix errors before storing', 'error'); return; }
       data = new TextEncoder().encode(content);
       mimeType = 'application/json';
       break;
@@ -1742,7 +1742,7 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
       const displayText = text.length > 5000 ? text.slice(0, 5000) + '\n\n[...truncated]' : text;
       preview = `<pre style="background:var(--surface2);padding:12px;border-radius:var(--radius);overflow:auto;max-height:340px;font-size:12px;font-family:var(--mono);white-space:pre-wrap;word-break:break-word;">${escHtml(displayText)}</pre>`;
     } else {
-      preview = `<div style="color:var(--text-dim);font-size:13px;margin-bottom:8px;">Binary content — use the download button to save.</div>`;
+      preview = `<div style="color:var(--text-dim);font-size:13px;margin-bottom:8px;">Binary content - use the download button to save.</div>`;
     }
 
     const downloadUrl = URL.createObjectURL(new Blob([data], { type: mime }));

@@ -20,7 +20,7 @@ api.registerKey(pub, keys);
 // Transfer UNIT
 await api.send(fromPub, 'alice', 100_000, keys);
 
-// Store encrypted content — returns CID
+// Store encrypted content - returns CID
 const handle = await api.storeContent(imageBytes, 'image/jpeg', keys, 'my-photo');
 
 // Retrieve and decrypt
@@ -47,22 +47,22 @@ api.on('storage:reward-issued',  ({ amount }) => console.log('Reward minted:', a
 
 ## Content Storage
 
-Content has **dynamic visibility** — each piece of content is stored with an explicit visibility mode:
+Content has **dynamic visibility** - each piece of content is stored with an explicit visibility mode:
 
 | Visibility | Storage method | Who can read |
 |---|---|---|
-| **Public** | `storeWithMetaPublic()` — raw bytes, no encryption | Anyone with the CID |
-| **Private** | `storeWithMeta()` — AES-256-GCM encrypted | Only the key holder |
+| **Public** | `storeWithMetaPublic()` - raw bytes, no encryption | Anyone with the CID |
+| **Private** | `storeWithMeta()` - AES-256-GCM encrypted | Only the key holder |
 
-All store actions are **ECDSA P-256 signed** by the account key regardless of visibility — the signature is carried in the on-chain block that references the CID. This means even public content is authentically attributed.
+All store actions are **ECDSA P-256 signed** by the account key regardless of visibility - the signature is carried in the on-chain block that references the CID. This means even public content is authentically attributed.
 
-The CID returned is content-addressed (SHA-256) — tamper-evident by construction. Retrieval auto-detects visibility: tries decryption first, falls back to public.
+The CID returned is content-addressed (SHA-256) - tamper-evident by construction. Retrieval auto-detects visibility: tries decryption first, falls back to public.
 
 ### Supported Content Types
 
 | Content Type | MIME Type | Description |
 |---|---|---|
-| JSON | `application/json` | Any structured data — posts, comments, profiles, config, etc. |
+| JSON | `application/json` | Any structured data - posts, comments, profiles, config, etc. |
 | Image | `image/jpeg`, `image/png`, `image/gif`, `image/webp`, `image/svg+xml`, `image/avif` | Photos, graphics |
 | Video | `video/mp4`, `video/webm`, `video/ogg` | Short clips, full videos |
 | Audio | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/flac`, `audio/aac` | Music, podcasts, voice notes |
@@ -72,12 +72,12 @@ The CID returned is content-addressed (SHA-256) — tamper-evident by constructi
 | JSON | `application/json` | Structured data, configuration |
 | Other | `application/octet-stream` | Any binary file |
 
-### `storeContent(data, mimeType, keys, name?)` — private
+### `storeContent(data, mimeType, keys, name?)` - private
 
 Encrypt with AES-256-GCM and store. Only the key holder can decrypt.
 
 ```typescript
-// Private — only you can read
+// Private - only you can read
 const handle = await api.storeContent(
   imageBytes,       // Uint8Array
   'image/jpeg',     // MIME type
@@ -85,18 +85,18 @@ const handle = await api.storeContent(
   'my-photo.jpg',   // optional name label
 );
 
-console.log(handle.cid);       // IPFS CID — store in blocks or contracts
+console.log(handle.cid);       // IPFS CID - store in blocks or contracts
 console.log(handle.size);      // bytes before encryption
 console.log(handle.mimeType);  // 'image/jpeg'
 console.log(handle.timestamp); // Unix ms
 ```
 
-### `node.helia.storeWithMetaPublic(data, meta)` — public
+### `node.helia.storeWithMetaPublic(data, meta)` - public
 
 Store without encryption. Anyone with the CID can read. Signed on-chain via the block referencing it.
 
 ```typescript
-// Public — anyone can read
+// Public - anyone can read
 const { cid } = await node.helia.storeWithMetaPublic(postBytes, {
   mimeType: 'application/json',
   name: 'My Post',
@@ -221,7 +221,7 @@ const contracts = api.listContracts();
 
 ## Decentralised Storage Ledger
 
-NeuronChain has an automated storage incentive system. Providers earn new UNIT minted directly into their account — no manual deals, no payments to chase.
+NeuronChain has an automated storage incentive system. Providers earn new UNIT minted directly into their account - no manual deals, no payments to chase.
 
 **Earning rate:**
 ```
@@ -280,7 +280,7 @@ Manually trigger today's reward claim (normally fires automatically once per day
 
 ```typescript
 api.getBlock(hash)                // AccountBlock | undefined
-api.getChain(pub)                 // AccountBlock[] — full account chain
+api.getChain(pub)                 // AccountBlock[] - full account chain
 api.getRecentBlocks(limit?)       // last N blocks across all accounts
 api.getLedgerStats()              // { totalAccounts, totalBlocks, ... }
 ```
@@ -330,7 +330,7 @@ api.on('node:stopped',             () => { });
 
 ```typescript
 interface ContentHandle {
-  cid: string;       // IPFS CID — use in block.contentCid or contract state
+  cid: string;       // IPFS CID - use in block.contentCid or contract state
   size: number;      // bytes before encryption
   mimeType: string;
   timestamp: number; // Unix ms

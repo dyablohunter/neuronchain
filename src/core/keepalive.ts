@@ -2,9 +2,9 @@
  * Keep-alive system to prevent the browser tab from freezing/sleeping.
  *
  * Uses three strategies:
- * 1. Wake Lock API — prevents screen from turning off (mobile + desktop)
- * 2. Web Worker heartbeat — keeps JS execution alive even when tab is backgrounded
- * 3. Silent audio loop — prevents mobile browsers from suspending the tab
+ * 1. Wake Lock API - prevents screen from turning off (mobile + desktop)
+ * 2. Web Worker heartbeat - keeps JS execution alive even when tab is backgrounded
+ * 3. Silent audio loop - prevents mobile browsers from suspending the tab
  */
 
 let wakeLock: WakeLockSentinel | null = null;
@@ -25,7 +25,7 @@ async function requestWakeLock(): Promise<void> {
       });
     }
   } catch {
-    // Wake Lock not supported or denied — non-critical
+    // Wake Lock not supported or denied - non-critical
   }
 }
 
@@ -87,7 +87,7 @@ function startSilentAudio(): void {
 
     playSilence();
   } catch {
-    // AudioContext not available — non-critical
+    // AudioContext not available - non-critical
   }
 }
 

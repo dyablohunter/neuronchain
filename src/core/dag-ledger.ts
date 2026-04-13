@@ -32,7 +32,7 @@ export interface DAGStats {
 }
 
 /**
- * Live storage provider profile — derived from on-chain blocks and updated
+ * Live storage provider profile - derived from on-chain blocks and updated
  * with off-chain metrics (latency, spot-check rate) by StorageManager.
  */
 export interface StorageProvider {
@@ -68,7 +68,7 @@ export class DAGLedger extends EventEmitter {
   contracts: Map<string, { owner: string; code: string; state: Record<string, unknown>; name: string; deployedAt: number }> = new Map();
   unclaimedSends: Map<string, { fromPub: string; toPub: string; amount: number }> = new Map();
   faceAccountCount: Map<string, number> = new Map();
-  /** Per-contract execution queue — ensures calls execute sequentially, never concurrently */
+  /** Per-contract execution queue - ensures calls execute sequentially, never concurrently */
   private contractQueues: Map<string, Promise<void>> = new Map();
 
   /** Decentralised storage ledger: provider pub → live profile */
@@ -287,12 +287,12 @@ export class DAGLedger extends EventEmitter {
     const epochDay = Math.floor(Date.now() / REWARD_EPOCH_MS);
     if (provider.lastRewardEpoch >= epochDay) return { error: 'Storage reward already claimed for today' };
 
-    // Use capacity at epoch start — not current capacity — to prevent bumping GB just before claiming
+    // Use capacity at epoch start - not current capacity - to prevent bumping GB just before claiming
     const capacityAtEpochStart = this.getCapacityAtEpochStart(pub, epochDay);
-    if (capacityAtEpochStart === 0) return { error: 'Not registered at epoch start — no reward eligible' };
+    if (capacityAtEpochStart === 0) return { error: 'Not registered at epoch start - no reward eligible' };
 
     const heartbeatCount = this.countHeartbeatsInEpoch(pub, epochDay);
-    if (heartbeatCount === 0) return { error: 'No heartbeat blocks recorded today — cannot claim reward' };
+    if (heartbeatCount === 0) return { error: 'No heartbeat blocks recorded today - cannot claim reward' };
 
     const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1.0);
     const amount = Math.floor(BASE_STORAGE_RATE_MILLI * capacityAtEpochStart * uptimeFactor);
@@ -475,7 +475,7 @@ export class DAGLedger extends EventEmitter {
       if (provider.lastRewardEpoch >= data.epochDay) {
         return `storage-reward: epoch ${data.epochDay} already rewarded`;
       }
-      // Validate storedGB against capacity at epoch start — not current capacity
+      // Validate storedGB against capacity at epoch start - not current capacity
       const capacityAtEpochStart = this.getCapacityAtEpochStart(block.accountPub, data.epochDay);
       if (capacityAtEpochStart === 0) {
         return 'storage-reward: not registered at epoch start';

@@ -1,11 +1,11 @@
 /**
- * Helia/IPFS content store — large content storage for social media posts,
+ * Helia/IPFS content store - large content storage for social media posts,
  * images, video, audio, JSON documents, HTML/CSS/JS files, etc.
  *
  * Content is content-addressed (stored by SHA-256 CID) which means:
  *   1. Any peer that has the content can serve it to any requester
  *   2. The hash stored on-chain in block.contentCid proves integrity
- *   3. A malicious peer can't serve tampered content — hash mismatch = reject
+ *   3. A malicious peer can't serve tampered content - hash mismatch = reject
  *
  * All content is encrypted with the uploader's content key before storing.
  * Only holders of the account's ECDH private key can decrypt their own content.
@@ -39,7 +39,7 @@ export class HeliaStore {
   private datastore!: IDBDatastore;
   private started = false;
 
-  /** Start Helia — shares the same libp2p node for networking */
+  /** Start Helia - shares the same libp2p node for networking */
   async start(libp2pNode?: unknown): Promise<void> {
     if (this.started) return;
 
@@ -102,7 +102,7 @@ export class HeliaStore {
 
   /**
    * Encrypt `data` with the account's content key, then store.
-   * Returns the CID — store this in block.contentCid.
+   * Returns the CID - store this in block.contentCid.
    */
   async storeEncrypted(data: Uint8Array, keys: KeyPair): Promise<string> {
     const aesKey = await deriveContentKey(keys);
@@ -174,7 +174,7 @@ export class HeliaStore {
   // ── Public (unencrypted) variants ─────────────────────────────────────────
 
   /**
-   * Store with a metadata envelope without encryption — content is publicly readable.
+   * Store with a metadata envelope without encryption - content is publicly readable.
    * Use for posts, profiles, and any content with "public" visibility.
    * The action should still be ECDSA-signed at the block layer.
    */
@@ -193,7 +193,7 @@ export class HeliaStore {
 
   /**
    * Retrieve public (unencrypted) content stored via storeWithMetaPublic.
-   * Anyone can read this — no key required.
+   * Anyone can read this - no key required.
    */
   async retrieveWithMetaPublic(metaCid: string): Promise<{ data: Uint8Array; meta: ContentMeta & { contentCid: string } } | undefined> {
     try {
@@ -206,7 +206,7 @@ export class HeliaStore {
   }
 
   /**
-   * Auto-detect and retrieve content — tries encrypted first (if keys provided),
+   * Auto-detect and retrieve content - tries encrypted first (if keys provided),
    * falls back to public. Works for both visibility modes.
    */
   async retrieveAuto(metaCid: string, keys?: KeyPair): Promise<{ data: Uint8Array; meta: ContentMeta & { contentCid: string }; wasEncrypted: boolean } | undefined> {
@@ -228,7 +228,7 @@ export class HeliaStore {
     await this.helia.pins.add(cid);
   }
 
-  /** Unpin content — it will be garbage-collected eventually */
+  /** Unpin content - it will be garbage-collected eventually */
   async unpin(cidStr: string): Promise<void> {
     this.assertStarted();
     try {
@@ -272,6 +272,6 @@ export class HeliaStore {
   isStarted(): boolean { return this.started; }
 
   private assertStarted(): void {
-    if (!this.started) throw new Error('HeliaStore not started — call start() first');
+    if (!this.started) throw new Error('HeliaStore not started - call start() first');
   }
 }

@@ -4,9 +4,9 @@
  * Run with:  node relay-server.js
  *
  * This server provides three services:
- *   1. WebSocket listener at /p2p on port 9090 — browser entry point
- *   2. Circuit Relay v2 — lets browser peers reach each other through NAT
- *   3. Kademlia DHT server mode — peer routing for the network
+ *   1. WebSocket listener at /p2p on port 9090 - browser entry point
+ *   2. Circuit Relay v2 - lets browser peers reach each other through NAT
+ *   3. Kademlia DHT server mode - peer routing for the network
  *
  * This relay is NOT on the data path:
  *   - Application messages (blocks, votes, accounts) pass peer-to-peer via GossipSub
@@ -16,8 +16,8 @@
  * Deploy multiple independent community relays to eliminate single-operator control.
  *
  * Environment variables:
- *   PORT         — WebSocket port (default: 9090)
- *   PEER_ID_FILE — path to persist peer ID across restarts (default: .relay-peer-id.json)
+ *   PORT         - WebSocket port (default: 9090)
+ *   PEER_ID_FILE - path to persist peer ID across restarts (default: .relay-peer-id.json)
  */
 
 import { createLibp2p } from 'libp2p';
@@ -40,7 +40,7 @@ import { GossipSub } from '@chainsafe/libp2p-gossipsub';
 // ── Fix A: libp2p stream API mismatch with it-pipe ────────────────────────────
 // New libp2p streams (AbstractMessageStream) have Symbol.asyncIterator + send()
 // but NOT the .sink / .source duplex interface that it-pipe expects.
-// gossipsub's OutboundStream calls pipe(pushable, rawStream) — it-pipe checks
+// gossipsub's OutboundStream calls pipe(pushable, rawStream) - it-pipe checks
 // isDuplex(rawStream) = rawStream.sink != null && rawStream.source != null,
 // which fails, causing a TypeError that is silently swallowed and leaving
 // streamsOutbound empty (no messages flow).
@@ -65,7 +65,7 @@ Object.defineProperty(AbstractMessageStream.prototype, 'sink', {
 // ── Fix B: multiaddr.tuples() API mismatch in GossipSub.addPeer ──────────────
 // gossipsub 14.x calls multiaddr.tuples() for IP scoring but libp2p's internal
 // multiaddr objects (different class instance) don't have this method, causing
-// addPeer() to throw before pushing to outboundInflightQueue — so no streams form.
+// addPeer() to throw before pushing to outboundInflightQueue - so no streams form.
 // Patch: catch the error and add the peer manually without IP scoring.
 const _origAddPeer = GossipSub.prototype.addPeer;
 GossipSub.prototype.addPeer = function(peerId, direction, addr) {
@@ -147,7 +147,7 @@ async function main() {
         },
       }),
       dht: kadDHT({
-        // Server mode — participates in DHT routing
+        // Server mode - participates in DHT routing
         clientMode: false,
         kBucketSize: 20,
       }),

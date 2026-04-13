@@ -162,7 +162,7 @@ export class StorageManager extends EventEmitter {
 
       const result = await this.ledger.createStorageReward(pub, keys);
       if (!result.block) {
-        // Not yet eligible (no heartbeats today, or already claimed) — log and continue
+        // Not yet eligible (no heartbeats today, or already claimed) - log and continue
         console.log(`[StorageManager] Reward not yet eligible for ${pub.slice(0, 12)}...: ${result.error}`);
         continue;
       }
@@ -226,7 +226,7 @@ export class StorageManager extends EventEmitter {
   ): Promise<{ providers: string[]; error?: string }> {
     const providers = this.selectProviders(REDUNDANCY_TARGET);
     if (providers.length === 0) {
-      return { providers: [], error: 'No storage providers available — content stored locally only' };
+      return { providers: [], error: 'No storage providers available - content stored locally only' };
     }
 
     const peerId = this.net.libp2p?.peerId?.toString() || '';
@@ -266,11 +266,11 @@ export class StorageManager extends EventEmitter {
     try {
       const verified = await verifySignature(req.signature, req.uploaderPub);
       if (verified !== payload) {
-        console.warn(`[StorageManager] Rejected pin request — invalid signature`);
+        console.warn(`[StorageManager] Rejected pin request - invalid signature`);
         return;
       }
     } catch {
-      console.warn(`[StorageManager] Rejected pin request — signature verification failed`);
+      console.warn(`[StorageManager] Rejected pin request - signature verification failed`);
       return;
     }
 
@@ -342,7 +342,7 @@ export class StorageManager extends EventEmitter {
       for (const provider of providers) {
         try {
           const start = Date.now();
-          // Attempt to retrieve the CID — Helia will fetch from the peer if not local
+          // Attempt to retrieve the CID - Helia will fetch from the peer if not local
           const bytes = await Promise.race([
             this.helia.retrieve(cid),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 8_000)),
@@ -369,7 +369,7 @@ export class StorageManager extends EventEmitter {
             this.handleReceipt(receipt);
           }
         } catch {
-          // Spot check failed — record a failure receipt
+          // Spot check failed - record a failure receipt
           const myPub = Array.from(this.localKeys.keys())[0];
           const myKeys = myPub ? this.localKeys.get(myPub) : undefined;
           if (myPub && myKeys) {
