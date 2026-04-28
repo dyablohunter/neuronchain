@@ -26,11 +26,10 @@ npm run tunnel     # (second terminal) HTTPS tunnel for multiple-device testing
 1. **Create account** - Account tab → choose username → liveness check → face enrollment (3 captures) → set 4-digit PIN → 1,000,000 UNIT minted → save backup secret key
 2. **Start node** - Node tab → Start Node (connects to relay, starts syncing via libp2p + smoke)
 3. **Send UNIT** - Transfer tab → recipient username → amount → **PIN required**
-4. **Claim receives** - Transfer tab → Pending Receives → Claim
-5. **Recover account** - Account tab → enter username → PIN prompt → face scan / paste backup secret key (from any device)
-6. **Store content** - Storage tab → select account → paste JSON or upload file → get CID
-7. **Deploy contract** - Contracts tab → load Token or NFT template → deploy → **PIN required**
-8. **Update PIN / face** - Account tab → Update PIN / Face section → authenticate → change credentials
+4. **Recover account** - Account tab → enter username → PIN prompt → face scan / paste backup secret key (from any device)
+5. **Store content** - Storage tab → select account → paste JSON or upload file → get CID
+6. **Deploy contract** - Contracts tab → load Token or NFT template → deploy → **PIN required**
+7. **Update PIN / face** - Account tab → Update PIN / Face section → authenticate → change credentials
 
 ### Production Relay
 
@@ -394,7 +393,7 @@ neuronchain/
 
 - **Bootstrap dependency**: libp2p still needs bootstrap nodes to find initial peers. Run multiple community bootstrap/relay nodes for mainnet.
 - **Relay on gossipsub path**: while browser-to-browser connections run over circuit relay (before WebRTC upgrade), the relay node must also participate in GossipSub to route messages between those peers. Once peers upgrade to direct WebRTC, the relay is off the data path. For true relay-independence, run multiple independent community relays.
-- **Auto-receive timing window**: `autoReceive` fires when the recipient's node receives the SEND block via GossipSub. If the recipient was briefly disconnected, they can claim the pending receive manually (Transfer → Pending Receives). The sender re-broadcasts every 20s so auto-receive will eventually fire.
+- **Auto-receive timing window**: `autoReceive` fires when the recipient's node receives the SEND block via GossipSub. If the recipient was briefly disconnected, the sender re-broadcasts every 20s so auto-receive will fire once they reconnect.
 - **Waku alternative**: Waku (built on libp2p) provides a ready bootstrap fleet and built-in message store, but has a 150KB message size limit that prevents direct content storage. libp2p + smoke is the correct choice when storing arbitrary content.
 - **Face uniqueness**: enforced locally via Euclidean distance on 128-dim descriptors. A global uniqueness proof (ZK biometrics) is an open research problem.
 - **BFT finality**: optimistic confirmation with conflict voting is not BFT. Under a 33%+ Sybil attack, forks can persist. Full BFT (e.g., HotStuff) is a future upgrade path.
