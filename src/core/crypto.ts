@@ -1,19 +1,27 @@
 /**
- * Cryptographic primitives - pure Web Crypto API, no external dependencies.
+ * Cryptographic primitives.
  *
- * Key pairs use ECDSA P-256 for signing and ECDH P-256 for encryption.
- * Keys are serialised as base64-encoded JWK JSON strings so they can be
- * stored in localStorage / IndexedDB / libp2p without binary concerns.
+ * Classical: Web Crypto API (ECDSA P-256 signing, ECDH P-256 encryption).
+ * Quantum-safe: @noble/post-quantum (ML-DSA-65 hybrid signing, ML-KEM-768 key encapsulation).
  *
+ * Classical key wire format: base64-encoded JWK JSON strings.
+ * PQ key wire format: base64-encoded raw Uint8Array.
  * Signature wire format: JSON string `{"d":"<original-data>","s":"<base64-sig>"}`
- * verifySignature returns the original data string on success, undefined on failure.
  */
+
+import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
+import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
 
 export interface KeyPair {
   pub: string;   // ECDSA P-256 public key  - base64(JSON(JWK))
   priv: string;  // ECDSA P-256 private key - base64(JSON(JWK))
   epub: string;  // ECDH  P-256 public key  - base64(JSON(JWK))
   epriv: string; // ECDH  P-256 private key - base64(JSON(JWK))
+  // Quantum-safe keys (absent on legacy accounts)
+  pqPub?: string;     // ML-DSA-65 public key  - base64(Uint8Array, 1952 bytes)
+  pqPriv?: string;    // ML-DSA-65 private key - base64(Uint8Array, 4032 bytes)
+  pqKemPub?: string;  // ML-KEM-768 public key  - base64(Uint8Array, 1184 bytes)
+  pqKemPriv?: string; // ML-KEM-768 private key - base64(Uint8Array, 2400 bytes)
 }
 
 // ── Byte helpers ──────────────────────────────────────────────────────────────
@@ -22,8 +30,8 @@ function bufToB64(buf: ArrayBuffer): string {
   return btoa(String.fromCharCode(...new Uint8Array(buf)));
 }
 
-function b64ToBuf(s: string): Uint8Array {
-  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+function b64ToBuf(s: string): Uint8Array<ArrayBuffer> {
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0)) as Uint8Array<ArrayBuffer>;
 }
 
 async function exportJWK(key: CryptoKey): Promise<string> {
@@ -80,7 +88,7 @@ async function deriveAESFromECDH(eprivB64: string): Promise<CryptoKey> {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/** Generate a fresh ECDSA/ECDH P-256 key pair */
+/** Generate a fresh ECDSA/ECDH P-256 key pair with ML-DSA-65 and ML-KEM-768 quantum-safe keys */
 export async function generateKeyPair(): Promise<KeyPair> {
   const [sigPair, encPair] = await Promise.all([
     crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']),
@@ -92,7 +100,17 @@ export async function generateKeyPair(): Promise<KeyPair> {
     exportJWK((encPair as CryptoKeyPair).publicKey),
     exportJWK((encPair as CryptoKeyPair).privateKey),
   ]);
-  return { pub, priv, epub, epriv };
+
+  const dsaKeys = ml_dsa65.keygen();
+  const kemKeys = ml_kem768.keygen();
+
+  return {
+    pub, priv, epub, epriv,
+    pqPub:    btoa(String.fromCharCode(...dsaKeys.publicKey)),
+    pqPriv:   btoa(String.fromCharCode(...dsaKeys.secretKey)),
+    pqKemPub:  btoa(String.fromCharCode(...kemKeys.publicKey)),
+    pqKemPriv: btoa(String.fromCharCode(...kemKeys.secretKey)),
+  };
 }
 
 /** SHA-256 hex digest */
@@ -150,7 +168,7 @@ export async function encryptData(data: string, pair: KeyPair): Promise<string> 
     aesKey,
     new TextEncoder().encode(data),
   );
-  return `${bufToB64(iv.buffer)}:${bufToB64(ct)}`;
+  return `${bufToB64(iv.buffer as ArrayBuffer)}:${bufToB64(ct)}`;
 }
 
 /** Decrypt a string produced by `encryptData`. Returns undefined on failure. */
@@ -175,7 +193,7 @@ export async function decryptData(encrypted: string, pair: KeyPair): Promise<str
  */
 export async function encryptBytes(data: Uint8Array, aesKey: CryptoKey): Promise<Uint8Array> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, data);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, data as unknown as BufferSource);
   const result = new Uint8Array(12 + ct.byteLength);
   result.set(iv);
   result.set(new Uint8Array(ct), 12);
@@ -200,4 +218,35 @@ export async function decryptBytes(data: Uint8Array, aesKey: CryptoKey): Promise
  */
 export async function deriveContentKey(pair: KeyPair): Promise<CryptoKey> {
   return deriveAESFromECDH(pair.epriv);
+}
+
+// ── Quantum-safe signing (ML-DSA-65) ─────────────────────────────────────────
+
+function b64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+/**
+ * Sign data with ML-DSA-65 (quantum-safe).
+ * Returns base64-encoded signature.
+ */
+export function pqSign(data: string, pqPrivB64: string): string {
+  const msg = new TextEncoder().encode(data);
+  const secretKey = b64ToBytes(pqPrivB64);
+  const sig = ml_dsa65.sign(msg, secretKey);
+  return btoa(String.fromCharCode(...sig));
+}
+
+/**
+ * Verify an ML-DSA-65 signature produced by pqSign.
+ */
+export function pqVerify(data: string, sigB64: string, pqPubB64: string): boolean {
+  try {
+    const msg = new TextEncoder().encode(data);
+    const sig = b64ToBytes(sigB64);
+    const publicKey = b64ToBytes(pqPubB64);
+    return ml_dsa65.verify(sig, msg, publicKey);
+  } catch {
+    return false;
+  }
 }

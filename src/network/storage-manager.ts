@@ -23,6 +23,8 @@ import { Libp2pNetwork } from './libp2p-network';
 import { HeliaStore } from './helia-store';
 import { AccountBlock, HEARTBEAT_INTERVAL_MS, REWARD_EPOCH_MS } from '../core/dag-block';
 import { KeyPair, signData, verifySignature } from '../core/crypto';
+import { getDeviceId } from './node';
+import { multiaddr } from '@multiformats/multiaddr';
 
 const HEARTBEAT_JITTER_MS = 5 * 60 * 1000;          // ±5 min jitter so nodes don't all fire at once
 const REWARD_CHECK_INTERVAL_MS = 30 * 60 * 1000;    // check every 30 min whether today's reward is due
@@ -31,6 +33,7 @@ const RECEIPT_WINDOW_MS = 24 * 60 * 60 * 1000;      // keep receipts for 24h rol
 const REDUNDANCY_TARGET = 10;                        // target copies per file
 
 export interface StorageReceipt {
+  [key: string]: unknown;
   /** Provider that served the content */
   providerPub: string;
   /** Peer that retrieved and signed the receipt */
@@ -44,12 +47,18 @@ export interface StorageReceipt {
 }
 
 export interface PinRequest {
+  [key: string]: unknown;
   cid: string;
+  /** Additional CIDs that must also be pinned (e.g. contentCid inside a meta envelope) */
+  additionalCids?: string[];
   /** Public keys of providers selected to pin this CID */
   targetProviders: string[];
   uploaderPub: string;
   /** libp2p PeerId of the uploader so providers can dial and fetch */
   uploaderPeerId: string;
+  /** Circuit-relay multiaddrs of the uploader — provider dials these to establish a
+   *  direct libp2p connection before BitSwap so WANT messages actually reach the uploader */
+  uploaderAddrs?: string[];
   timestamp: number;
   signature: string;
 }
@@ -67,8 +76,11 @@ export class StorageManager extends EventEmitter {
   /** Rolling 24h receipts per provider (off-chain, in-memory only) */
   private receipts: Map<string, StorageReceipt[]> = new Map();
 
-  /** CIDs we're tracking for redundancy: cid → { owner, confirmedProviders } */
-  private trackedCids: Map<string, { ownerPub: string; confirmedProviders: Set<string> }> = new Map();
+  /** CIDs we're tracking for redundancy: cid → { owner, confirmedProviders, additionalCids, lastDistributed } */
+  private trackedCids: Map<string, { ownerPub: string; confirmedProviders: Set<string>; additionalCids: string[]; lastDistributed: number }> = new Map();
+
+  /** CIDs that failed distribution (no providers at upload time): primaryCid → { ownerPub, additionalCids } */
+  private pendingCids: Map<string, { ownerPub: string; additionalCids: string[] }> = new Map();
 
   private started = false;
 
@@ -92,10 +104,21 @@ export class StorageManager extends EventEmitter {
     this.started = true;
 
     // Watch for incoming pin requests from other nodes
-    this.net.watchPinRequests(async (req) => this.handlePinRequest(req));
+    this.net.watchPinRequests(async (req) => this.handlePinRequest(req as unknown as PinRequest));
 
     // Watch for retrieval receipts from peers
-    this.net.watchStorageReceipts((receipt) => this.handleReceipt(receipt));
+    this.net.watchStorageReceipts((receipt) => this.handleReceipt(receipt as unknown as StorageReceipt));
+
+    // Retry pending CIDs whenever a new provider registers (covers the case where
+    // files were uploaded before any provider was available).
+    this.ledger.on('storage:registered', () => {
+      setTimeout(() => this.retryPendingDistributions(), 2_000);
+    });
+
+    // Retry all unconfirmed distributions every 30s. Covers the case where the
+    // GossipSub mesh wasn't fully formed when the pin request was first published
+    // (fire-and-forget messages are lost if no peers were in the mesh at that moment).
+    setInterval(() => this.retryUnconfirmedDistributions(), 30_000);
 
     // Schedule the first heartbeat with jitter, then repeat
     this.scheduleNextHeartbeat();
@@ -133,9 +156,11 @@ export class StorageManager extends EventEmitter {
   }
 
   private async broadcastHeartbeatsForAll(): Promise<void> {
+    const localDeviceId = getDeviceId();
     for (const [pub, keys] of this.localKeys) {
       const provider = this.ledger.storageProviders.get(pub);
       if (!provider || provider.capacityGB === 0) continue;
+      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
       await this.broadcastHeartbeat(pub, keys);
     }
   }
@@ -184,9 +209,11 @@ export class StorageManager extends EventEmitter {
    * Weight = capacityGB × max(0.1, score). Local accounts are excluded.
    */
   selectProviders(count: number): StorageProvider[] {
-    const myPubs = new Set(this.localKeys.keys());
+    const localDeviceId = getDeviceId();
+    // Exclude providers registered on this physical device — their content is already local.
+    // Providers on other devices are eligible even if the same account key is loaded here.
     const candidates = this.ledger.getStorageProviders()
-      .filter(p => !myPubs.has(p.pub));
+      .filter(p => !p.deviceId || p.deviceId !== localDeviceId);
 
     if (candidates.length === 0) return [];
 
@@ -214,40 +241,83 @@ export class StorageManager extends EventEmitter {
 
   // ── Content distribution ──────────────────────────────────────────────────
 
+  /** Retry distribution for CIDs that failed earlier because no providers existed. */
+  private async retryPendingDistributions(): Promise<void> {
+    if (this.pendingCids.size === 0) return;
+    if (this.selectProviders(1).length === 0) return;
+
+    for (const [cid, { ownerPub, additionalCids }] of this.pendingCids) {
+      const keys = this.localKeys.get(ownerPub);
+      if (!keys) continue;
+      const result = await this.distributeContent(cid, ownerPub, keys, additionalCids);
+      if (result.providers.length > 0) {
+        this.pendingCids.delete(cid);
+        console.log(`[StorageManager] Retried distribution for ${cid.slice(0, 16)}... → ${result.providers.length} providers`);
+      }
+    }
+  }
+
+  /** Resend pin requests for CIDs that have no confirmed provider yet. */
+  private async retryUnconfirmedDistributions(): Promise<void> {
+    if (this.trackedCids.size === 0) return;
+    if (this.selectProviders(1).length === 0) return;
+    const now = Date.now();
+    for (const [cid, tracked] of this.trackedCids) {
+      if (tracked.confirmedProviders.size > 0) continue; // already confirmed
+      if (now - tracked.lastDistributed < 25_000) continue; // too soon to retry
+      const keys = this.localKeys.get(tracked.ownerPub);
+      if (!keys) continue;
+      tracked.lastDistributed = now;
+      await this.distributeContent(cid, tracked.ownerPub, keys, tracked.additionalCids);
+      console.log(`[StorageManager] Retried unconfirmed distribution for ${cid.slice(0, 16)}...`);
+    }
+  }
+
   /**
-   * Distribute a stored CID to up to REDUNDANCY_TARGET providers.
-   * Publishes a signed pin request via GossipSub; providers fetch via Helia/Bitswap.
-   * Returns the list of selected provider pub keys.
+   * Distribute stored CIDs to up to REDUNDANCY_TARGET providers.
+   * `cid` is the primary (meta) CID; `additionalCids` are bundled in the same pin
+   * request so providers pin both the envelope and the content block together.
    */
   async distributeContent(
     cid: string,
     uploaderPub: string,
     keys: KeyPair,
+    additionalCids: string[] = [],
   ): Promise<{ providers: string[]; error?: string }> {
     const providers = this.selectProviders(REDUNDANCY_TARGET);
     if (providers.length === 0) {
+      this.pendingCids.set(cid, { ownerPub: uploaderPub, additionalCids });
       return { providers: [], error: 'No storage providers available - content stored locally only' };
     }
 
     const peerId = this.net.libp2p?.peerId?.toString() || '';
-    const payload = `pin:${cid}:${uploaderPub}:${Date.now()}`;
+    const ts = Date.now();
+    const payload = `pin:${cid}:${uploaderPub}:${ts}`;
     const signature = await signData(payload, keys);
+
+    // Collect circuit-relay multiaddrs so the provider can dial us directly for BitSwap.
+    // GossipSub messages flow via the relay, but BitSwap needs a direct libp2p connection.
+    const uploaderAddrs = (this.net.libp2p?.getMultiaddrs?.() ?? [])
+      .map(ma => ma.toString())
+      .filter(a => a.includes('p2p-circuit'))
+      .slice(0, 2);
 
     const request: PinRequest = {
       cid,
+      additionalCids: additionalCids.length > 0 ? additionalCids : undefined,
       targetProviders: providers.map(p => p.pub),
       uploaderPub,
       uploaderPeerId: peerId,
-      timestamp: Date.now(),
+      uploaderAddrs: uploaderAddrs.length > 0 ? uploaderAddrs : undefined,
+      timestamp: ts,
       signature,
     };
 
     this.net.publishPinRequest(request);
 
-    // Track for redundancy monitoring
-    this.trackedCids.set(cid, { ownerPub: uploaderPub, confirmedProviders: new Set() });
+    this.trackedCids.set(cid, { ownerPub: uploaderPub, confirmedProviders: new Set(), additionalCids, lastDistributed: Date.now() });
 
-    console.log(`[StorageManager] Pin request published for ${cid.slice(0, 16)}... to ${providers.length} providers`);
+    console.log(`[StorageManager] Pin request published for ${cid.slice(0, 16)}... (+${additionalCids.length} extra) to ${providers.length} providers`);
     return { providers: providers.map(p => p.pub) };
   }
 
@@ -256,10 +326,24 @@ export class StorageManager extends EventEmitter {
   private async handlePinRequest(req: PinRequest): Promise<void> {
     // Check if we are one of the target providers
     const myProviderPub = Array.from(this.localKeys.keys()).find(pub => req.targetProviders.includes(pub));
-    if (!myProviderPub) return;
+    if (!myProviderPub) {
+      console.log(`[StorageManager] Pin request ignored - not a target provider. Targets: ${req.targetProviders.map(p => p.slice(0,8)).join(',')}, local keys: ${Array.from(this.localKeys.keys()).map(p => p.slice(0,8)).join(',')}`);
+      return;
+    }
 
     const provider = this.ledger.storageProviders.get(myProviderPub);
-    if (!provider || provider.capacityGB === 0) return;
+    if (!provider || provider.capacityGB === 0) {
+      console.log(`[StorageManager] Pin request ignored - ${myProviderPub.slice(0,12)} not an active provider (capacity=${provider?.capacityGB ?? 'none'})`);
+      return;
+    }
+
+    // Only the device that registered should serve - prevents both devices from
+    // responding when the same account is loaded on two machines.
+    const localDeviceId = getDeviceId();
+    if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) {
+      console.log(`[StorageManager] Pin request ignored - deviceId mismatch (registered=${provider.deviceId.slice(0,8)}, local=${localDeviceId.slice(0,8)})`);
+      return;
+    }
 
     // Verify the uploader's signature
     const payload = `pin:${req.cid}:${req.uploaderPub}:${req.timestamp}`;
@@ -274,11 +358,34 @@ export class StorageManager extends EventEmitter {
       return;
     }
 
-    // Pin the content via Helia (fetches from the uploader or any peer that has it)
-    if (!this.helia.isStarted()) return;
+    console.log(`[StorageManager] Handling pin request for ${req.cid.slice(0, 16)}... as provider ${myProviderPub.slice(0,12)}`);
+
+    // BitSwap needs a direct libp2p connection to the uploader. GossipSub flows through
+    // the relay (which runs GossipSub), but the relay does not run BitSwap/Helia.
+    // Without this dial, the provider's WANT messages go only to the relay, get no
+    // response, and the fetch times out.
+    if (this.net.libp2p && req.uploaderAddrs?.length) {
+      for (const addrStr of req.uploaderAddrs) {
+        try {
+          await this.net.libp2p.dial(multiaddr(addrStr));
+          console.log(`[StorageManager] Connected to uploader via circuit relay for BitSwap`);
+          break;
+        } catch { /* try next addr */ }
+      }
+    }
+
+    // Pin the content via Helia (fetches from the uploader or any peer that has it).
+    // Pin every CID in the request - the meta envelope and the content block are
+    // stored as separate UnixFS blobs and must both be fetched explicitly.
+    if (!this.helia.isStarted()) { console.warn('[StorageManager] Helia not started, cannot pin'); return; }
     try {
       const start = Date.now();
-      await this.helia.pin(req.cid);
+      const allCids = [req.cid, ...(Array.isArray(req.additionalCids) ? req.additionalCids : [])];
+      for (const c of allCids) {
+        console.log(`[StorageManager] Fetching+pinning ${c.slice(0,16)}...`);
+        await this.helia.pin(c);
+        console.log(`[StorageManager] Pinned ${c.slice(0,16)}... OK`);
+      }
       const latencyMs = Date.now() - start;
       console.log(`[StorageManager] Pinned ${req.cid.slice(0, 16)}... in ${latencyMs}ms`);
 
@@ -310,6 +417,12 @@ export class StorageManager extends EventEmitter {
   // ── Receipt handling ──────────────────────────────────────────────────────
 
   handleReceipt(receipt: StorageReceipt): void {
+    // Mark provider as confirmed for this CID so we stop retrying
+    if (receipt.success) {
+      const tracked = this.trackedCids.get(receipt.cid);
+      if (tracked) tracked.confirmedProviders.add(receipt.providerPub);
+    }
+
     // Prune receipts older than 24h
     const cutoff = Date.now() - RECEIPT_WINDOW_MS;
     const list = (this.receipts.get(receipt.providerPub) || []).filter(r => r.timestamp > cutoff);

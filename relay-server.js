@@ -144,6 +144,13 @@ async function main() {
         reservations: {
           maxReservations: 1024,
           reservationTtl: 2 * 60 * 60 * 1000, // 2h
+          // Default data limit is 128 KB per circuit — far too small for BitSwap
+          // block transfers (max IPFS block = 256 KB; a 10 MB file = ~40 blocks).
+          // Set to 1 GB so BitSwap can freely exchange blocks over circuit relay.
+          defaultDataLimit: BigInt(1 << 30), // 1 GB per circuit
+          // Default duration limit is 2 minutes — too short for large transfers.
+          // Set to 1 hour so long-running BitSwap sessions don't get cut off.
+          defaultDurationLimit: 60 * 60 * 1000, // 1 hour in ms
         },
       }),
       dht: kadDHT({
@@ -174,15 +181,101 @@ async function main() {
     pubsub.subscribe(`neuronchain/${network}/votes`);
     pubsub.subscribe(`neuronchain/${network}/accounts`);
     pubsub.subscribe(`neuronchain/${network}/generation`);
-    pubsub.subscribe(`neuronchain/${network}/storage-offers`);
+    pubsub.subscribe(`neuronchain/${network}/storage/pin-requests`);
+    pubsub.subscribe(`neuronchain/${network}/storage/receipts`);
+    pubsub.subscribe(`neuronchain/${network}/lockouts`);
+    pubsub.subscribe(`neuronchain/${network}/keyblobs`);
+    pubsub.subscribe(`neuronchain/${network}/blob-requests`);
+    pubsub.subscribe(`neuronchain/${network}/peer-addrs`);
   }
 
+  // ── Peer-addr cache and replay ────────────────────────────────────────────
+  // Problem: when Browser A publishes peer-addrs, Browser B may not be in the
+  // relay's GossipSub mesh yet (mesh formation takes 1–3 gossipsub heartbeats).
+  // Solution: the relay caches the latest peer-addrs per sender and replays
+  // them to new subscribers + re-publishes after a short delay when received
+  // so that peers who join the mesh slightly late still receive the addrs.
+
+  // peerId → { topic, data: Uint8Array, timestamp: number }
+  // Keyed by peerId (not topic:peerId) so we can filter by connection status.
+  const peerAddrCache = new Map();
+  // topic → setTimeout handle (debounce)
+  const rebroadcastTimers = new Map();
+
+  /** Return Set of peer ID strings currently connected to this relay. */
+  function connectedPeerIds() {
+    return new Set(node.getConnections().map(c => c.remotePeer.toString()));
+  }
+
+  /**
+   * Re-broadcast all cached peer-addrs for `topic`, but ONLY for peers that are
+   * currently connected to this relay. Stale entries from previous browser sessions
+   * (which would cause NO_RESERVATION errors) are silently skipped.
+   */
+  function scheduleRebroadcast(topic, delayMs) {
+    if (rebroadcastTimers.has(topic)) return;
+    rebroadcastTimers.set(topic, setTimeout(() => {
+      rebroadcastTimers.delete(topic);
+      const connected = connectedPeerIds();
+      const now = Date.now();
+      let sent = 0;
+      for (const [peerId, cached] of peerAddrCache) {
+        if (cached.topic === topic &&
+            now - cached.timestamp < 3 * 60 * 1000 && // 3-min TTL
+            connected.has(peerId)) {
+          pubsub.publish(topic, cached.data).catch(() => {});
+          sent++;
+        }
+      }
+      if (sent > 0) console.log(`[Relay] rebroadcast ${sent} live peer-addr(s) on ${topic}`);
+    }, delayMs));
+  }
+
+  pubsub.addEventListener('message', (evt) => {
+    const msg = evt.detail;
+    if (!msg.topic.endsWith('/peer-addrs')) return;
+    try {
+      const decoded = JSON.parse(new TextDecoder().decode(msg.data));
+      if (decoded.peerId && Array.isArray(decoded.addrs) && decoded.addrs.length > 0) {
+        peerAddrCache.set(decoded.peerId, {
+          topic: msg.topic,
+          data: msg.data,
+          timestamp: Date.now(),
+        });
+        console.log(`[Relay] cached peer-addrs from ${decoded.peerId.slice(0,12)}: ${decoded.addrs.length} addr(s)`);
+        // Re-broadcast after 1.5s so peers that joined the mesh slightly late
+        // (GossipSub mesh formation takes up to ~2 heartbeats) still receive it.
+        scheduleRebroadcast(msg.topic, 1500);
+      }
+    } catch { /* malformed - ignore */ }
+  });
+
   // Dynamically mirror any neuronchain topic a browser peer subscribes to
-  // (covers dynamic inbox topics like neuronchain/{network}/inbox/{pubShort})
+  // (covers dynamic inbox topics like neuronchain/{network}/inbox/{pubShort}).
+  // Also replays cached peer-addrs when a new peer subscribes to a peer-addrs topic.
   pubsub.addEventListener('subscription-change', (evt) => {
     for (const { topic, subscribe } of evt.detail.subscriptions) {
       if (subscribe && topic.startsWith('neuronchain/')) {
         try { pubsub.subscribe(topic); } catch { /* already subscribed */ }
+      }
+      if (subscribe && topic.endsWith('/peer-addrs')) {
+        // New subscriber — replay cached peer-addrs (for currently-connected peers only)
+        // after a delay so the GossipSub stream and mesh have time to fully form.
+        setTimeout(() => {
+          const connected = connectedPeerIds();
+          const now = Date.now();
+          let replayed = 0;
+          for (const [peerId, cached] of peerAddrCache) {
+            if (cached.topic === topic &&
+                now - cached.timestamp < 3 * 60 * 1000 &&
+                connected.has(peerId)) {
+              pubsub.publish(topic, cached.data).catch(() => {});
+              replayed++;
+            }
+          }
+          if (replayed > 0) console.log(`[Relay] replayed ${replayed} live peer-addr(s) for new subscriber on ${topic}`);
+          else console.log(`[Relay] no live peer-addr cache entries for ${topic} (${peerAddrCache.size} total, ${connected.size} connected)`);
+        }, 2000);
       }
     }
   });

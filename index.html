@@ -402,6 +402,25 @@
       .stats-grid { grid-template-columns: 1fr 1fr; }
       .main { padding: 16px; }
       .tab-btn { padding: 10px 14px; font-size: 12px; }
+
+      /* Compact tables on mobile */
+      table { font-size: 11px; }
+      th { padding: 6px 8px; font-size: 10px; letter-spacing: 0.3px; }
+      td { padding: 6px 8px; font-size: 11px; }
+      .truncate { max-width: 90px; }
+
+      /* Make badge text smaller */
+      .badge { padding: 1px 5px; font-size: 10px; }
+
+      /* Buttons inside table cells */
+      td .btn { padding: 3px 8px; font-size: 11px; }
+    }
+
+    @media (max-width: 480px) {
+      table { font-size: 10px; }
+      th { padding: 5px 6px; font-size: 9px; }
+      td { padding: 5px 6px; }
+      .truncate { max-width: 60px; }
     }
 
     /* Toast notifications */
@@ -434,6 +453,121 @@
     .toast.info { border-left: 3px solid var(--accent); }
 
     @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes logPanelUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+
+    /* Mobile log FAB */
+    .log-fab {
+      position: fixed;
+      left: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 9000;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: none;
+      border-radius: 0 8px 8px 0;
+      padding: 14px 7px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s, border-color 0.15s;
+      box-shadow: 2px 0 12px rgba(0,0,0,0.3);
+      color: var(--text-dim);
+      line-height: 1;
+    }
+    .log-fab:hover { background: var(--surface2); color: var(--text); }
+    .log-fab svg { width: 15px; height: 15px; flex-shrink: 0; }
+    .log-fab-label {
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: inherit;
+    }
+    .log-fab-badge {
+      background: var(--danger);
+      color: #fff;
+      font-size: 9px;
+      font-weight: 700;
+      min-width: 16px;
+      height: 16px;
+      border-radius: 8px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 0 3px;
+    }
+
+    /* Mobile log panel */
+    .mobile-log-panel {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 62vh;
+      z-index: 8990;
+      display: none;
+      flex-direction: column;
+      background: #050810;
+      border-top: 1px solid var(--border);
+      border-radius: 14px 14px 0 0;
+      box-shadow: 0 -8px 32px rgba(0,0,0,0.5);
+      animation: logPanelUp 0.22s ease;
+    }
+    .mobile-log-panel.open { display: flex; }
+    .mobile-log-handle {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .mobile-log-handle-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-dim);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .mobile-log-handle-title svg { width: 13px; height: 13px; opacity: 0.7; }
+    .mobile-log-actions { display: flex; align-items: center; gap: 4px; }
+    .mobile-log-close,
+    .mobile-log-copy,
+    .mobile-log-clear {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      line-height: 1;
+      padding: 4px 6px;
+      border-radius: 4px;
+      transition: background 0.15s, color 0.15s;
+      display: flex;
+      align-items: center;
+    }
+    .mobile-log-close { font-size: 18px; }
+    .mobile-log-copy svg, .mobile-log-clear svg { width: 14px; height: 14px; }
+    .mobile-log-close:hover,
+    .mobile-log-copy:hover,
+    .mobile-log-clear:hover { background: var(--surface2); color: var(--text); }
+    .mobile-log-scroller {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.7;
+      overscroll-behavior: contain;
+    }
+    .mobile-log-scroller .log-entry .time { font-size: 10px; }
 
     /* Spinner */
     .spinner {
@@ -654,9 +788,9 @@
     <div class="tab-panel" id="tab-account">
       <div class="row">
         <div class="card">
-          <div class="card-title">Create Account with FaceID</div>
+          <div class="card-title">Create Account with FaceID + PIN</div>
           <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-            Choose a username, then verify with FaceID. Your private key is generated and <strong>encrypted with your face</strong> - only you can decrypt it. You receive <strong>1,000,000 UNIT</strong> upon creation.
+            Choose a username, then verify with FaceID and set a <strong>4-digit PIN</strong>. Your private key is generated and <strong>double-encrypted</strong> — both your face and PIN are required to unlock it. You receive <strong>1,000,000 UNIT</strong> upon creation.
           </p>
           <div class="form-group">
             <label class="form-label">Choose Username</label>
@@ -671,7 +805,7 @@
         <div class="card">
           <div class="card-title">Recover Account</div>
           <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-            <strong>Option A:</strong> Scan your face - your encrypted keys are on-chain.<br>
+            <strong>Option A:</strong> Enter your PIN then scan your face — your encrypted keys are on-chain.<br>
             <strong>Option B:</strong> Paste your backup key pair JSON.
           </p>
           <div class="form-group">
@@ -685,10 +819,10 @@
           </div>
           <div id="keyRecoverSection" style="display:none;">
             <div class="form-group">
-              <label class="form-label">Key Pair (JSON)</label>
-              <textarea class="form-textarea" id="recoverKeyPair" placeholder='{"pub":"...","priv":"...","epub":"...","epriv":"..."}'></textarea>
+              <label class="form-label">Backup Code</label>
+              <textarea class="form-textarea" id="recoverKeyPair" placeholder="Paste your Base58 backup code (or legacy JSON key pair)" style="font-family:monospace;font-size:12px;"></textarea>
             </div>
-            <button class="btn btn-outline" id="btnRecoverKeys">Restore from Key Pair</button>
+            <button class="btn btn-outline" id="btnRecoverKeys">Restore from Backup Code</button>
           </div>
         </div>
       </div>
@@ -696,9 +830,26 @@
         <div class="card-title">My Accounts</div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Username</th><th>Public Key</th><th>Balance (UNIT)</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Username</th><th>Public Key</th><th>Balance</th><th>Actions</th></tr></thead>
             <tbody id="myAccounts"></tbody>
           </table>
+        </div>
+      </div>
+
+      <div class="card" id="updateSecurityCard" style="display:none;">
+        <div class="card-title">Update PIN / Face</div>
+        <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
+          Change your PIN or re-enroll your face. Both require your current face + PIN to unlock first.
+          A signed <code>update</code> block is broadcast to the network to tie the new credentials on-chain.
+        </p>
+        <div class="form-group">
+          <label class="form-label">Account</label>
+          <select class="form-select" id="updateSecurityAccount"></select>
+        </div>
+        <div id="updateSecurityStatus" style="margin-bottom: 12px;"></div>
+        <div class="btn-group">
+          <button class="btn btn-outline" id="btnUpdatePin">Change PIN</button>
+          <button class="btn btn-outline" id="btnUpdateFace">Re-enroll Face</button>
         </div>
       </div>
 
@@ -764,7 +915,7 @@
         <div id="explorerSyncStatus" style="margin-bottom:12px;font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:8px;"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Hash</th><th>Type</th><th>Account</th><th>Counterparty / Contract</th><th>Name / Method</th><th>Amount</th><th>Status</th></tr></thead>
+            <thead><tr><th>Hash</th><th>Type</th><th>Account</th><th>Counterparty</th><th>Method</th><th>Amount</th><th>Status</th></tr></thead>
             <tbody id="explorerTxs"></tbody>
           </table>
         </div>
@@ -859,7 +1010,7 @@ function getCount() { return state.counter; }"></textarea>
         <div id="myStorageStats" style="display:none;margin-bottom:16px;">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Capacity</th><th>Uptime today</th><th>Score</th><th>Rate (UNIT/day)</th><th>Total earned</th><th>Last reward</th></tr></thead>
+              <thead><tr><th>Capacity</th><th>Uptime</th><th>Score</th><th>Rate/day</th><th>Total earned</th><th>Last reward</th></tr></thead>
               <tbody id="myProviderStatsRow"></tbody>
             </table>
           </div>
@@ -906,7 +1057,7 @@ function getCount() { return state.counter; }"></textarea>
         <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">All registered storage providers on NeuronChain, ranked by score.</p>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Provider</th><th>Capacity</th><th>Uptime</th><th>Avg Latency</th><th>Spot Check</th><th>Score</th><th>Rate (UNIT/day)</th><th>Total Earned</th></tr></thead>
+            <thead><tr><th>Provider</th><th>Capacity</th><th>Uptime</th><th>Latency</th><th>Spot Check</th><th>Score</th><th>Rate/day</th><th>Total Earned</th></tr></thead>
             <tbody id="storageProvidersList"></tbody>
           </table>
         </div>
@@ -916,7 +1067,7 @@ function getCount() { return state.counter; }"></textarea>
       <div class="card">
         <div class="card-title">Store Content</div>
         <p style="color:var(--text-dim);font-size:13px;margin-bottom:16px;">
-          Upload any content to Helia (IPFS). All store actions are ECDSA-signed by your account key. Choose <strong>Public</strong> for openly readable content (posts, profiles) or <strong>Private</strong> to encrypt with AES-256-GCM (only you can decrypt).
+          Upload any content to NeuronChain's decentralised content layer. All store actions are ECDSA-signed by your account key. Choose <strong>Public</strong> for openly readable content (posts, profiles) or <strong>Private</strong> to encrypt with AES-256-GCM (only you can decrypt).
         </p>
 
         <div class="row">
@@ -937,14 +1088,13 @@ function getCount() { return state.counter; }"></textarea>
           <div class="form-group">
             <label class="form-label">Content Type</label>
             <select class="form-select" id="storageContentType">
-              <option value="json">JSON</option>
               <option value="image">Image</option>
               <option value="video">Video</option>
               <option value="audio">Audio</option>
+              <option value="json">JSON</option>
               <option value="html">HTML</option>
               <option value="css">CSS</option>
               <option value="js">JavaScript</option>
-              <option value="json">JSON</option>
               <option value="other">Other File</option>
             </select>
           </div>
@@ -1082,7 +1232,7 @@ function getCount() { return state.counter; }"></textarea>
           <span>Content Library</span>
           <button class="btn btn-outline" style="font-size:11px;padding:3px 10px;font-weight:600;" id="btnClearLibrary">Clear List</button>
         </div>
-        <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">Your locally tracked CIDs. Content remains on Helia regardless of this list.</p>
+        <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">Your locally tracked CIDs. Content remains on the NeuronChain network regardless of this list.</p>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Name</th><th>Type</th><th>Visibility</th><th>Size</th><th>Stored</th><th>CID</th><th>Actions</th></tr></thead>
@@ -1098,16 +1248,16 @@ function getCount() { return state.counter; }"></textarea>
       <div class="card">
         <div class="help-section">
           <h3>Welcome to NeuronChain</h3>
-          <p>NeuronChain is a browser-based blockchain using a <strong>block-lattice DAG</strong> with <strong>stake-weighted voting</strong> and <strong>face-locked keys</strong>. Your private key is encrypted with your face - no seed phrases, no passwords. The native currency is the <strong>Neuron Unit (UNIT)</strong>.</p>
+          <p>NeuronChain is a browser-based blockchain using a <strong>block-lattice DAG</strong> with <strong>stake-weighted voting</strong> and <strong>two-factor face + PIN locked keys</strong>. Your private key is double-encrypted — both your face and a 4-digit PIN are required to unlock it. No seed phrases. The native currency is the <strong>Neuron Unit (UNIT)</strong>.</p>
         </div>
 
         <div class="help-section">
           <h3>Getting Started</h3>
           <ul>
-            <li><strong>Step 1:</strong> Go to the <strong>Node</strong> tab and click <strong>Start Node</strong> to connect to the relay network. Do this first - Transfer and Contracts tabs are disabled until the node is running.</li>
-            <li><strong>Step 2:</strong> Go to the <strong>Accounts</strong> tab, choose a username (3-24 chars, lowercase alphanumeric + dot), and scan your face. You receive <strong>1,000,000 UNIT</strong>.</li>
-            <li><strong>Step 3:</strong> Save the backup key pair JSON shown after creation (secondary recovery method).</li>
-            <li><strong>Step 4:</strong> Send UNIT in the <strong>Transfer</strong> tab - enter a recipient username and amount.</li>
+            <li><strong>Step 1:</strong> Go to the <strong>Node</strong> tab and click <strong>Start Node</strong> to connect to the relay network. Do this first — Transfer and Contracts tabs are disabled until the node is running.</li>
+            <li><strong>Step 2:</strong> Go to the <strong>Accounts</strong> tab, choose a username (3–24 chars, lowercase alphanumeric + dot), scan your face, then set a <strong>4-digit PIN</strong>. You receive <strong>1,000,000 UNIT</strong>.</li>
+            <li><strong>Step 3:</strong> Save the <strong>backup secret key</strong> shown after creation — a short Base58 code. This is your secondary recovery method if face + PIN fails.</li>
+            <li><strong>Step 4:</strong> Send UNIT in the <strong>Transfer</strong> tab — enter a recipient username, amount, then confirm with your PIN.</li>
             <li><strong>Step 5:</strong> Check the <strong>Explorer</strong> tab to see your transactions syncing across the network.</li>
           </ul>
         </div>
@@ -1126,26 +1276,76 @@ function getCount() { return state.counter; }"></textarea>
         </div>
 
         <div class="help-section">
-          <h3>Face-Locked Keys</h3>
-          <p>Account creation requires a face scan. Your private key is <strong>encrypted with your face</strong>:</p>
+          <h3>Two-Factor Keys (Face + PIN)</h3>
+          <p>Account keys are protected by <strong>two independent factors</strong>. Compromising either one alone reveals nothing.</p>
+          <p style="margin-top:8px;"><strong>Encryption layers (inner → outer):</strong></p>
           <ul>
-            <li><strong>Liveness check:</strong> Slowly turn your head left and right - movement detection requires at least 30 pixels of nose travel and 2 direction reversals to prevent photo and video replay attacks</li>
-            <li><strong>Face enrollment:</strong> 3 captures are averaged into a stable 128-dimensional face descriptor (face-api.js, 99.38% accuracy on LFW)</li>
-            <li><strong>Quantization:</strong> The descriptor is quantized into stable bins so the same face produces the same key across sessions</li>
-            <li><strong>Key derivation:</strong> Quantized descriptor &#8594; PBKDF2 (100K iterations) &#8594; AES-256-GCM encryption key</li>
-            <li><strong>Key encryption:</strong> Your ECDSA key pair is encrypted with the face-derived AES key</li>
-            <li><strong>On-chain storage:</strong> The encrypted blob is stored on the libp2p network + IndexedDB - available from any device, but only your face can decrypt it</li>
-            <li><strong>Local wallet:</strong> Keys are encrypted with a per-session AES key in localStorage - cleared when the browser session ends</li>
-            <li><strong>Backup:</strong> A JSON key pair is shown once at creation - save it as a secondary recovery method</li>
-            <li><strong>Privacy:</strong> Only a SHA-256 hash of the face map is stored publicly. No images or raw descriptors leave the browser.</li>
+            <li><strong>Inner layer — face factor:</strong> Stored canonical descriptor &#8594; quantize &#8594; PBKDF2-SHA-512 (100K iterations) &#8594; AES-256-GCM</li>
+            <li><strong>Outer layer — PIN factor:</strong> 4-digit PIN + 32-byte random salt &#8594; PBKDF2-SHA-512 (600K iterations, OWASP 2024) &#8594; AES-256-GCM</li>
           </ul>
+          <p style="margin-top:8px;"><strong>Face enrollment:</strong></p>
+          <ul>
+            <li><strong>Liveness check:</strong> Slowly turn your head left and right — requires ≥30 px nose travel and 2 direction reversals to prevent photo/video replay</li>
+            <li><strong>Face capture:</strong> 3 captures averaged into a stable 128-dimensional canonical descriptor (face-api.js, 99.38% accuracy on LFW)</li>
+            <li><strong>Stored canonical:</strong> The averaged descriptor is PIN-encrypted and saved inside the key blob (<code>encryptedCanonical</code>). On recovery, the PIN decrypts this stored descriptor to derive the face key — deterministically, regardless of lighting or angle changes between sessions.</li>
+          </ul>
+          <p style="margin-top:8px;"><strong>How recovery works reliably:</strong> The live face scan at recovery time is compared to the stored canonical as a <em>biometric identity check</em> (tolerance-based). The actual AES face key is derived from the stored canonical, not the live scan — so it always matches the enrollment key exactly.</p>
+          <p style="margin-top:8px;"><strong>PIN:</strong></p>
+          <ul>
+            <li>Set once at account creation; independent per account</li>
+            <li>Required for: send tokens, deploy contract, account recovery, updating PIN/face</li>
+            <li>Not required for: contract calls (may come from other accounts or external inputs)</li>
+            <li><strong>5-minute session cache</strong> — after entering PIN (at login, recovery, or a transfer), no re-prompt for quick consecutive actions. Cleared on page close.</li>
+          </ul>
+          <p style="margin-top:8px;"><strong>Privacy:</strong></p>
+          <ul>
+            <li>Raw face descriptor is PIN-encrypted inside the blob — never stored in plaintext</li>
+            <li>Only a SHA-256 hash of the face map is stored on-chain (for duplicate detection)</li>
+            <li>No images or raw descriptors leave the browser</li>
+          </ul>
+          <p style="margin-top:8px;"><strong>Storage and backup:</strong></p>
+          <ul>
+            <li><strong>On-chain blob:</strong> stored on the libp2p network + IndexedDB — available from any device</li>
+            <li><strong>On-chain anchor (<code>linkedAnchor</code>):</strong> SHA-256(encryptedKeys:faceMapHash:pub) ties the blob to the account, detects tampering on recovery</li>
+            <li><strong>Local wallet:</strong> AES-256-GCM encrypted with a per-session key in localStorage — cleared when the session ends</li>
+            <li><strong>Backup secret key:</strong> A compact Base58 code (~263 characters) shown once at creation — encodes both private keys; secondary recovery without camera or PIN</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Quantum-Safe Cryptography</h3>
+          <p>Every account carries a <strong>hybrid classical + post-quantum key pair</strong>:</p>
+          <ul>
+            <li><strong>ECDSA P-256</strong> — classical block signing (always present)</li>
+            <li><strong>ML-DSA-65</strong> (CRYSTALS-Dilithium) — quantum-safe block signing (present on all new accounts)</li>
+            <li><strong>ECDH P-256</strong> — classical key agreement / content encryption</li>
+            <li><strong>ML-KEM-768</strong> (CRYSTALS-Kyber) — quantum-safe key encapsulation</li>
+          </ul>
+          <p style="margin-top:8px;">Every block carries both an ECDSA <code>signature</code> and an ML-DSA-65 <code>pqSignature</code>. Verification checks both. Legacy accounts (pre-upgrade) remain fully compatible — the PQ signature field is optional.</p>
+          <p style="margin-top:8px;">PQ private keys are stored inside the face+PIN double-encrypted blob. PQ public keys are stored on-chain so any peer can verify without unlocking your account.</p>
+        </div>
+
+        <div class="help-section">
+          <h3>Wrong PIN Backoff</h3>
+          <p>Wrong PIN attempts trigger an exponential lockout to prevent brute force attacks:</p>
+          <ul>
+            <li><strong>Attempts 1–3:</strong> No delay</li>
+            <li><strong>Attempt 4:</strong> 30 seconds</li>
+            <li><strong>Attempt 5:</strong> 2 minutes</li>
+            <li><strong>Attempt 6:</strong> 8 minutes</li>
+            <li><strong>Attempt 7:</strong> 32 minutes</li>
+            <li><strong>Attempt 8:</strong> 2 hours</li>
+            <li><strong>Attempt 9:</strong> 8 hours</li>
+            <li><strong>Attempt 10+:</strong> 24 hours</li>
+          </ul>
+          <p style="margin-top:8px;">The attempt counter is stored both in <strong>IndexedDB</strong> (local, fast) and <strong>inside the encrypted blob</strong> (face-key-encrypted — transfers to new devices automatically and cannot be cleared without face auth). When the threshold is crossed, a <strong>lockout notice</strong> is broadcast via GossipSub — other nodes on the network will also delay processing blocks from the locked account.</p>
         </div>
 
         <div class="help-section">
           <h3>Account Recovery</h3>
           <ul>
-            <li><strong>FaceID (primary):</strong> Enter your username &#8594; face scan &#8594; encrypted keys fetched from the relay and decrypted with your face. Works from any device. The key blob's integrity is verified against its on-chain hash before decryption to detect tampering.</li>
-            <li><strong>Key Pair (backup):</strong> Click "Recover with Key Pair" and paste the JSON you saved at creation. Works without a camera.</li>
+            <li><strong>FaceID + PIN (primary):</strong> Enter your username &#8594; PIN prompt &#8594; face scan (3-sample capture, same as enrollment) &#8594; encrypted keys decrypted with both factors. Works from any device. The <code>linkedAnchor</code> is verified against on-chain data to detect blob tampering before decryption. Face key is derived from the PIN-decrypted stored canonical — not from the live scan — so recovery is reliable regardless of session-to-session variation in lighting or angle.</li>
+            <li><strong>Backup secret key:</strong> Click "Recover with Key Pair" and paste the Base58 backup code saved at creation. Restores signing and encryption keys without a camera or PIN. The account's PIN requirement is automatically restored from the key blob.</li>
           </ul>
         </div>
 
@@ -1153,11 +1353,12 @@ function getCount() { return state.counter; }"></textarea>
           <h3>Block-Lattice DAG</h3>
           <p>Instead of one global chain, every account has its own chain of blocks:</p>
           <ul>
-            <li><strong><code>open</code></strong> - first block, created with FaceID, mints 1,000,000 UNIT</li>
-            <li><strong><code>send</code></strong> - transfer UNIT (deducts from sender)</li>
-            <li><strong><code>receive</code></strong> - accept UNIT from a confirmed send (credits recipient)</li>
-            <li><strong><code>deploy</code></strong> - deploy a smart contract</li>
-            <li><strong><code>call</code></strong> - call a smart contract method</li>
+            <li><strong><code>open</code></strong> — first block, created with FaceID + PIN, mints 1,000,000 UNIT</li>
+            <li><strong><code>send</code></strong> — transfer UNIT (deducts from sender) — <strong>PIN required</strong></li>
+            <li><strong><code>receive</code></strong> — accept UNIT from a confirmed send (credits recipient)</li>
+            <li><strong><code>deploy</code></strong> — deploy a smart contract — <strong>PIN required</strong></li>
+            <li><strong><code>call</code></strong> — call a smart contract method (no PIN — may come from external inputs)</li>
+            <li><strong><code>update</code></strong> — change PIN or re-enroll face; updates <code>linkedAnchor</code> + PQ keys on-chain — <strong>PIN required</strong></li>
           </ul>
           <p style="margin-top: 8px;">Transfers require two blocks: a <code>send</code> on the sender's chain and a <code>receive</code> on the recipient's chain. The recipient must <strong>claim</strong> the receive in the Transfer tab (or it is auto-claimed if their node is online).</p>
         </div>
@@ -1200,21 +1401,25 @@ function getCount() { return state.counter; }"></textarea>
         <div class="help-section">
           <h3>Security</h3>
           <ul>
-            <li><strong>SHA-256 block hashing</strong> - all block hashes computed via Web Crypto API</li>
-            <li><strong>ECDSA signatures</strong> - every block is signed by its author and verified on receipt</li>
-            <li><strong>Client-side vote verification</strong> - all incoming votes are cryptographically verified client-side, not just by the relay - a malicious relay cannot fabricate or alter votes</li>
-            <li><strong>Balance proofs</strong> - votes include the voter's chain head hash; receiving nodes verify the voter's balance from their own ledger instead of trusting self-reported stake</li>
-            <li><strong>Peer-side validation</strong> - all incoming blocks, votes, and accounts are verified with ECDSA signatures before being accepted; rogue peers cannot inject unsigned data via GossipSub</li>
-            <li><strong>Noise protocol</strong> - all libp2p connections are encrypted and authenticated at the transport layer</li>
-            <li><strong>Null-write rejection</strong> - client-side null-field guards reject incomplete or malformed data from any peer</li>
-            <li><strong>Signed accounts</strong> - account data is ECDSA-signed by the owner; peers and the relay reject unsigned or spoofed accounts</li>
-            <li><strong>Signed inbox signals</strong> - transfer notifications are ECDSA-signed by the sender; recipients verify signatures to prevent relay fabrication</li>
-            <li><strong>Key blob integrity</strong> - encrypted key blobs include a SHA-256 content hash stored on-chain; during account recovery, the blob's hash is verified to detect tampering</li>
-            <li><strong>Sandboxed contracts</strong> - smart contracts execute in an isolated Web Worker with no access to DOM, localStorage, fetch, or other browser APIs; terminated after 3 seconds to prevent infinite loops</li>
-            <li><strong>Balance overflow protection</strong> - all balances and amounts are validated against <code>Number.isSafeInteger</code> before acceptance</li>
-            <li><strong>Generation governance</strong> - testnet resets are open; mainnet generation bumps require a signed message from a known operator key, preventing unilateral network wipes</li>
-            <li><strong>Encrypted local wallet</strong> - keys in localStorage are AES-256-GCM encrypted with a per-session key (cleared when the browser session ends)</li>
-            <li><strong>XSS protection</strong> - all peer-supplied data (usernames, hashes, contract names) is HTML-escaped before rendering</li>
+            <li><strong>Two-factor key protection</strong> — private keys are double-encrypted: AES-256-GCM(face key) → AES-256-GCM(PIN key). Both factors are required to unlock.</li>
+            <li><strong>Quantum-safe hybrid signing</strong> — every block carries both an ECDSA P-256 signature and an ML-DSA-65 (Dilithium) post-quantum signature. Both are verified.</li>
+            <li><strong>PIN brute-force protection</strong> — PBKDF2-SHA-512 at 600K iterations (~300ms/attempt) plus exponential backoff (up to 24h lockout after 10 wrong attempts).</li>
+            <li><strong>Decentralised lockout</strong> — when PIN attempts exceed the threshold, a lockout notice is broadcast via GossipSub; other nodes delay processing blocks from locked accounts.</li>
+            <li><strong>Face descriptor privacy</strong> — the raw 128-dim descriptor is PIN-encrypted locally; only its SHA-256 hash is stored publicly on-chain.</li>
+            <li><strong>On-chain binding (<code>linkedAnchor</code>)</strong> — SHA-256(encryptedKeys:faceMapHash:pub) ties the face+PIN blob to the account; verified on recovery to detect blob tampering.</li>
+            <li><strong>SHA-256 block hashing</strong> — all block hashes computed via Web Crypto API</li>
+            <li><strong>ECDSA signatures</strong> — every block is signed by its author and verified on receipt</li>
+            <li><strong>Client-side vote verification</strong> — all incoming votes are cryptographically verified client-side; a malicious relay cannot fabricate or alter votes</li>
+            <li><strong>Balance proofs</strong> — votes include the voter's chain head hash; receiving nodes verify the voter's balance from their own ledger</li>
+            <li><strong>Peer-side validation</strong> — all incoming blocks, votes, and accounts are verified before being accepted; rogue peers cannot inject unsigned data</li>
+            <li><strong>Noise protocol</strong> — all libp2p connections are encrypted and authenticated at the transport layer</li>
+            <li><strong>Signed accounts</strong> — account data is ECDSA-signed; peers reject unsigned or spoofed accounts</li>
+            <li><strong>Signed inbox signals</strong> — transfer notifications are ECDSA-signed by the sender; recipients verify before processing</li>
+            <li><strong>Sandboxed contracts</strong> — smart contracts execute in an isolated Web Worker with no DOM/fetch/storage access; terminated after 3 seconds</li>
+            <li><strong>Balance overflow protection</strong> — all amounts validated against <code>Number.isSafeInteger</code></li>
+            <li><strong>Generation governance</strong> — mainnet resets require a signed message from a known operator key</li>
+            <li><strong>Encrypted local wallet</strong> — keys in localStorage are AES-256-GCM encrypted with a per-session key; cleared when the session ends</li>
+            <li><strong>XSS protection</strong> — all peer-supplied data is HTML-escaped before rendering</li>
           </ul>
         </div>
 
@@ -1285,7 +1490,7 @@ function myTokens() {
 
         <div class="help-section">
           <h3>Content Storage</h3>
-          <p>NeuronChain is a full content network. Posts, images, video, audio, HTML, CSS, JS, and JSON are stored <strong>on NeuronChain</strong> using its decentralised Helia/IPFS layer - not on any central server.</p>
+          <p>NeuronChain is a full content network. Posts, images, video, audio, HTML, CSS, JS, and JSON are stored <strong>on NeuronChain</strong> using its own content layer — not on any central server, and not on the public IPFS network. Content is served by NeuronChain peers only, using content-addressing (CIDs) and Bitswap for parallel chunk transfer.</p>
           <ul>
             <li><strong>Content-addressed:</strong> every file is stored by its SHA-256 CID. Any peer serving wrong bytes is automatically rejected - tamper-evident by construction.</li>
             <li><strong>On-chain anchor:</strong> the CID is recorded in <code>block.contentCid</code> or smart contract state, creating an immutable provenance proof. The content hash is the receipt.</li>
@@ -1308,8 +1513,8 @@ function myTokens() {
             <li><strong>Providers</strong> publish a <code>storage-offer</code> block announcing capacity (MB) and price (milli-UNIT / MB / day)</li>
             <li><strong>Beneficiaries</strong> accept with a <code>storage-deal</code> block</li>
             <li>A <strong>24h timer</strong> auto-pays from beneficiary to provider via a standard <code>send</code> block</li>
-            <li>If the beneficiary has <strong>insufficient balance</strong>, content is automatically unpinned from the provider's Helia node</li>
-            <li>Content is stored in <strong>Helia (IPFS)</strong> - content-addressed and encrypted before storage</li>
+            <li>If the beneficiary has <strong>insufficient balance</strong>, content is automatically unpinned from the provider's node</li>
+            <li>Content is stored on the <strong>NeuronChain network</strong> - content-addressed and encrypted before storage</li>
             <li>CIDs are referenced in <code>block.contentCid</code> or smart contract state</li>
           </ul>
         </div>
@@ -1324,7 +1529,7 @@ function myTokens() {
             <li><strong>Face descriptor:</strong> 128 dimensions, quantized to 0.05 bins</li>
             <li><strong>Consensus:</strong> Optimistic confirmation, conflict-only stake-weighted voting (&gt;2/3 threshold, 10s timeout)</li>
             <li><strong>P2P:</strong> libp2p - WebRTC (browser&#8596;browser), WebSocket (browser&#8596;relay), circuit relay v2 (NAT traversal), GossipSub (pubsub), Kademlia DHT (peer discovery)</li>
-            <li><strong>Content storage:</strong> Helia/IPFS with Bitswap - content-addressed, encrypted, parallel chunk transfer</li>
+            <li><strong>Content storage:</strong> NeuronChain content layer (Helia/Bitswap internally) - content-addressed, encrypted, parallel chunk transfer across NeuronChain peers</li>
             <li><strong>Persistence:</strong> IndexedDB (blocks, accounts, keyblobs, contracts) - no relay dependency</li>
             <li><strong>Keep-alive:</strong> Wake Lock API + Web Worker heartbeat + silent audio (prevents tab suspension)</li>
             <li><strong>dApp API:</strong> <code>NeuronChainAPI</code> - stable facade for building apps on NeuronChain</li>
@@ -1333,6 +1538,45 @@ function myTokens() {
       </div>
     </div>
   </main>
+
+  <!-- Log FAB + panel -->
+  <button class="log-fab" id="logFab" title="Toggle console log" aria-label="Toggle console log">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="1.5" y="1.5" width="13" height="13" rx="2"/>
+      <polyline points="4,5.5 6.5,8 4,10.5"/>
+      <line x1="8" y1="10.5" x2="12" y2="10.5"/>
+    </svg>
+    <span class="log-fab-badge" id="logFabBadge"></span>
+    <span class="log-fab-label">log</span>
+  </button>
+
+  <div class="mobile-log-panel" id="mobileLogPanel" role="dialog" aria-label="Console log">
+    <div class="mobile-log-handle">
+      <span class="mobile-log-handle-title">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="1.5" y="1.5" width="13" height="13" rx="2"/>
+          <polyline points="4,5.5 6.5,8 4,10.5"/>
+          <line x1="8" y1="10.5" x2="12" y2="10.5"/>
+        </svg>
+        Console Log
+      </span>
+      <div class="mobile-log-actions">
+        <button class="mobile-log-copy" id="mobileLogCopy" aria-label="Copy log to clipboard" title="Copy log">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5.5" y="1.5" width="9" height="11" rx="1.5"/>
+            <path d="M3.5 4.5H2a.5.5 0 00-.5.5v9A1.5 1.5 0 003 15.5h7a.5.5 0 00.5-.5v-1.5"/>
+          </svg>
+        </button>
+        <button class="mobile-log-clear" id="mobileLogClear" aria-label="Clear log" title="Clear log">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="2,4 14,4"/><path d="M5,4V2.5a.5.5 0 01.5-.5h5a.5.5 0 01.5.5V4"/><path d="M3,4l1,10h8l1-10"/>
+          </svg>
+        </button>
+        <button class="mobile-log-close" id="mobileLogClose" aria-label="Close log panel">&#x2715;</button>
+      </div>
+    </div>
+    <div class="mobile-log-scroller" id="mobileLogScroller"></div>
+  </div>
 
   <script type="module" src="/src/main.ts"></script>
 </body>

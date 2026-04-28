@@ -1,6 +1,6 @@
 # NeuronChain
 
-A browser-based blockchain using a **block-lattice DAG** with **stake-weighted voting** and **face-locked keys**. Powered by **libp2p** (WebRTC + GossipSub + Kademlia DHT) and **Helia/IPFS** for decentralised content storage - no central relay on the data path.
+A browser-based blockchain using a **block-lattice DAG** with **stake-weighted voting** and **two-factor face + PIN locked keys**. Powered by **libp2p** (WebRTC + GossipSub + Kademlia DHT) and **Helia/IPFS** for decentralised content storage - no central relay on the data path.
 
 ## Currency: Neuron Unit (UNIT)
 
@@ -23,13 +23,14 @@ npm run tunnel     # (second terminal) HTTPS tunnel for multiple-device testing
 
 ### First Steps
 
-1. **Create account** - Account tab → choose username → face scan → 1,000,000 UNIT minted
+1. **Create account** - Account tab → choose username → liveness check → face enrollment (3 captures) → set 4-digit PIN → 1,000,000 UNIT minted → save backup secret key
 2. **Start node** - Node tab → Start Node (connects to relay, starts syncing via libp2p + Helia)
-3. **Send UNIT** - Transfer tab → recipient username → amount
+3. **Send UNIT** - Transfer tab → recipient username → amount → **PIN required**
 4. **Claim receives** - Transfer tab → Pending Receives → Claim
-5. **Recover account** - Account tab → enter username → face scan (from any device)
+5. **Recover account** - Account tab → enter username → PIN prompt → face scan / paste backup secret key (from any device)
 6. **Store content** - Storage tab → select account → paste JSON or upload file → get CID
-7. **Deploy contract** - Contracts tab → load Token or NFT template → deploy
+7. **Deploy contract** - Contracts tab → load Token or NFT template → deploy → **PIN required**
+8. **Update PIN / face** - Account tab → Update PIN / Face section → authenticate → change credentials
 
 ### Production Relay
 
@@ -80,7 +81,7 @@ GossipSub topics are sharded across 4 synapse paths by `hash(accountPub) % 4`.
 
 ### Content Storage
 
-NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON are stored **on NeuronChain** using its decentralised Helia/IPFS layer. Each piece of content is:
+NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON are stored **on NeuronChain** using its own content layer. Helia (the JavaScript IPFS implementation) and Bitswap run embedded inside each NeuronChain node, sharing the same libp2p connections as the blockchain — so content is served by NeuronChain peers only, not by the public IPFS network. Each piece of content is:
 
 - **Content-addressed** by SHA-256 CID - tamper-evident: any peer serving a wrong byte is rejected
 - **Anchored on-chain** - the CID is recorded in `block.contentCid` or smart contract state, creating an immutable provenance proof
@@ -159,47 +160,185 @@ Build applications on NeuronChain using the `NeuronChainAPI` facade in [`src/api
 
 See **[CONTENT_API.md](CONTENT_API.md)** for the full API reference including content types, schemas, events, and code examples.
 
-### Face-Locked Keys
+### Two-Factor Key Protection (Face + PIN)
 
-- **Liveness check** (head movement detection, 15s timeout)
-- **Face enrollment** - 3 captures averaged into a 128-dim descriptor
-- **Quantization** - stable bins so the same face produces the same key across sessions
-- **Key derivation** - PBKDF2 (100K iterations) → AES-256-GCM
-- **Encryption** - ECDSA key pair encrypted with face-derived key
-- **On-chain storage** - encrypted blob stored on libp2p network + local IndexedDB
-- **Key blob integrity** - SHA-256 hash of blob stored on-chain; verified on recovery
-- **Backup** - JSON key pair shown once at creation
+Account private keys are protected by **two independent cryptographic factors**. Both are required to recover keys — compromising one factor alone reveals nothing.
+
+**Encryption layers (inner → outer):**
+```
+KeyPair JSON
+  → AES-256-GCM(face key)    ← inner layer, face factor
+  → AES-256-GCM(PIN key)     ← outer layer, PIN factor
+  → blob.encryptedKeys        (stored on libp2p network + IndexedDB)
+```
+
+**Face factor:**
+- Liveness check (head movement detection, 15s timeout)
+- Face enrollment — 3 captures averaged into a stable 128-dim canonical descriptor
+- The canonical descriptor is PIN-encrypted and stored inside the blob (`encryptedCanonical`)
+- Key derivation — quantize stored canonical → PBKDF2-SHA-512 (100K iterations) → AES-256-GCM
+
+**Deterministic recovery (why it works reliably across devices and sessions):**
+
+Face descriptors vary slightly between sessions due to lighting, angle, and distance. If key derivation used the live scan directly, the AES key would differ and decryption would fail. Instead:
+
+1. At enrollment the canonical descriptor (3-sample average) is encrypted with the PIN key and stored in the blob as `encryptedCanonical`
+2. At recovery: PIN is entered first → PIN key decrypts `encryptedCanonical` → the *same* stored canonical is recovered → quantized → face key derived deterministically
+3. The live face scan is used only as a **biometric verification check** (tolerance-based distance comparison to the stored canonical), not for key derivation
+
+This means recovery is as reliable as remembering your PIN. The live scan only needs to be "close enough" to confirm identity — it does not need to be bit-for-bit identical.
+
+**PIN factor:**
+- 4-digit numeric PIN set at account creation (per-account, independent)
+- Key derivation — PBKDF2-SHA-512 (600,000 iterations, OWASP 2024 recommendation)
+- 32-byte random salt per account stored publicly in the key blob
+- ~300ms per attempt in-browser; 10,000 PIN combinations × 300ms ≈ 50 min offline
+
+**Privacy:**
+- The canonical 128-dim face descriptor is PIN-encrypted inside the blob — never stored in plaintext
+- `faceMapHash` (SHA-256 of quantized descriptor) remains public for duplicate detection
+- `encryptedFaceDescriptor` in `Account` is PIN-ciphertext — unreadable without the PIN
+
+**PIN-required actions:** send tokens, deploy contract, account recovery, update PIN/face  
+**PIN-free actions:** contract calls (may originate from other accounts or external inputs)
+
+**5-minute session cache:** after entering PIN (at login, recovery, or a transfer), the derived PIN key is held in memory for 5 minutes. Quick consecutive actions (multiple sends, deploy + call) do not re-prompt. Cleared on page close.
+
+**On-chain binding — `linkedAnchor`:**
+```
+linkedAnchor = SHA-256(encryptedKeys + ":" + faceMapHash + ":" + pub)
+```
+Stored on-chain in the `open` block. Changing PIN or face requires a signed `update` block:
+- Owner signs `update` block with their existing ECDSA key
+- Block carries `updateData: { newFaceMapHash?, newLinkedAnchor, newPQPub?, newPQKemPub? }`
+- Ledger verifies signature and recomputes anchor before accepting
+- UI: Account tab → Update PIN / Face → authenticate → credentials updated on-chain
+
+**On-chain storage** — encrypted blob stored on libp2p network + local IndexedDB  
+**Backup** — compact Base58 secret key (~263 chars) shown once at creation; encodes both private keys (signing + encryption); recoverable without camera or PIN
+
+### Quantum-Safe Hybrid Cryptography
+
+Every new account generates a **hybrid key pair** combining classical and post-quantum algorithms:
+
+| Key | Algorithm | Purpose |
+|---|---|---|
+| `pub` / `priv` | ECDSA P-256 | Block signing (classical) |
+| `epub` / `epriv` | ECDH P-256 | Key agreement / content encryption (classical) |
+| `pqPub` / `pqPriv` | ML-DSA-65 (CRYSTALS-Dilithium) | Block signing (quantum-safe) |
+| `pqKemPub` / `pqKemPriv` | ML-KEM-768 (CRYSTALS-Kyber) | Key encapsulation (quantum-safe) |
+
+PQ private keys live inside the face+PIN doubly-encrypted blob.  
+PQ public keys (`pqPub`, `pqKemPub`) are stored on-chain in the `Account` object.
+
+#### How ML-DSA-65 works (block signing)
+
+ML-DSA-65 works like ECDSA — sign with the private key, verify with the public key — but the underlying math is based on **lattice problems** (Module Learning With Errors, MLWE) instead of elliptic curves. The private key is a short polynomial; the public key is derived from it via a structured matrix. Signing produces a "hint" vector; verification checks that hint against the public key and message hash.
+
+Shor's algorithm (which breaks ECDSA by solving the discrete logarithm problem in polynomial time on a quantum computer) does not apply to MLWE. The best known quantum algorithm against lattice problems still requires exponential time.
+
+Every block is signed with **both** ECDSA and ML-DSA-65. Both are verified on receipt. If ECDSA is ever broken by a quantum computer, ML-DSA-65 still holds.
+
+#### How ML-KEM-768 works (content encryption)
+
+ML-KEM-768 is a **Key Encapsulation Mechanism** — it establishes a shared secret between two parties, analogous to ECDH but quantum-safe. It does not encrypt content directly; it produces a shared secret that is then used as an AES-GCM key.
+
+```
+Alice publishes pqKemPub on-chain
+
+Bob wants to send Alice encrypted content:
+  { cipherText, sharedSecret } = encapsulate(alicePubKey)
+  encrypted = AES-GCM(sharedSecret, content)
+  → sends cipherText + encrypted to Alice
+
+Alice decrypts:
+  sharedSecret = decapsulate(cipherText, alicePrivKey)
+  content = AES-GCM-decrypt(sharedSecret, encrypted)
+```
+
+The `cipherText` is a set of noisy polynomial equations over a polynomial ring. Only Alice's private key can remove the noise and recover the shared secret — again based on MLWE hardness.
+
+#### Why quantum computers can't break these
+
+Classical crypto (ECDSA, ECDH) relies on the **discrete logarithm problem** — Shor's algorithm solves it efficiently on a quantum computer. Lattice problems (MLWE) are a completely different mathematical structure. Shor's algorithm offers no advantage against them. Grover's algorithm gives at most a quadratic speedup on unstructured search but leaves lattice problems exponentially hard. Both ML-DSA and ML-KEM are NIST-standardised post-quantum algorithms (FIPS 204 and FIPS 203 respectively).
+
+**Hybrid block signing:**
+- Every block carries a classical `signature` (ECDSA P-256, always)
+- Blocks from PQ-capable accounts also carry `pqSignature` (ML-DSA-65)
+- Verification: ECDSA always checked; ML-DSA checked when both `pqSignature` and `pqPub` are present
+- Legacy accounts (no PQ keys) are fully backward compatible — `pqSignature` is optional
+
+Implementation uses `@noble/post-quantum` (pure TypeScript, no WASM).
+
+### Exponential Backoff and Decentralised Lockout
+
+Wrong PIN attempts trigger an exponential delay before the next attempt is allowed:
+
+| Attempts | Delay |
+|---|---|
+| 1–3 | No delay |
+| 4 | 30 seconds |
+| 5 | 2 minutes |
+| 6 | 8 minutes |
+| 7 | 32 minutes |
+| 8 | 2 hours |
+| 9 | 8 hours |
+| 10+ | 24 hours |
+
+Formula: `delay_s = attempt > 3 ? Math.min(86400, 30 × 4^(attempt − 3)) : 0`
+
+**Two-layer tamper-resistant persistence:**
+1. **IndexedDB** `neuronchain-security / pinAttempts` — fast local check, keyed by account pub key
+2. **Blob-embedded `pinAttemptState`** — face-key-encrypted `{ failedAttempts, lockedUntil }` inside the key blob — counter transfers to new devices and cannot be cleared without face auth
+
+**Decentralised enforcement via GossipSub:**
+- Topic: `neuronchain/{network}/lockouts`
+- When attempt count crosses threshold (attempt ≥ 4): `LockoutNotice { accountPub, failedAttempts, lockedUntil, timestamp }` is broadcast
+- Receiving nodes store notices (capped at 10,000); blocks from locked accounts are held until lockout expires
+- Message authenticity relies on libp2p Noise protocol (peer-authenticated at transport layer)
+
+**PIN session cache:** a 5-minute in-memory cache per account avoids re-prompting on quick consecutive actions (e.g., sending multiple transactions). Cleared on page close.
 
 ### Security
 
 | Layer | Protection |
 |---|---|
-| Transport | Noise protocol (libp2p) - all peer connections encrypted + authenticated |
-| Blocks | ECDSA P-256 signatures on every block |
-| Accounts | ECDSA-signed account data - peers reject unsigned accounts |
+| Transport | Noise protocol (libp2p) — all peer connections encrypted + authenticated |
+| Blocks | ECDSA P-256 + ML-DSA-65 hybrid signatures on every block |
+| Accounts | ECDSA-signed account data — peers reject unsigned accounts |
 | Votes | ECDSA-signed votes + balance proofs (`chainHeadHash`) |
-| Inbox signals | ECDSA-signed by sender - recipients verify before accepting |
-| Key blobs | SHA-256 content hash stored on-chain - tamper detection on recovery |
-| Smart contracts | Web Worker sandbox - no DOM/network/storage access |
+| Inbox signals | ECDSA-signed by sender — recipients verify before accepting |
+| Key storage | AES-256-GCM(face key) → AES-256-GCM(PIN key) double encryption |
+| Key blob integrity | `linkedAnchor` SHA-256 stored on-chain — tamper detection on recovery |
+| Face descriptor | PIN-encrypted canonical stored in blob; live scan used only for identity check, not key derivation |
+| PIN brute force | PBKDF2-SHA-512 600K iterations + exponential backoff + decentralised lockout |
+| Smart contracts | Web Worker sandbox — no DOM/network/storage access |
 | Content | AES-256-GCM encryption before IPFS storage |
 | Generation governance | Mainnet resets require signed message from known operator keys |
 | Null-write rejection | Client-side null-field guards on all received data |
 | Balance overflow | `Number.isSafeInteger` validation on all amounts |
-| Peer gossip | GossipSub message signing - rogue peers can't inject unsigned messages |
+| Peer gossip | GossipSub message signing — rogue peers can't inject unsigned messages |
+| Quantum-safe | ML-DSA-65 signatures + ML-KEM-768 key encapsulation alongside classical crypto |
 
 ## Technical Specs
 
 | Spec | Value |
 |---|---|
-| Key pairs | ECDSA P-256 + ECDH P-256 (Web Crypto API - zero external dependency) |
+| Classical key pairs | ECDSA P-256 (signing) + ECDH P-256 (key agreement) via Web Crypto API |
+| Quantum-safe keys | ML-DSA-65 (Dilithium, signing) + ML-KEM-768 (Kyber, encapsulation) |
+| Block signing | Hybrid: ECDSA always + ML-DSA-65 when PQ keys present |
 | Block hashing | SHA-256 (Web Crypto API) |
 | Content encryption | AES-256-GCM, key via PBKDF2 from ECDH private key |
-| Face key derivation | PBKDF2 (100K iterations) → AES-256-GCM |
-| Face descriptor | 128 dimensions, quantized to 0.05 bins |
+| Face key derivation | PBKDF2-SHA-512 (100K iterations) → AES-256-GCM |
+| PIN key derivation | PBKDF2-SHA-512 (600K iterations, OWASP 2024) → AES-256-GCM |
+| Key encryption | Double-layered: AES-GCM(face key) → AES-GCM(PIN key); face key derived from PIN-encrypted canonical |
+| Face descriptor | 128 dimensions (3-sample average), quantized to 0.05 bins; canonical stored encrypted in blob |
+| PIN entropy hardening | 600K PBKDF2 iterations ≈ 300ms/attempt → 50min offline for 10K PINs |
+| PIN backoff schedule | Attempts 1-3: none; 4: 30s; 5: 2m; 6: 8m; 7: 32m; 8: 2h; 9: 8h; 10+: 24h |
 | Consensus | Optimistic confirmation + conflict-only stake-weighted voting (>2/3, 10s timeout) |
-| P2P | libp2p - WebRTC, WebSockets, circuit relay v2, GossipSub, Kademlia DHT |
-| Content storage | Helia/IPFS with Bitswap - content-addressed, encrypted, parallel chunks |
-| Local persistence | IndexedDB - blocks, accounts, keyblobs, contracts survive relay downtime |
+| P2P | libp2p — WebRTC, WebSockets, circuit relay v2, GossipSub, Kademlia DHT |
+| Content storage | Helia/IPFS with Bitswap — content-addressed, encrypted, parallel chunks |
+| Local persistence | IndexedDB — blocks, accounts, keyblobs, contracts survive relay downtime |
 | Max safe balance | `Number.MAX_SAFE_INTEGER` (milli-UNIT) |
 | Smart contract timeout | 3 seconds |
 | Storage payment interval | 24 hours (configurable) |
@@ -212,13 +351,14 @@ neuronchain/
 │   ├── api/
 │   │   └── neuronchain-api.ts    # dApp API facade
 │   ├── core/
-│   │   ├── crypto.ts             # Web Crypto API - ECDSA/ECDH/AES
-│   │   ├── dag-block.ts          # Block types + hashing + validation
-│   │   ├── dag-ledger.ts         # Block-lattice state machine + storage deals
+│   │   ├── crypto.ts             # Web Crypto API - ECDSA/ECDH/AES + ML-DSA-65/ML-KEM-768
+│   │   ├── dag-block.ts          # Block types + hashing + validation + hybrid signing
+│   │   ├── dag-ledger.ts         # Block-lattice state machine + update block handler
 │   │   ├── vote.ts               # Stake-weighted voting + balance proofs
-│   │   ├── account.ts            # Account model
+│   │   ├── account.ts            # Account model (includes PQ keys + linkedAnchor)
 │   │   ├── face-verify.ts        # FaceID liveness + enrollment
-│   │   ├── face-store.ts         # Face-locked key encryption/decryption
+│   │   ├── face-store.ts         # Double-encrypted key blobs (face+PIN) + linkedAnchor
+│   │   ├── pin-crypto.ts         # PIN key derivation, exponential backoff, lockout state
 │   │   └── events.ts             # EventEmitter
 │   └── network/
 │       ├── libp2p-network.ts     # libp2p + GossipSub + IndexedDB

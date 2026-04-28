@@ -1,5 +1,5 @@
 /**
- * Helia/IPFS content store - large content storage for social media posts,
+ * Helia/IPFS content store - large content storage,
  * images, video, audio, JSON documents, HTML/CSS/JS files, etc.
  *
  * Content is content-addressed (stored by SHA-256 CID) which means:
@@ -17,6 +17,7 @@
  */
 
 import { createHelia, Helia } from 'helia';
+import { bitswap } from '@helia/block-brokers';
 import { unixfs, UnixFS } from '@helia/unixfs';
 import { IDBBlockstore } from 'blockstore-idb';
 import { IDBDatastore } from 'datastore-idb';
@@ -53,6 +54,11 @@ export class HeliaStore {
       datastore: this.datastore,
       // Share the existing libp2p node so Helia uses the same peer connections
       ...(libp2pNode ? { libp2p: libp2pNode } : {}),
+      // Enable BitSwap over circuit-relay (limited) connections.
+      // By default BitSwap refuses limited connections (DEFAULT_RUN_ON_TRANSIENT_CONNECTIONS = false),
+      // meaning it won't exchange blocks with peers connected via circuit relay — which is
+      // the ONLY transport available between two browser nodes behind NAT.
+      blockBrokers: [bitswap({ runOnLimitedConnections: true })],
     } as Parameters<typeof createHelia>[0]);
 
     this.fs = unixfs(this.helia);
@@ -82,16 +88,36 @@ export class HeliaStore {
   /**
    * Retrieve raw bytes by CID string.
    * Fetches from local store first, then from Helia's BitSwap peer network.
+   * Throws if content is not found within timeoutMs (default 15s).
    */
-  async retrieve(cidStr: string): Promise<Uint8Array> {
+  async retrieve(cidStr: string, timeoutMs = 20_000): Promise<Uint8Array> {
     this.assertStarted();
     const cid = CID.parse(cidStr);
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of this.fs.cat(cid)) {
-      chunks.push(chunk);
+
+    let localHas = false;
+    try { localHas = Boolean(await Promise.resolve(this.helia.blockstore.has(cid))); } catch { /* ignore */ }
+    const peers = this.helia.libp2p?.getPeers?.() ?? [];
+    const conns = this.helia.libp2p?.getConnections?.() ?? [];
+    console.log(`[Helia] retrieve ${cidStr.slice(0, 20)}… local=${localHas} peers=${peers.length} conns=${conns.length} timeout=${timeoutMs}ms`);
+    if (conns.length > 0) {
+      console.log(`[Helia] connections: ${conns.map((c: { remotePeer: { toString(): string }; status: string }) => `${c.remotePeer.toString().slice(0,12)}(${c.status})`).join(', ')}`);
     }
-    // Concatenate
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`Retrieve timed out after ${timeoutMs}ms for ${cidStr.slice(0, 16)}`)), timeoutMs);
+    const chunks: Uint8Array[] = [];
+    try {
+      for await (const chunk of this.fs.cat(cid, { signal: controller.signal })) {
+        chunks.push(chunk);
+      }
+    } catch (err) {
+      console.error(`[Helia] retrieve FAILED ${cidStr.slice(0, 20)}…:`, err instanceof Error ? err.message : String(err));
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
     const total = chunks.reduce((n, c) => n + c.length, 0);
+    console.log(`[Helia] retrieved ${cidStr.slice(0, 20)}… OK (${total} bytes)`);
     const result = new Uint8Array(total);
     let offset = 0;
     for (const c of chunks) { result.set(c, offset); offset += c.length; }
@@ -114,10 +140,12 @@ export class HeliaStore {
    * Retrieve and decrypt content stored by storeEncrypted.
    * Returns undefined if decryption fails (wrong key or corrupted data).
    */
-  async retrieveDecrypted(cidStr: string, keys: KeyPair): Promise<Uint8Array | undefined> {
-    const encrypted = await this.retrieve(cidStr);
-    const aesKey = await deriveContentKey(keys);
-    return decryptBytes(encrypted, aesKey);
+  async retrieveDecrypted(cidStr: string, keys: KeyPair, timeoutMs = 25_000): Promise<Uint8Array | undefined> {
+    try {
+      const encrypted = await this.retrieve(cidStr, timeoutMs);
+      const aesKey = await deriveContentKey(keys);
+      return decryptBytes(encrypted, aesKey);
+    } catch { return undefined; }
   }
 
   /**
@@ -166,7 +194,7 @@ export class HeliaStore {
   async retrieveWithMeta(metaCid: string, keys: KeyPair): Promise<{ data: Uint8Array; meta: ContentMeta & { contentCid: string } } | undefined> {
     const meta = await this.retrieveJSON<ContentMeta & { contentCid: string }>(metaCid, keys);
     if (!meta?.contentCid) return undefined;
-    const data = await this.retrieveDecrypted(meta.contentCid, keys);
+    const data = await this.retrieveDecrypted(meta.contentCid, keys, 30_000);
     if (!data) return undefined;
     return { data, meta };
   }
@@ -200,7 +228,7 @@ export class HeliaStore {
       const metaBytes = await this.retrieve(metaCid);
       const meta = JSON.parse(new TextDecoder().decode(metaBytes)) as ContentMeta & { contentCid: string };
       if (!meta?.contentCid) return undefined;
-      const data = await this.retrieve(meta.contentCid);
+      const data = await this.retrieve(meta.contentCid, 30_000);
       return { data, meta };
     } catch { return undefined; }
   }
@@ -222,10 +250,14 @@ export class HeliaStore {
   // ── Pinning ───────────────────────────────────────────────────────────────
 
   /** Pin content locally so it's never garbage-collected */
-  async pin(cidStr: string): Promise<void> {
+  async pin(cidStr: string, timeoutMs = 30_000): Promise<void> {
     this.assertStarted();
+    // retrieve() fetches all blocks via BitSwap and caches them locally.
+    // Only then do we mark as pinned — this guarantees the content is actually
+    // present in the blockstore before pins.add() walks the DAG.
+    await this.retrieve(cidStr, timeoutMs);
     const cid = CID.parse(cidStr);
-    await this.helia.pins.add(cid);
+    for await (const _ of this.helia.pins.add(cid)) { /* drain generator to complete pin */ }
   }
 
   /** Unpin content - it will be garbage-collected eventually */
@@ -233,7 +265,7 @@ export class HeliaStore {
     this.assertStarted();
     try {
       const cid = CID.parse(cidStr);
-      await this.helia.pins.rm(cid);
+      for await (const _ of this.helia.pins.rm(cid)) { /* drain */ }
     } catch { /* already unpinned */ }
   }
 
@@ -264,7 +296,7 @@ export class HeliaStore {
     this.assertStarted();
     let total = 0;
     for await (const block of this.helia.blockstore.getAll()) {
-      total += block.bytes.length;
+      total += (block.bytes as unknown as Uint8Array).byteLength;
     }
     return total;
   }

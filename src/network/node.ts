@@ -6,6 +6,20 @@ import { AccountBlock } from '../core/dag-block';
 import { VoteManager, Vote } from '../core/vote';
 import { KeyPair, signData, verifySignature } from '../core/crypto';
 import { EventEmitter } from '../core/events';
+import { multiaddr } from '@multiformats/multiaddr';
+
+/**
+ * Returns a stable per-device ID persisted in localStorage.
+ * Unlike libp2p's peerId, this survives page reloads so storage
+ * registration correctly identifies which physical device is serving.
+ */
+export function getDeviceId(): string {
+  try {
+    let id = localStorage.getItem('neuronchain_device_id');
+    if (!id) { id = crypto.randomUUID(); localStorage.setItem('neuronchain_device_id', id); }
+    return id;
+  } catch { return ''; }
+}
 
 export interface NodeStats {
   status: 'stopped' | 'running' | 'validating';
@@ -37,6 +51,7 @@ export class NeuronNode extends EventEmitter {
   private processedInbox: Set<string> = new Set();
   private watchedInboxes: Set<string> = new Set();
   private static readonly MAX_INBOX = 10_000;
+  private dialingPeers: Set<string> = new Set();
 
   constructor(network: NetworkType = 'testnet') {
     super();
@@ -55,18 +70,26 @@ export class NeuronNode extends EventEmitter {
     this.net.on('account:synced', async (data: unknown) => {
       const acc = data as Record<string, unknown>;
       const pub = String(acc.pub);
-      if (this.ledger.accounts.has(pub)) return;
       if (acc._sig) {
         const valid = await NeuronNode.verifyAccountData(acc);
         if (!valid) { console.warn(`[Node] Rejected account ${pub.slice(0, 12)}... - invalid signature`); return; }
       }
+      // Always register — registerAccount merges into existing or creates new.
+      // Dropping known accounts here was the cause of one-way sync: PC created
+      // account A, received account B from mobile, but since A was already known
+      // the handler returned early and B was never registered.
       this.ledger.registerAccount({
         username: String(acc.username), pub,
         balance: Number(acc.balance || 0), nonce: Number(acc.nonce || 0),
         createdAt: Number(acc.createdAt || 0), faceMapHash: String(acc.faceMapHash || ''),
+        linkedAnchor: acc.linkedAnchor ? String(acc.linkedAnchor) : undefined,
+        pqPub: acc.pqPub ? String(acc.pqPub) : undefined,
+        pqKemPub: acc.pqKemPub ? String(acc.pqKemPub) : undefined,
+        pinSalt: acc.pinSalt ? String(acc.pinSalt) : undefined,
+        pinVerifier: acc.pinVerifier ? String(acc.pinVerifier) : undefined,
       });
       this.emit('account:synced', acc);
-      // A new peer has data - reply with ours so the handshake completes both ways
+      // A new peer has data — reply with ours so the handshake completes both ways
       if (this.publishDebounce) clearTimeout(this.publishDebounce);
       this.publishDebounce = setTimeout(() => {
         this.publishDebounce = null;
@@ -103,6 +126,11 @@ export class NeuronNode extends EventEmitter {
     this.ledger.on('contract:executed',(d: unknown) => this.emit('contract:executed', d));
     this.ledger.on('contract:error',   (d: unknown) => this.emit('contract:error', d));
 
+    this.net.on('peer:addrs', async (data: unknown) => {
+      const { peerId, addrs } = data as { peerId: string; addrs: string[] };
+      await this.dialPeer(peerId, addrs);
+    });
+
     this.net.on('peer:connected', (id: unknown) => {
       this.emit('peer:connected', id);
       // Re-broadcast all local accounts and blocks so the newly connected
@@ -116,21 +144,19 @@ export class NeuronNode extends EventEmitter {
     });
     this.net.on('peer:disconnected', (id: unknown) => this.emit('peer:disconnected', id));
 
-    this.net.on('generation:changed', () => {
-      // A peer broadcast a higher generation number (= testnet reset).
-      // libp2p-network.ts already wiped IndexedDB and processedBlocks when it
-      // received the message. Here we wipe the in-memory ledger so we don't
-      // (a) keep publishing zombie blocks from the old generation that peers
-      //     will reject via the `_gen < this.generation` filter, or
-      // (b) have unclaimedSends / balances from the old chain confusing new blocks.
-      // localKeys must also be cleared - the accounts those keys belong to no
-      // longer exist after a reset; they will be re-added via addLocalKey() after
-      // the user creates/recovers their account in the new generation.
-      // generation:reset → main.ts → location.reload() to fully flush JS heap.
-      this.ledger.reset();
-      this.localKeys.clear();
-      this.processedInbox.clear();
-      this.emit('generation:reset');
+    this.net.on('generation:changed', (isReset: unknown) => {
+      if (isReset) {
+        // Real testnet reset from another device — wipe in-memory state and reload
+        this.ledger.reset();
+        this.localKeys.clear();
+        this.processedInbox.clear();
+        this.emit('generation:reset'); // → main.ts → location.reload()
+      } else {
+        // Sync-only generation update (publishLocalData re-broadcast).
+        // IDB was NOT cleared, so in-memory state is still valid.
+        // Re-publish immediately so our messages pass peers' _gen filter.
+        setTimeout(() => this.publishLocalData(), 1000);
+      }
     });
 
     this.storage.on('storage:heartbeat-sent', (d: unknown) => this.emit('storage:heartbeat-sent', d));
@@ -138,6 +164,63 @@ export class NeuronNode extends EventEmitter {
     this.storage.on('storage:pinned',         (d: unknown) => this.emit('storage:pinned', d));
 
     for (const pub of this.localKeys.keys()) this.startInboxWatch(pub);
+  }
+
+  private async dialPeer(peerId: string, addrs: string[]): Promise<void> {
+    if (!this.net.libp2p) return;
+    const connected = this.net.libp2p.getConnections().some(c => c.remotePeer.toString() === peerId);
+    if (connected) {
+      console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: already connected`);
+      return;
+    }
+    if (this.dialingPeers.has(peerId)) {
+      console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: dial in progress, skipping`);
+      return;
+    }
+    this.dialingPeers.add(peerId);
+    try {
+
+    // Build simplified circuit-relay addrs from our own existing relay connections.
+    // The received addrs may contain transport-specific components like
+    // wss/http-path/relay-ws that confuse the circuit-relay transport's dialFilter
+    // on some libp2p/multiaddr version combinations, causing "Can't interpret
+    // protocol p2p-circuit". The simplified /p2p/{relay}/p2p-circuit format has
+    // no such components and the transport reuses the already-open relay connection.
+    const constructed: string[] = [];
+    for (const conn of this.net.libp2p.getConnections()) {
+      const relayId = conn.remotePeer.toString();
+      if (relayId !== peerId) {
+        constructed.push(`/p2p/${relayId}/p2p-circuit/p2p/${peerId}`);
+      }
+    }
+
+    const toTry = [...constructed, ...addrs];
+    console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: ${toTry.length} addr(s) (${constructed.length} via relay, ${addrs.length} received)`);
+
+    for (const addrStr of toTry) {
+      try {
+        await this.net.libp2p.dial(multiaddr(addrStr));
+        console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: connected via ${addrStr.slice(0, 40)}`);
+        return;
+      } catch (err) {
+        console.warn(`[Node] dialPeer ${peerId.slice(0, 12)}: failed ${addrStr.slice(0, 40)} — ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    console.warn(`[Node] dialPeer ${peerId.slice(0, 12)}: all addrs failed`);
+    } finally {
+      this.dialingPeers.delete(peerId);
+    }
+  }
+
+  async connectToKnownPeers(): Promise<void> {
+    const known = [...this.net.knownPeerAddrs.entries()];
+    const myAddrs = (this.net.libp2p?.getMultiaddrs?.() ?? []).map(a => a.toString());
+    const conns = (this.net.libp2p?.getConnections?.() ?? []).map(c => c.remotePeer.toString());
+    console.log(`[Node] connectToKnownPeers: ${known.length} known, ${conns.length} active conns`);
+    console.log(`[Node] my multiaddrs: ${myAddrs.join(' | ') || 'none'}`);
+    for (const [peerId, addrs] of known) {
+      await this.dialPeer(peerId, addrs);
+    }
   }
 
   private async voteIfConflict(block: AccountBlock): Promise<void> {
@@ -235,6 +318,11 @@ export class NeuronNode extends EventEmitter {
             balance: Number(accData.balance || 0), nonce: Number(accData.nonce || 0),
             createdAt: Number(accData.createdAt || 0), faceMapHash: String(accData.faceMapHash || ''),
             faceDescriptor,
+            linkedAnchor: accData.linkedAnchor ? String(accData.linkedAnchor) : undefined,
+            pqPub: accData.pqPub ? String(accData.pqPub) : undefined,
+            pqKemPub: accData.pqKemPub ? String(accData.pqKemPub) : undefined,
+            pinSalt: accData.pinSalt ? String(accData.pinSalt) : undefined,
+            pinVerifier: accData.pinVerifier ? String(accData.pinVerifier) : undefined,
           });
         }
       }
@@ -283,6 +371,11 @@ export class NeuronNode extends EventEmitter {
         balance: Number(accData.balance || 0), nonce: Number(accData.nonce || 0),
         createdAt: Number(accData.createdAt || 0), faceMapHash: String(accData.faceMapHash || ''),
         faceDescriptor,
+        linkedAnchor: accData.linkedAnchor ? String(accData.linkedAnchor) : undefined,
+        pqPub: accData.pqPub ? String(accData.pqPub) : undefined,
+        pqKemPub: accData.pqKemPub ? String(accData.pqKemPub) : undefined,
+        pinSalt: accData.pinSalt ? String(accData.pinSalt) : undefined,
+        pinVerifier: accData.pinVerifier ? String(accData.pinVerifier) : undefined,
       });
     }
 
@@ -337,6 +430,11 @@ export class NeuronNode extends EventEmitter {
           balance: Number(accData.balance || 0), nonce: Number(accData.nonce || 0),
           createdAt: Number(accData.createdAt || 0), faceMapHash: String(accData.faceMapHash || ''),
           faceDescriptor,
+          linkedAnchor: accData.linkedAnchor ? String(accData.linkedAnchor) : undefined,
+          pqPub: accData.pqPub ? String(accData.pqPub) : undefined,
+          pqKemPub: accData.pqKemPub ? String(accData.pqKemPub) : undefined,
+          pinSalt: accData.pinSalt ? String(accData.pinSalt) : undefined,
+          pinVerifier: accData.pinVerifier ? String(accData.pinVerifier) : undefined,
         });
         if (!existing) newAccounts++;
       }
@@ -381,6 +479,11 @@ export class NeuronNode extends EventEmitter {
   }
 
   async publishLocalData(): Promise<void> {
+    // Re-broadcast generation so late-joining peers can catch up and pass the
+    // _gen filter. The reload is now suppressed when a fresh device (no blocks)
+    // receives a higher generation, so this no longer causes spurious reloads.
+    this.net.publishGeneration();
+
     let published = 0;
     for (const [pub, acc] of this.ledger.accounts) {
       const keys = this.localKeys.get(pub);
@@ -388,11 +491,21 @@ export class NeuronNode extends EventEmitter {
         username: acc.username, pub: acc.pub, balance: acc.balance, nonce: acc.nonce,
         createdAt: acc.createdAt, faceMapHash: acc.faceMapHash,
         faceDescriptor: acc.faceDescriptor ? JSON.stringify(acc.faceDescriptor) : undefined,
+        linkedAnchor: acc.linkedAnchor ?? undefined,
+        pqPub: acc.pqPub ?? undefined,
+        pqKemPub: acc.pqKemPub ?? undefined,
+        pinSalt: acc.pinSalt ?? undefined,
+        pinVerifier: acc.pinVerifier ?? undefined,
       };
       this.net.saveAccount(pub, keys ? await this.signAccountData(accData, keys) : accData);
     }
     for (const [, block] of this.ledger.allBlocks) { this.net.publishBlock(block); published++; }
-    if (published > 0) { /* published */ }
+
+    // Re-gossip local key blobs so recovering devices can fetch them without being online at enrollment
+    for (const pub of this.localKeys.keys()) {
+      const blob = await this.net.loadKeyBlob(pub);
+      if (blob) this.net.saveKeyBlob(pub, blob);
+    }
   }
 
   async stop(): Promise<void> {
@@ -447,7 +560,7 @@ export class NeuronNode extends EventEmitter {
 
   /** Register as a storage provider. capacityGB = 0 deregisters. */
   async registerStorage(pub: string, capacityGB: number, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
-    const result = await this.ledger.createStorageRegister(pub, capacityGB, keys);
+    const result = await this.ledger.createStorageRegister(pub, capacityGB, keys, getDeviceId());
     if (!result.block) return { success: false, error: result.error };
     return this.submitBlock(result.block);
   }
@@ -459,9 +572,10 @@ export class NeuronNode extends EventEmitter {
     return this.submitBlock(result.block);
   }
 
-  /** Distribute a stored CID to up to 10 network providers. */
-  async distributeContent(cid: string, uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {
-    return this.storage.distributeContent(cid, uploaderPub, keys);
+  /** Distribute stored CIDs to up to 10 network providers. Pass all CIDs that must be pinned together (e.g. metaCid + contentCid). */
+  async distributeContent(cids: string | string[], uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {
+    const cidArr = Array.isArray(cids) ? cids : [cids];
+    return this.storage.distributeContent(cidArr[0], uploaderPub, keys, cidArr.slice(1));
   }
 
   getStats(): NodeStats {

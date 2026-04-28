@@ -1,4 +1,4 @@
-import { signData, verifySignature, KeyPair } from './crypto';
+import { signData, verifySignature, pqSign, pqVerify, KeyPair } from './crypto';
 
 /**
  * Block types in the block-lattice:
@@ -18,7 +18,8 @@ import { signData, verifySignature, KeyPair } from './crypto';
  */
 export type AccountBlockType =
   | 'open' | 'send' | 'receive' | 'deploy' | 'call'
-  | 'storage-register' | 'storage-deregister' | 'storage-heartbeat' | 'storage-reward';
+  | 'storage-register' | 'storage-deregister' | 'storage-heartbeat' | 'storage-reward'
+  | 'update';
 
 export const UNIT_DECIMALS = 3;
 export const UNIT_FACTOR = 1000;
@@ -81,9 +82,15 @@ export interface AccountBlock {
 
   /**
    * IPFS CID of content referenced or produced by this block.
-   * Used by social app posts, NFT media, etc.
+   * Can be used by social app posts, NFT media, etc.
    */
   contentCid?: string;
+
+  /** update block: JSON { newFaceMapHash?, newLinkedAnchor, newPQPub?, newPQKemPub? } */
+  updateData?: string;
+
+  /** ML-DSA-65 signature (base64) for quantum-safe hybrid verification. Present on new accounts. */
+  pqSignature?: string;
 }
 
 export interface ConfirmedBlock extends AccountBlock {
@@ -100,6 +107,8 @@ export interface StorageRegisterData {
   type: 'storage-register';
   /** Offered capacity in gigabytes. Set to 0 to deregister. */
   capacityGB: number;
+  /** Stable device ID of the registering machine - storage is per-device, not per-account */
+  deviceId?: string;
 }
 
 /**
@@ -121,7 +130,7 @@ export interface StorageRewardData {
 
 // ── Block hashing ─────────────────────────────────────────────────────────────
 
-export async function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signature'>): Promise<string> {
+export async function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signature' | 'pqSignature'>): Promise<string> {
   const data = [
     block.accountPub,
     block.index,
@@ -137,6 +146,7 @@ export async function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signa
     block.faceMapHash || '',
     block.contractData || '',
     block.contentCid || '',
+    block.updateData || '',
   ].join(':');
 
   const encoded = new TextEncoder().encode(data);
@@ -159,6 +169,7 @@ export async function createAccountBlock(
     faceMapHash?: string;
     contractData?: string;
     contentCid?: string;
+    updateData?: string;
   },
   keys: KeyPair,
 ): Promise<AccountBlock> {
@@ -166,12 +177,31 @@ export async function createAccountBlock(
   const hashInput = { ...params, timestamp };
   const hash = await hashAccountBlock(hashInput);
   const signature = await signData(hash, keys);
-  return { ...params, timestamp, hash, signature };
+
+  const block: AccountBlock = { ...params, timestamp, hash, signature };
+
+  // Hybrid quantum-safe signature: add ML-DSA-65 signature alongside ECDSA
+  if (keys.pqPriv) {
+    block.pqSignature = pqSign(hash, keys.pqPriv);
+  }
+
+  return block;
 }
 
-export async function verifyBlockSignature(block: AccountBlock): Promise<boolean> {
+/**
+ * Verify block signature(s).
+ * Always checks ECDSA. If pqSignature + pqPub are both present, also checks ML-DSA-65.
+ * Both must pass when both are present.
+ */
+export async function verifyBlockSignature(block: AccountBlock, pqPub?: string): Promise<boolean> {
   const result = await verifySignature(block.signature, block.accountPub);
-  return result === block.hash;
+  if (result !== block.hash) return false;
+
+  if (block.pqSignature && pqPub) {
+    if (!pqVerify(block.hash, block.pqSignature, pqPub)) return false;
+  }
+
+  return true;
 }
 
 export function validateBlockStructure(
@@ -271,7 +301,20 @@ export function validateBlockStructure(
       }
       return { valid: true };
     }
+    case 'update': {
+      if (!block.updateData) return { valid: false, error: 'Update block needs updateData' };
+      try {
+        const data = JSON.parse(block.updateData) as Record<string, unknown>;
+        if (!data.newLinkedAnchor || typeof data.newLinkedAnchor !== 'string') {
+          return { valid: false, error: 'Update block requires newLinkedAnchor' };
+        }
+      } catch {
+        return { valid: false, error: 'Update block updateData is not valid JSON' };
+      }
+      if (block.balance !== parent.balance) return { valid: false, error: 'Balance unchanged after update' };
+      return { valid: true };
+    }
+    default:
+      return { valid: false, error: 'Unknown block type' };
   }
-
-  return { valid: false, error: 'Unknown block type' };
 }
