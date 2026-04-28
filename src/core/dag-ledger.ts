@@ -288,6 +288,7 @@ export class DAGLedger extends EventEmitter {
     const block = await createAccountBlock({
       accountPub: pub, index: head.index + 1, type: 'storage-deregister',
       previousHash: head.hash, balance: head.balance,
+      contractData: JSON.stringify({ capacityGB: provider.capacityGB }),
     }, keys);
     return { block };
   }

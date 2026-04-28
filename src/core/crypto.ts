@@ -189,7 +189,7 @@ export async function decryptData(encrypted: string, pair: KeyPair): Promise<str
 
 /**
  * Encrypt arbitrary bytes with a raw AES-256-GCM key.
- * Used by HeliaStore for content encryption.
+ * Used by SmokeStore for content encryption.
  */
 export async function encryptBytes(data: Uint8Array, aesKey: CryptoKey): Promise<Uint8Array> {
   const iv = crypto.getRandomValues(new Uint8Array(12));

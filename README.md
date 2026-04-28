@@ -1,6 +1,6 @@
 # NeuronChain
 
-A browser-based blockchain using a **block-lattice DAG** with **stake-weighted voting** and **two-factor face + PIN locked keys**. Powered by **libp2p** (WebRTC + GossipSub + Kademlia DHT) and **Helia/IPFS** for decentralised content storage - no central relay on the data path.
+A browser-based blockchain using a **block-lattice DAG** with **stake-weighted voting** and **two-factor face + PIN locked keys**. Powered by **libp2p** (WebRTC + GossipSub + Kademlia DHT) and **@sinclair/smoke** (HTTP-over-WebRTC + IndexedDB) for decentralised content storage - no central relay on the data path.
 
 ## Currency: Neuron Unit (UNIT)
 
@@ -24,7 +24,7 @@ npm run tunnel     # (second terminal) HTTPS tunnel for multiple-device testing
 ### First Steps
 
 1. **Create account** - Account tab → choose username → liveness check → face enrollment (3 captures) → set 4-digit PIN → 1,000,000 UNIT minted → save backup secret key
-2. **Start node** - Node tab → Start Node (connects to relay, starts syncing via libp2p + Helia)
+2. **Start node** - Node tab → Start Node (connects to relay, starts syncing via libp2p + smoke)
 3. **Send UNIT** - Transfer tab → recipient username → amount → **PIN required**
 4. **Claim receives** - Transfer tab → Pending Receives → Claim
 5. **Recover account** - Account tab → enter username → PIN prompt → face scan / paste backup secret key (from any device)
@@ -41,10 +41,11 @@ node relay-server.js       # Defaults to port 9090
 PORT=443 node relay-server.js   # Or any port
 ```
 
-The relay serves three roles:
+The relay serves four roles:
 - **GossipSub router** - subscribes to all `neuronchain/*` topics and routes messages between browser peers (required while browsers remain on circuit-relay connections; once browsers upgrade to direct WebRTC the relay is off the data path)
 - **Circuit relay v2** - NAT traversal: relays connections when direct WebRTC fails
 - **Bootstrap / DHT server** - provides initial peer addresses and Kademlia routing
+- **Smoke hub** (`/smoke-hub` on port 9092) - WebSocket signaling for smoke's HTTP-over-WebRTC block transfer layer
 
 ## Architecture
 
@@ -72,7 +73,7 @@ Uncontested blocks are confirmed immediately (**optimistic confirmation**). When
 | Peer discovery | Kademlia DHT | Decentralised - no central peer registry |
 | Pubsub | GossipSub | Blocks, votes, accounts, inbox signals |
 | Persistence | IndexedDB | Full chain stored locally - no relay dependency |
-| Content | Helia/Bitswap | Large content - parallel chunk transfer |
+| Content | smoke FileSystem + Http | Large content - HTTP-over-WebRTC transfer |
 
 **Bootstrap address** (dev): `ws://localhost:9090`  
 **Custom bootstrap**: `localStorage.setItem('neuronchain_bootstrap', JSON.stringify(['/dns4/relay.example.com/tcp/9090/ws/p2p/<peerID>']))`
@@ -81,12 +82,12 @@ GossipSub topics are sharded across 4 synapse paths by `hash(accountPub) % 4`.
 
 ### Content Storage
 
-NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON are stored **on NeuronChain** using its own content layer. Helia (the JavaScript IPFS implementation) and Bitswap run embedded inside each NeuronChain node, sharing the same libp2p connections as the blockchain — so content is served by NeuronChain peers only, not by the public IPFS network. Each piece of content is:
+NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON are stored **on NeuronChain** using its own content layer. `@sinclair/smoke` provides IndexedDB-backed local storage and HTTP-over-WebRTC for peer-to-peer block transfer — content is served by NeuronChain peers directly, with no dependency on the public IPFS network. Each piece of content is:
 
-- **Content-addressed** by SHA-256 CID - tamper-evident: any peer serving a wrong byte is rejected
+- **Content-addressed** by SHA-256 CID (`bafkrei…` format via `multiformats`) - tamper-evident: any peer serving a wrong byte is rejected
 - **Anchored on-chain** - the CID is recorded in `block.contentCid` or smart contract state, creating an immutable provenance proof
 - **ECDSA-signed** - every store action is signed by the account key regardless of visibility
-- **Served by any peer** that holds a copy via Bitswap (parallel chunk transfer, BitTorrent-style)
+- **Served by any peer** that holds a copy via smoke Http (HTTP-over-WebRTC to the peer's virtual port 5891)
 - **Persisted locally** in IndexedDB - readable offline without a relay
 
 Content has **dynamic visibility**:
@@ -107,7 +108,8 @@ NeuronChain has a built-in automated storage incentive system - no marketplace, 
 | Provider registers | `storage-register` block (capacityGB) | Yes |
 | Proof of uptime | `storage-heartbeat` block every ~4h | Yes |
 | Daily reward | `storage-reward` block - mints new UNIT | Yes |
-| Content distribution | Pin request via GossipSub → Helia/Bitswap | Off-chain |
+| Content distribution | Cache request via GossipSub → smoke Http fetch | Off-chain |
+| Content deletion | Delete request via GossipSub → all holders drop blocks | Off-chain |
 | Off-chain metrics | Retrieval receipts (latency, spot-check) | Off-chain |
 
 **Earning rate formula:**
@@ -121,7 +123,9 @@ spot_check_factor = checks_passed / checks_received (max 1.0)
 
 Rewards are self-issued daily via a `storage-reward` block. Other nodes verify the amount against the on-chain heartbeat count before accepting. Over-claiming is rejected by the ledger.
 
-**Content distribution:** uploaders select up to 10 providers via weighted-random (weight = capacityGB × score), publish a signed pin request, and providers fetch via Helia/Bitswap. Providers re-pin on startup from their local blockstore.
+**Content distribution:** uploaders select up to 10 providers via weighted-random (weight = capacityGB × score), publish a signed `CacheRequest` via GossipSub (including the uploader's smoke Hub address so providers can reach the uploader over WebRTC), and providers fetch each block via smoke Http (HTTP-over-WebRTC) and write it to their local IndexedDB. Non-provider nodes that observe the `CacheRequest` also register the uploader's smoke address as a peer fallback so they can retrieve directly from the uploader if a provider is unavailable.
+
+**Content deletion:** the owner broadcasts a signed `DeleteRequest` via GossipSub (`storage/delete-requests` topic). Any node that receives it — provider or non-provider — verifies the ECDSA signature against the owner's public key and immediately drops all local copies from IndexedDB. No restart required; deletion propagates across the mesh as fast as GossipSub delivers the message.
 
 **Sybil resistance:** face-lock enforces 1 account per face on mainnet → 1 storage provider registration per person.
 
@@ -146,19 +150,33 @@ function balanceOf(address) { ... }
 **NFT Collection (ERC-721 style)**
 ```javascript
 function init(name, symbol) { ... }
-function mint(metadata, cid) { ... }   // cid = Helia CID of media content
+function mint(metadata, cid) { ... }   // cid = SHA-256 CID of media content
 function transfer(tokenId, to) { ... }
 function ownerOf(tokenId) { ... }
 function myTokens() { ... }
 ```
 
-NFT media is stored in Helia - the CID passed to `mint()` is a content pointer to the encrypted image/video/audio.
+NFT media is stored via smoke FileSystem - the CID passed to `mint()` is a content pointer to the encrypted image/video/audio.
 
 ### dApp API
 
-Build applications on NeuronChain using the `NeuronChainAPI` facade in [`src/api/neuronchain-api.ts`](src/api/neuronchain-api.ts).
+Build applications on NeuronChain using the `NeuronChainAPI` facade in [`src/api/neuronchain-api.ts`](src/api/neuronchain-api.ts). Key methods:
 
-See **[CONTENT_API.md](CONTENT_API.md)** for the full API reference including content types, schemas, events, and code examples.
+| Category | Method | Description |
+|---|---|---|
+| Content | `storeContent(data, mimeType, keys, name?)` | Store private (AES-256-GCM encrypted) content |
+| Content | `storeContentPublic(data, mimeType, name?)` | Store public (unencrypted) content |
+| Content | `retrieveContent(cid, keys)` | Retrieve + decrypt private content |
+| Content | `retrieveContentPublic(cid)` | Retrieve public content |
+| Content | `retrieveContentAuto(cid, keys?)` | Retrieve without knowing visibility |
+| Content | `deleteContent(cids, ownerPub, keys)` | Delete locally + broadcast delete to all providers |
+| Content | `distributeContent(cids, pub, keys)` | Push CIDs to up to 10 storage providers |
+| Transfers | `send(from, to, amount, keys)` | Send UNIT (amount in milli-UNIT) |
+| Contracts | `deployContract(name, code, pub, keys)` | Deploy a JS sandbox contract |
+| Contracts | `callContract(id, method, args, pub, keys)` | Call a contract method |
+| Storage | `registerStorage(pub, capacityGB, keys)` | Register as a provider (auto heartbeats + rewards) |
+
+See **[CONTENT_API.md](CONTENT_API.md)** for the full API reference including detailed method signatures, content types, event catalogue, and complete code examples.
 
 ### Two-Factor Key Protection (Face + PIN)
 
@@ -313,7 +331,7 @@ Formula: `delay_s = attempt > 3 ? Math.min(86400, 30 × 4^(attempt − 3)) : 0`
 | Face descriptor | PIN-encrypted canonical stored in blob; live scan used only for identity check, not key derivation |
 | PIN brute force | PBKDF2-SHA-512 600K iterations + exponential backoff + decentralised lockout |
 | Smart contracts | Web Worker sandbox — no DOM/network/storage access |
-| Content | AES-256-GCM encryption before IPFS storage |
+| Content | AES-256-GCM encryption before smoke storage |
 | Generation governance | Mainnet resets require signed message from known operator keys |
 | Null-write rejection | Client-side null-field guards on all received data |
 | Balance overflow | `Number.isSafeInteger` validation on all amounts |
@@ -337,7 +355,7 @@ Formula: `delay_s = attempt > 3 ? Math.min(86400, 30 × 4^(attempt − 3)) : 0`
 | PIN backoff schedule | Attempts 1-3: none; 4: 30s; 5: 2m; 6: 8m; 7: 32m; 8: 2h; 9: 8h; 10+: 24h |
 | Consensus | Optimistic confirmation + conflict-only stake-weighted voting (>2/3, 10s timeout) |
 | P2P | libp2p — WebRTC, WebSockets, circuit relay v2, GossipSub, Kademlia DHT |
-| Content storage | Helia/IPFS with Bitswap — content-addressed, encrypted, parallel chunks |
+| Content storage | @sinclair/smoke — content-addressed (SHA-256 CIDs), encrypted, HTTP-over-WebRTC block transfer |
 | Local persistence | IndexedDB — blocks, accounts, keyblobs, contracts survive relay downtime |
 | Max safe balance | `Number.MAX_SAFE_INTEGER` (milli-UNIT) |
 | Smart contract timeout | 3 seconds |
@@ -362,7 +380,7 @@ neuronchain/
 │   │   └── events.ts             # EventEmitter
 │   └── network/
 │       ├── libp2p-network.ts     # libp2p + GossipSub + IndexedDB
-│       ├── helia-store.ts        # Helia/IPFS content storage
+│       ├── smoke-store.ts        # Smoke content storage (IndexedDB + HTTP-over-WebRTC)
 │       ├── storage-manager.ts    # Storage deal lifecycle + 24h payments
 │       └── node.ts               # NeuronNode - orchestrates all layers
 ├── relay-server.js               # libp2p relay + circuit relay v2 (Node.js)
@@ -377,7 +395,7 @@ neuronchain/
 - **Bootstrap dependency**: libp2p still needs bootstrap nodes to find initial peers. Run multiple community bootstrap/relay nodes for mainnet.
 - **Relay on gossipsub path**: while browser-to-browser connections run over circuit relay (before WebRTC upgrade), the relay node must also participate in GossipSub to route messages between those peers. Once peers upgrade to direct WebRTC, the relay is off the data path. For true relay-independence, run multiple independent community relays.
 - **Auto-receive timing window**: `autoReceive` fires when the recipient's node receives the SEND block via GossipSub. If the recipient was briefly disconnected, they can claim the pending receive manually (Transfer → Pending Receives). The sender re-broadcasts every 20s so auto-receive will eventually fire.
-- **Waku alternative**: Waku (built on libp2p) provides a ready bootstrap fleet and built-in message store, but has a 150KB message size limit that prevents direct content storage. libp2p + Helia is the correct choice when storing arbitrary content.
+- **Waku alternative**: Waku (built on libp2p) provides a ready bootstrap fleet and built-in message store, but has a 150KB message size limit that prevents direct content storage. libp2p + smoke is the correct choice when storing arbitrary content.
 - **Face uniqueness**: enforced locally via Euclidean distance on 128-dim descriptors. A global uniqueness proof (ZK biometrics) is an open research problem.
 - **BFT finality**: optimistic confirmation with conflict voting is not BFT. Under a 33%+ Sybil attack, forks can persist. Full BFT (e.g., HotStuff) is a future upgrade path.
 

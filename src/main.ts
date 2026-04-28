@@ -171,6 +171,7 @@ function promptPin(
     const showError = (message: string) => {
       subtitleEl.innerHTML = `<span style="color:var(--danger)">${message}</span>`;
       dots.forEach(d => {
+        d.style.opacity = '';
         d.style.background = 'var(--danger)';
         d.style.borderColor = 'var(--danger)';
       });
@@ -201,6 +202,9 @@ function promptPin(
       validating = true;
       btnOk.disabled = true;
       btnCancel.disabled = true;
+      // Show immediate visual feedback while async validation (PBKDF2) runs
+      subtitleEl.innerHTML = '<span style="color:var(--text-muted)"><span class="spinner"></span> Verifying…</span>';
+      dots.forEach(d => { d.style.opacity = '0.45'; });
       const result = await validate(pin);
       if (result === 'ok') { finish(pin); return; }
       if (result === 'cancel') { finish(null); return; }
@@ -218,7 +222,7 @@ function promptPin(
       // Strip non-digits
       input.value = input.value.replace(/\D/g, '').slice(0, 4);
       updateDots();
-      if (input.value.length === 4) setTimeout(tryConfirm, 180);
+      if (input.value.length === 4) setTimeout(tryConfirm, 80);
     });
   });
 }
@@ -855,7 +859,14 @@ function refreshChain() {
           <td>${copyBtn(b.hash)}</td>
           <td><span class="badge badge-${b.type === 'send' ? 'transfer' : b.type === 'receive' ? 'create' : b.type === 'deploy' ? 'deploy' : b.type === 'call' ? 'call' : 'verify'}">${b.type}</span></td>
           <td>${resolveName(b.accountPub)}</td>
-          <td>${b.type === 'send' ? '-' + formatUNIT(b.amount || 0) : b.type === 'receive' ? '+' + formatUNIT(b.receiveAmount || 0) : b.type === 'open' ? '+' + formatUNIT(VERIFICATION_MINT_AMOUNT) : '-'}</td>
+          <td>${
+            b.type === 'send' ? '-' + formatUNIT(b.amount || 0) :
+            b.type === 'receive' ? '+' + formatUNIT(b.receiveAmount || 0) :
+            b.type === 'open' ? '+' + formatUNIT(VERIFICATION_MINT_AMOUNT) :
+            b.type === 'storage-register' && b.contractData ? (() => { try { return (JSON.parse(b.contractData) as { capacityGB: number }).capacityGB + ' GB'; } catch { return '-'; } })() :
+            b.type === 'storage-deregister' && b.contractData ? (() => { try { return `-${(JSON.parse(b.contractData) as { capacityGB: number }).capacityGB} GB`; } catch { return '0 GB'; } })() :
+            '-'
+          }</td>
           <td style="color:${statusColor}">${status}</td>
         </tr>`;
       }).join('');
@@ -1113,8 +1124,10 @@ function renderExplorerRow(b: AccountBlock): string {
   } else if (b.type === 'storage-register' && b.contractData) {
     try {
       const d = JSON.parse(b.contractData) as { capacityGB: number };
-      name = `${d.capacityGB} GB`;
+      amount = `${d.capacityGB} GB`;
     } catch { /* skip */ }
+  } else if (b.type === 'storage-deregister' && b.contractData) {
+    try { amount = `-${(JSON.parse(b.contractData) as { capacityGB: number }).capacityGB} GB`; } catch { amount = '0 GB'; }
   }
 
   return `<tr>
@@ -2150,6 +2163,8 @@ function stopRefreshInterval() {
 
 interface ContentRecord {
   cid: string;
+  /** Inner content CID (the actual data block, separate from the meta envelope) */
+  contentCid?: string;
   name: string;
   contentType: string;
   mimeType: string;
@@ -2185,9 +2200,21 @@ function removeFromContentLibrary(cid: string): void {
   saveContentLibrary(loadContentLibrary().filter(r => r.cid !== cid));
 }
 
-(window as unknown as Record<string, unknown>)['removeFromLibraryAndRefresh'] = (cid: string) => {
+(window as unknown as Record<string, unknown>)['removeFromLibraryAndRefresh'] = async (cid: string) => {
+  const record = loadContentLibrary().find(r => r.cid === cid);
   removeFromContentLibrary(cid);
   refreshStorage();
+
+  if (node.store.isStarted() && record) {
+    const cids = [cid, ...(record.contentCid ? [record.contentCid] : [])];
+    const keys = node.localKeys.get(record.ownerPub);
+    if (keys) {
+      await node.deleteContent(cids, record.ownerPub, keys).catch(() => {});
+    } else {
+      // Keys not loaded (e.g. wallet locked) — delete locally only
+      for (const c of cids) await node.store.deleteBlock(c).catch(() => {});
+    }
+  }
 };
 
 (window as unknown as Record<string, unknown>)['fillRetrieveCid'] = (cid: string) => {
@@ -2396,7 +2423,7 @@ $('#btnServeStorage')?.addEventListener('click', async () => {
 
   const acc = localAccounts.find(a => a.pub === pub);
   if (!acc) { toast('Account not found', 'error'); return; }
-  if (!node.helia.isStarted()) { toast('Start the node first', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Start the node first', 'error'); return; }
 
   const result = await node.registerStorage(pub, capacityGB, acc.keys);
   if (result.success) {
@@ -2452,7 +2479,7 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
   const pub = $<HTMLSelectElement>('#storageContentFrom').value;
   const acc = localAccounts.find(a => a.pub === pub);
   if (!acc) { toast('Select an account', 'error'); return; }
-  if (!node.helia.isStarted()) { toast('Node not started', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Node not started', 'error'); return; }
 
   const contentType = $<HTMLSelectElement>('#storageContentType').value;
   const contentName = $<HTMLInputElement>('#storageContentName').value.trim() || contentType;
@@ -2529,8 +2556,8 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     const isEncrypted = visibility === 'private';
 
     const storeResult = isEncrypted
-      ? await node.helia.storeWithMeta(data, { mimeType, name: finalName }, acc.keys)
-      : await node.helia.storeWithMetaPublic(data, { mimeType, name: finalName });
+      ? await node.store.storeWithMeta(data, { mimeType, name: finalName }, acc.keys)
+      : await node.store.storeWithMetaPublic(data, { mimeType, name: finalName });
 
     const { cid } = storeResult;
     const contentCid = (storeResult.meta as { contentCid?: string }).contentCid;
@@ -2547,7 +2574,7 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     resultEl.style.display = 'block';
     resultEl.innerHTML = `<strong>Stored!</strong> (${visLabel})&nbsp; CID: <span>${escHtml(cid)}</span> ${cpBtn(cid)}`;
 
-    addToContentLibrary({ cid, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
+    addToContentLibrary({ cid, contentCid, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
     toast(`Content stored (${visLabel})`, 'success');
     refreshStorage();
   } catch (err) {
@@ -2562,7 +2589,7 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
 
   const pub = $<HTMLSelectElement>('#retrieveContentFrom').value;
   const acc = localAccounts.find(a => a.pub === pub);
-  if (!node.helia.isStarted()) { toast('Node not started', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Node not started', 'error'); return; }
 
   const resultEl = $('#retrieveResult');
   resultEl.style.display = 'block';
@@ -2575,44 +2602,21 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
   // Encrypted content requires the owner's keys; public content does not
   if (hint === 'encrypted' && !acc) { toast('Select the owner account to decrypt', 'error'); return; }
 
-  // Retry loop: peers may not have a circuit-relay reservation immediately after
-  // the relay restarts, so give up to 3 attempts with 12s between each.
-  // Each attempt re-runs connectToKnownPeers so that newly-registered peers
-  // (whose self:peer:update fires a few seconds after reconnecting) are dialed.
-  const MAX_ATTEMPTS = 3;
-  let result: Awaited<ReturnType<typeof node.helia.retrieveAuto>> = undefined;
+  let result: Awaited<ReturnType<typeof node.store.retrieveAuto>> = undefined;
   let lastErr: unknown;
 
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    if (attempt > 0) {
-      resultEl.innerHTML = `<span class="spinner"></span> Waiting for peer relay reservation… (attempt ${attempt + 1}/${MAX_ATTEMPTS})`;
-      await new Promise(r => setTimeout(r, 20_000));
-    }
-
-    try {
-      // Ensure direct libp2p connections to known peers so BitSwap WANT messages
-      // reach content providers (not just the relay).
-      await node.connectToKnownPeers();
-
-      const connsAfter = (node.net.libp2p?.getConnections?.() ?? []);
-      console.log(`[Retrieve] attempt ${attempt + 1} conns=${connsAfter.length}: ${connsAfter.map(c => c.remotePeer.toString().slice(0, 12)).join(', ') || 'none'}`);
-      console.log(`[Retrieve] fetching CID ${cid.slice(0, 24)}… hint=${hint}`);
-
-      // If we know it's public, skip the encrypted attempt to avoid spurious errors
-      result = hint === 'public'
-        ? await node.helia.retrieveAuto(cid)
-        : await node.helia.retrieveAuto(cid, acc?.keys);
-
-      if (result) break; // success
-    } catch (err) {
-      lastErr = err;
-      console.warn(`[Retrieve] attempt ${attempt + 1} failed:`, err instanceof Error ? err.message : String(err));
-    }
+  try {
+    result = hint === 'public'
+      ? await node.store.retrieveAuto(cid)
+      : await node.store.retrieveAuto(cid, acc?.keys);
+  } catch (err) {
+    lastErr = err;
   }
 
   try {
     if (!result) {
-      resultEl.innerHTML = `<span style="color:var(--danger)">Content not found after ${MAX_ATTEMPTS} attempts. Ensure the uploader's node is running and has a relay reservation. ${lastErr instanceof Error ? escHtml(lastErr.message) : ''}</span>`;
+      const errMsg = lastErr instanceof Error ? escHtml(lastErr.message) : '';
+      resultEl.innerHTML = `<span style="color:var(--danger)">Content not found. Ensure the uploader's node is running and online. ${errMsg}</span>`;
       return;
     }
 
@@ -2653,7 +2657,7 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
 
     resultEl.innerHTML = `
       ${preview}
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;line-height:1.8;">
+      <div style="font-size:12px;color:var(--text-muted);margin-top:10px;margin-bottom:8px;line-height:1.8;">
         Visibility: <strong style="color:${wasEncrypted ? 'var(--warning)' : 'var(--accent)'}">${visLabel}</strong>
         &nbsp;|&nbsp; MIME: ${escHtml(mime)} &nbsp;|&nbsp; Size: ${sizeStr}${meta.name ? ` &nbsp;|&nbsp; Name: ${escHtml(meta.name)}` : ''}
       </div>
@@ -2703,7 +2707,7 @@ function getInfo() {
 const NFT_TEMPLATE_NAME = 'NFTCollection';
 const NFT_TEMPLATE_CODE = `// NFT Collection (ERC-721 style)
 // Deploy with:  init("My Collection", "MNFT")
-// Mint with:    mint("My artwork title", "<helia-cid>")
+// Mint with:    mint("My artwork title", "<content-cid>")
 // Transfer with: transfer(1, "recipient_pub_key")
 function init(name, symbol) {
   if (state.initialized) return { error: 'already initialized' };
@@ -2719,7 +2723,7 @@ function mint(metadata, cid) {
   state.tokens[id] = {
     owner: caller,
     metadata,
-    cid,      // Helia/IPFS content CID (image, video, etc.)
+    cid,      // content CID (image, video, etc.)
     mintedAt: Date.now()
   };
   return { tokenId: id, owner: caller, cid };

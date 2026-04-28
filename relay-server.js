@@ -34,6 +34,7 @@ import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { promises as fs } from 'fs';
 import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
 import { AbstractMessageStream } from '@libp2p/utils';
 import { GossipSub } from '@chainsafe/libp2p-gossipsub';
 
@@ -144,12 +145,11 @@ async function main() {
         reservations: {
           maxReservations: 1024,
           reservationTtl: 2 * 60 * 60 * 1000, // 2h
-          // Default data limit is 128 KB per circuit — far too small for BitSwap
-          // block transfers (max IPFS block = 256 KB; a 10 MB file = ~40 blocks).
-          // Set to 1 GB so BitSwap can freely exchange blocks over circuit relay.
+          // Default data limit is 128 KB per circuit — raise it so large content
+          // transfers (signaling, libp2p protocol messages) can complete freely.
           defaultDataLimit: BigInt(1 << 30), // 1 GB per circuit
-          // Default duration limit is 2 minutes — too short for large transfers.
-          // Set to 1 hour so long-running BitSwap sessions don't get cut off.
+          // Default duration limit is 2 minutes — raise it for long-running sessions.
+          // Set to 1 hour so smoke WebRTC sessions don't get cut off mid-transfer.
           defaultDurationLimit: 60 * 60 * 1000, // 1 hour in ms
         },
       }),
@@ -227,7 +227,6 @@ async function main() {
           sent++;
         }
       }
-      if (sent > 0) console.log(`[Relay] rebroadcast ${sent} live peer-addr(s) on ${topic}`);
     }, delayMs));
   }
 
@@ -242,7 +241,6 @@ async function main() {
           data: msg.data,
           timestamp: Date.now(),
         });
-        console.log(`[Relay] cached peer-addrs from ${decoded.peerId.slice(0,12)}: ${decoded.addrs.length} addr(s)`);
         // Re-broadcast after 1.5s so peers that joined the mesh slightly late
         // (GossipSub mesh formation takes up to ~2 heartbeats) still receive it.
         scheduleRebroadcast(msg.topic, 1500);
@@ -273,8 +271,6 @@ async function main() {
               replayed++;
             }
           }
-          if (replayed > 0) console.log(`[Relay] replayed ${replayed} live peer-addr(s) for new subscriber on ${topic}`);
-          else console.log(`[Relay] no live peer-addr cache entries for ${topic} (${peerAddrCache.size} total, ${connected.size} connected)`);
         }, 2000);
       }
     }
@@ -295,6 +291,57 @@ async function main() {
     } else {
       res.writeHead(404);
       res.end();
+    }
+  });
+
+  // ── Smoke Hub ──────────────────────────────────────────────────────────────
+  // WebSocket signaling server for @sinclair/smoke WebRTC connections.
+  // Browsers connect to ws://host:PORT+2/smoke-hub (proxied via Vite in dev).
+  // Each peer registers with its UUID address; the hub routes ICE/offer/answer
+  // messages between peers so smoke's Http-over-WebRTC layer can establish
+  // direct data-channel connections for block transfer.
+
+  const smokeHubWss = new WebSocketServer({ noServer: true });
+  /** address string → WebSocket */
+  const smokeHubPeers = new Map();
+
+  smokeHubWss.on('connection', (ws) => {
+    let address = null;
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (!address && msg.type === 'register' && typeof msg.address === 'string') {
+          address = msg.address;
+          smokeHubPeers.set(address, ws);
+          console.log(`[SmokeHub] Peer registered: ${address.slice(0, 8)}...`);
+          return;
+        }
+        if (address && typeof msg.to === 'string' && smokeHubPeers.has(msg.to)) {
+          const target = smokeHubPeers.get(msg.to);
+          if (target.readyState === 1 /* OPEN */) {
+            target.send(JSON.stringify({ ...msg, from: address }));
+          }
+        }
+      } catch { /* ignore malformed */ }
+    });
+
+    ws.on('close', () => {
+      if (address) {
+        smokeHubPeers.delete(address);
+        console.log(`[SmokeHub] Peer disconnected: ${address.slice(0, 8)}...`);
+        address = null;
+      }
+    });
+  });
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url === '/smoke-hub') {
+      smokeHubWss.handleUpgrade(req, socket, head, (ws) => {
+        smokeHubWss.emit('connection', ws, req);
+      });
+    } else {
+      socket.destroy();
     }
   });
 

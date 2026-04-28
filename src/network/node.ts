@@ -1,6 +1,6 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { Libp2pNetwork } from './libp2p-network';
-import { HeliaStore } from './helia-store';
+import { SmokeStore } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
 import { VoteManager, Vote } from '../core/vote';
@@ -34,8 +34,8 @@ export class NeuronNode extends EventEmitter {
   ledger: DAGLedger;
   /** libp2p P2P network layer */
   net: Libp2pNetwork;
-  /** Helia/IPFS content store */
-  helia: HeliaStore;
+  /** Smoke content store (IndexedDB + HTTP-over-WebRTC) */
+  store: SmokeStore;
   /** Storage deal lifecycle manager */
   storage: StorageManager;
 
@@ -57,8 +57,8 @@ export class NeuronNode extends EventEmitter {
     super();
     this.ledger = new DAGLedger(network);
     this.net = new Libp2pNetwork(network);
-    this.helia = new HeliaStore();
-    this.storage = new StorageManager(this.ledger, this.net, this.helia, this.localKeys);
+    this.store = new SmokeStore();
+    this.storage = new StorageManager(this.ledger, this.net, this.store, this.localKeys);
   }
 
   private eventsWired = false;
@@ -127,8 +127,10 @@ export class NeuronNode extends EventEmitter {
     this.ledger.on('contract:error',   (d: unknown) => this.emit('contract:error', d));
 
     this.net.on('peer:addrs', async (data: unknown) => {
-      const { peerId, addrs } = data as { peerId: string; addrs: string[] };
+      const { peerId, addrs, smokeAddr } = data as { peerId: string; addrs: string[]; smokeAddr?: string };
       await this.dialPeer(peerId, addrs);
+      // Register every peer's smoke Hub address so retrieve() can fetch from any peer
+      if (smokeAddr) this.store.addPeerFallback(smokeAddr);
     });
 
     this.net.on('peer:connected', (id: unknown) => {
@@ -161,7 +163,7 @@ export class NeuronNode extends EventEmitter {
 
     this.storage.on('storage:heartbeat-sent', (d: unknown) => this.emit('storage:heartbeat-sent', d));
     this.storage.on('storage:reward-issued',  (d: unknown) => this.emit('storage:reward-issued', d));
-    this.storage.on('storage:pinned',         (d: unknown) => this.emit('storage:pinned', d));
+    this.storage.on('storage:cached',          (d: unknown) => this.emit('storage:cached', d));
 
     for (const pub of this.localKeys.keys()) this.startInboxWatch(pub);
   }
@@ -169,14 +171,8 @@ export class NeuronNode extends EventEmitter {
   private async dialPeer(peerId: string, addrs: string[]): Promise<void> {
     if (!this.net.libp2p) return;
     const connected = this.net.libp2p.getConnections().some(c => c.remotePeer.toString() === peerId);
-    if (connected) {
-      console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: already connected`);
-      return;
-    }
-    if (this.dialingPeers.has(peerId)) {
-      console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: dial in progress, skipping`);
-      return;
-    }
+    if (connected) return;
+    if (this.dialingPeers.has(peerId)) return;
     this.dialingPeers.add(peerId);
     try {
 
@@ -195,18 +191,12 @@ export class NeuronNode extends EventEmitter {
     }
 
     const toTry = [...constructed, ...addrs];
-    console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: ${toTry.length} addr(s) (${constructed.length} via relay, ${addrs.length} received)`);
-
     for (const addrStr of toTry) {
       try {
         await this.net.libp2p.dial(multiaddr(addrStr));
-        console.log(`[Node] dialPeer ${peerId.slice(0, 12)}: connected via ${addrStr.slice(0, 40)}`);
         return;
-      } catch (err) {
-        console.warn(`[Node] dialPeer ${peerId.slice(0, 12)}: failed ${addrStr.slice(0, 40)} — ${err instanceof Error ? err.message : String(err)}`);
-      }
+      } catch { /* try next addr */ }
     }
-    console.warn(`[Node] dialPeer ${peerId.slice(0, 12)}: all addrs failed`);
     } finally {
       this.dialingPeers.delete(peerId);
     }
@@ -216,8 +206,6 @@ export class NeuronNode extends EventEmitter {
     const known = [...this.net.knownPeerAddrs.entries()];
     const myAddrs = (this.net.libp2p?.getMultiaddrs?.() ?? []).map(a => a.toString());
     const conns = (this.net.libp2p?.getConnections?.() ?? []).map(c => c.remotePeer.toString());
-    console.log(`[Node] connectToKnownPeers: ${known.length} known, ${conns.length} active conns`);
-    console.log(`[Node] my multiaddrs: ${myAddrs.join(' | ') || 'none'}`);
     for (const [peerId, addrs] of known) {
       await this.dialPeer(peerId, addrs);
     }
@@ -351,9 +339,10 @@ export class NeuronNode extends EventEmitter {
   async start(): Promise<void> {
     if (this.status !== 'stopped') return;
     await this.net.start();
-    // Pass the NeuronChain libp2p node so Helia shares peer connections instead
-    // of bootstrapping its own separate node off public IPFS infrastructure.
-    await this.helia.start(this.net.libp2p);
+    await this.store.start();
+    // Push our smoke Hub address into peer-addrs broadcasts so every peer
+    // can reach us for content retrieval even if they missed our CacheRequests.
+    this.store.getSmokeHostname().then(addr => { if (addr) this.net.setSmokeAddr(addr); });
     this.storage.start();
     this.wireEvents();
 
@@ -516,7 +505,7 @@ export class NeuronNode extends EventEmitter {
     if (this.resyncDebounce) { clearTimeout(this.resyncDebounce); this.resyncDebounce = null; }
     if (this.publishDebounce) { clearTimeout(this.publishDebounce); this.publishDebounce = null; }
     this.storage.stop();
-    await this.helia.stop();
+    await this.store.stop();
     await this.net.stop();
     this.net.removeAllListeners();
     this.ledger.removeAllListeners();
@@ -576,6 +565,22 @@ export class NeuronNode extends EventEmitter {
   async distributeContent(cids: string | string[], uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {
     const cidArr = Array.isArray(cids) ? cids : [cids];
     return this.storage.distributeContent(cidArr[0], uploaderPub, keys, cidArr.slice(1));
+  }
+
+  /**
+   * Delete content from local storage and broadcast a signed delete request so
+   * all caching providers also drop their copies immediately.
+   */
+  async deleteContent(cids: string[], ownerPub: string, keys: KeyPair): Promise<void> {
+    // Delete locally first
+    for (const cid of cids) {
+      await this.store.deleteBlock(cid);
+    }
+    // Broadcast to providers
+    const ts = Date.now();
+    const payload = `delete:${cids.join(',')}:${ownerPub}:${ts}`;
+    const signature = await signData(payload, keys);
+    this.net.publishDeleteRequest({ cids, ownerPub, timestamp: ts, signature });
   }
 
   getStats(): NodeStats {

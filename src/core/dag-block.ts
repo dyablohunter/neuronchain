@@ -81,7 +81,7 @@ export interface AccountBlock {
   contractData?: string;
 
   /**
-   * IPFS CID of content referenced or produced by this block.
+   * Content CID (SHA-256) of content referenced or produced by this block.
    * Can be used by social app posts, NFT media, etc.
    */
   contentCid?: string;

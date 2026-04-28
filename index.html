@@ -1458,7 +1458,7 @@ function getInfo() { return { name: state.name, symbol: state.symbol, totalSuppl
 
           <p style="margin-top: 12px;"><strong>NFT Contract (ERC-721 style) - with content CIDs:</strong></p>
           <pre style="background: var(--surface2); padding: 12px; border-radius: var(--radius); margin-top: 8px; font-family: var(--mono); font-size: 12px; overflow-x: auto;"><code>// Deploy with: init("MyNFTs", "MNFT")
-// Mint with:   mint("My artwork", "&lt;helia-cid&gt;")
+// Mint with:   mint("My artwork", "&lt;content-cid&gt;")
 function init(name, symbol) {
   if (state.initialized) return;
   state.name = name; state.symbol = symbol;
@@ -1490,12 +1490,12 @@ function myTokens() {
 
         <div class="help-section">
           <h3>Content Storage</h3>
-          <p>NeuronChain is a full content network. Posts, images, video, audio, HTML, CSS, JS, and JSON are stored <strong>on NeuronChain</strong> using its own content layer — not on any central server, and not on the public IPFS network. Content is served by NeuronChain peers only, using content-addressing (CIDs) and Bitswap for parallel chunk transfer.</p>
+          <p>NeuronChain is a full content network. Posts, images, video, audio, HTML, CSS, JS, and JSON are stored <strong>on NeuronChain</strong> using its own content layer — not on any central server. Content is served by NeuronChain peers directly via HTTP over WebRTC (<code>@sinclair/smoke</code>), with no dependency on any external network.</p>
           <ul>
             <li><strong>Content-addressed:</strong> every file is stored by its SHA-256 CID. Any peer serving wrong bytes is automatically rejected - tamper-evident by construction.</li>
             <li><strong>On-chain anchor:</strong> the CID is recorded in <code>block.contentCid</code> or smart contract state, creating an immutable provenance proof. The content hash is the receipt.</li>
             <li><strong>ECDSA-signed:</strong> every store action is signed by your account key regardless of visibility - public content is still authentically attributed to you.</li>
-            <li><strong>Served by any peer</strong> that holds a copy via Bitswap (parallel chunk transfer, BitTorrent-style). More holders = faster delivery.</li>
+            <li><strong>Served by any peer</strong> that holds a copy — smoke Http fetches blocks directly via WebRTC data channels. More holders = faster delivery.</li>
             <li><strong>IndexedDB persistence:</strong> content stored locally survives relay downtime - readable offline.</li>
           </ul>
           <p style="margin-top: 8px;"><strong>Dynamic visibility</strong> - choose per content item:</p>
@@ -1529,7 +1529,7 @@ function myTokens() {
             <li><strong>Face descriptor:</strong> 128 dimensions, quantized to 0.05 bins</li>
             <li><strong>Consensus:</strong> Optimistic confirmation, conflict-only stake-weighted voting (&gt;2/3 threshold, 10s timeout)</li>
             <li><strong>P2P:</strong> libp2p - WebRTC (browser&#8596;browser), WebSocket (browser&#8596;relay), circuit relay v2 (NAT traversal), GossipSub (pubsub), Kademlia DHT (peer discovery)</li>
-            <li><strong>Content storage:</strong> NeuronChain content layer (Helia/Bitswap internally) - content-addressed, encrypted, parallel chunk transfer across NeuronChain peers</li>
+            <li><strong>Content storage:</strong> NeuronChain content layer (<code>@sinclair/smoke</code>) - content-addressed (SHA-256 CIDs), encrypted, HTTP-over-WebRTC block transfer across NeuronChain peers</li>
             <li><strong>Persistence:</strong> IndexedDB (blocks, accounts, keyblobs, contracts) - no relay dependency</li>
             <li><strong>Keep-alive:</strong> Wake Lock API + Web Worker heartbeat + silent audio (prevents tab suspension)</li>
             <li><strong>dApp API:</strong> <code>NeuronChainAPI</code> - stable facade for building apps on NeuronChain</li>
