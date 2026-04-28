@@ -39,9 +39,11 @@ import { EventEmitter } from '../core/events';
 export { formatUNIT, parseUNIT };
 
 export interface ContentHandle {
-  /** IPFS CID - store in block.contentCid or contract state */
+  /** Meta CID (SHA-256) - store in block.contentCid or contract state */
   cid: string;
-  /** Original size in bytes */
+  /** Inner content CID — pass alongside cid to distributeContent so providers cache both blocks */
+  contentCid?: string;
+  /** Original byte length before encryption */
   size: number;
   mimeType: string;
   timestamp: number;
@@ -62,7 +64,7 @@ export class NeuronChainAPI extends EventEmitter {
       'contract:deployed', 'contract:executed', 'contract:error',
       'inbox:signal', 'auto:received', 'resync',
       'storage:registered', 'storage:deregistered', 'storage:heartbeat-sent',
-      'storage:reward-issued', 'storage:pinned',
+      'storage:reward-issued', 'storage:cached', 'storage:deleted',
       'node:started', 'node:stopped',
     ];
     for (const ev of events) {
@@ -113,7 +115,7 @@ export class NeuronChainAPI extends EventEmitter {
     return { block: result.block };
   }
 
-  // ── Content storage (Helia/IPFS) ─────────────────────────────────────────
+  // ── Content storage (smoke — IndexedDB + HTTP-over-WebRTC) ───────────────
 
   /**
    * Store encrypted content. Returns a ContentHandle with the CID.
@@ -128,40 +130,95 @@ export class NeuronChainAPI extends EventEmitter {
     keys: KeyPair,
     name?: string,
   ): Promise<ContentHandle> {
-    if (!this.node.helia.isStarted()) throw new Error('Node not started');
-    const result = await this.node.helia.storeWithMeta(data, { mimeType, name }, keys);
-    return { cid: result.cid, size: data.length, mimeType, timestamp: result.meta.timestamp };
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    const result = await this.node.store.storeWithMeta(data, { mimeType, name }, keys);
+    return { cid: result.cid, contentCid: result.meta.contentCid, size: data.length, mimeType, timestamp: result.meta.timestamp };
   }
 
-  /** Retrieve and decrypt content by CID. */
+  /** Retrieve and decrypt private content by CID. Throws if decryption fails. */
   async retrieveContent(cid: string, keys: KeyPair): Promise<Uint8Array> {
-    if (!this.node.helia.isStarted()) throw new Error('Node not started');
-    const result = await this.node.helia.retrieveWithMeta(cid, keys);
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    const result = await this.node.store.retrieveWithMeta(cid, keys);
     if (!result) throw new Error(`Content not found or decryption failed: ${cid}`);
     return result.data;
   }
 
+  /**
+   * Store public (unencrypted) content. Returns a ContentHandle with the CID.
+   * Anyone with the CID can retrieve this content without keys.
+   */
+  async storeContentPublic(
+    data: Uint8Array,
+    mimeType: string,
+    name?: string,
+  ): Promise<ContentHandle> {
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    const result = await this.node.store.storeWithMetaPublic(data, { mimeType, name });
+    return { cid: result.cid, contentCid: result.meta.contentCid, size: data.length, mimeType, timestamp: result.meta.timestamp };
+  }
+
+  /**
+   * Retrieve public (unencrypted) content by CID.
+   * Use this when the content was stored with `storeContentPublic`.
+   */
+  async retrieveContentPublic(cid: string): Promise<Uint8Array> {
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    const result = await this.node.store.retrieveWithMetaPublic(cid);
+    if (!result) throw new Error(`Content not found: ${cid}`);
+    return result.data;
+  }
+
+  /**
+   * Retrieve content by CID without knowing whether it was stored as public or private.
+   * Tries decryption first (if keys provided), then falls back to public read.
+   * Returns the data, metadata, and whether it was encrypted.
+   */
+  async retrieveContentAuto(
+    cid: string,
+    keys?: KeyPair,
+  ): Promise<{ data: Uint8Array; mimeType: string; size: number; wasEncrypted: boolean } | undefined> {
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    const result = await this.node.store.retrieveAuto(cid, keys);
+    if (!result) return undefined;
+    return {
+      data: result.data,
+      mimeType: result.meta.mimeType,
+      size: result.meta.size,
+      wasEncrypted: result.wasEncrypted,
+    };
+  }
+
+  /**
+   * Delete content locally and broadcast a signed delete request to all caching providers.
+   * Providers verify the owner's signature before dropping their copies.
+   * Pass all CIDs related to the content — the meta CID and the inner content CID if known.
+   */
+  async deleteContent(cids: string[], ownerPub: string, keys: KeyPair): Promise<void> {
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.deleteContent(cids, ownerPub, keys);
+  }
+
   /** Store a JSON object encrypted. Returns CID. */
   async storeJSON(data: unknown, keys: KeyPair): Promise<string> {
-    if (!this.node.helia.isStarted()) throw new Error('Node not started');
-    return this.node.helia.storeJSON(data, keys);
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.store.storeJSON(data, keys);
   }
 
   /** Retrieve and decrypt a JSON object. */
   async retrieveJSON<T>(cid: string, keys: KeyPair): Promise<T | undefined> {
-    if (!this.node.helia.isStarted()) throw new Error('Node not started');
-    return this.node.helia.retrieveJSON<T>(cid, keys);
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.store.retrieveJSON<T>(cid, keys);
   }
 
   /** Store raw text (HTML, CSS, JS, markdown) encrypted. Returns CID. */
   async storeText(text: string, keys: KeyPair): Promise<string> {
-    if (!this.node.helia.isStarted()) throw new Error('Node not started');
-    return this.node.helia.storeText(text, keys);
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.store.storeText(text, keys);
   }
 
   async retrieveText(cid: string, keys: KeyPair): Promise<string | undefined> {
-    if (!this.node.helia.isStarted()) throw new Error('Node not started');
-    return this.node.helia.retrieveText(cid, keys);
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.store.retrieveText(cid, keys);
   }
 
   // ── Smart Contracts ───────────────────────────────────────────────────────
@@ -235,7 +292,7 @@ export class NeuronChainAPI extends EventEmitter {
 
   /**
    * Distribute a stored CID to up to 10 network providers.
-   * Providers fetch the content via Helia/Bitswap and pin it locally.
+   * Providers fetch the content via smoke Http (HTTP over WebRTC) and pin it locally.
    * Returns the list of selected provider pub keys.
    */
   async distributeContent(cid: string, uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {

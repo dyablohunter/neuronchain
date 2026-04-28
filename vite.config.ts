@@ -17,6 +17,10 @@ export default defineConfig({
         ws: true,
         rewrite: (path) => path.replace(/^\/relay-ws/, '') || '/',
       },
+      '/smoke-hub': {
+        target: 'ws://localhost:9092',
+        ws: true,
+      },
     },
   },
   build: {
@@ -48,10 +52,7 @@ export default defineConfig({
       '@libp2p/identify',
       '@libp2p/ping',
       '@libp2p/bootstrap',
-      'helia',
-      '@helia/unixfs',
-      'blockstore-idb',
-      'datastore-idb',
+      '@sinclair/smoke',
       'idb',
       'multiformats',
       '@multiformats/multiaddr-matcher',
@@ -60,8 +61,5 @@ export default defineConfig({
       '@libp2p/utils',
       'buffer',
     ],
-    rolldownOptions: {
-      target: 'esnext',
-    },
   },
 });

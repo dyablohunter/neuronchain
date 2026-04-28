@@ -1,12 +1,17 @@
 import { NeuronNode } from './network/node';
-import { validateUsername, generateAccountKeys, buildAccount, AccountWithKeys } from './core/account';
+import { validateUsername, generateAccountKeys, buildAccount, AccountWithKeys, Account } from './core/account';
 import { NetworkType } from './core/dag-ledger';
 import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, captureFaceDescriptor } from './core/face-verify';
-import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob } from './core/face-store';
+import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, deriveFaceKey, encryptWithFaceKey, decryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
+import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
+import {
+  derivePinKey, encryptWithPinKey, decryptWithPinKey,
+  checkPinLockout, recordPinFailure, recordPinSuccess,
+  getBackoffMs, generatePinSalt, LockoutNotice,
+} from './core/pin-crypto';
 
 // ──── Single-tab lock ────
 if (!acquireTabLock()) {
@@ -26,8 +31,304 @@ const savedNetwork = (localStorage.getItem('neuronchain_network') || 'testnet') 
 let node = new NeuronNode(savedNetwork);
 let localAccounts: AccountWithKeys[] = [];
 let cameraStream: MediaStream | null = null;
+let isRecovering = false;
+let pendingGenerationReset = false;
 
 const WALLET_KEY = 'neuronchain_wallet';
+
+// ──── PIN Session Cache ────
+// Holds the derived CryptoKey per account for 5 minutes to avoid re-prompting on quick sequences.
+const PIN_CACHE_TTL_MS = 5 * 60 * 1000;
+const pinSessionCache = new Map<string, { key: CryptoKey; expiry: number }>();
+
+function getCachedPinKey(accountPub: string): CryptoKey | null {
+  const entry = pinSessionCache.get(accountPub);
+  if (!entry || entry.expiry < Date.now()) { pinSessionCache.delete(accountPub); return null; }
+  return entry.key;
+}
+
+function cachePinKey(accountPub: string, key: CryptoKey): void {
+  pinSessionCache.set(accountPub, { key, expiry: Date.now() + PIN_CACHE_TTL_MS });
+}
+
+function clearPinCache(accountPub?: string): void {
+  if (accountPub) pinSessionCache.delete(accountPub);
+  else pinSessionCache.clear();
+}
+
+// ──── PIN Dialog ────
+
+/**
+ * Show a modal PIN input dialog and resolve with the entered 4-digit PIN, or null if cancelled.
+ *
+ * When `validate` is provided the modal stays open on failure: it calls validate(pin),
+ * and if the result is not 'ok' or 'cancel' it treats the result as an error message,
+ * shakes the card, turns the dots red, and lets the user try again without reopening.
+ * Return 'ok' to accept, 'cancel' to dismiss (resolve null), or any string for an error.
+ */
+function promptPin(
+  title = 'Enter your PIN',
+  subtitle = '',
+  validate?: (pin: string) => Promise<'ok' | 'cancel' | string>,
+): Promise<string | null> {
+  return new Promise(resolve => {
+    // Inject shake keyframes once into the document
+    if (!document.getElementById('nc-pin-shake')) {
+      const s = document.createElement('style');
+      s.id = 'nc-pin-shake';
+      s.textContent = '@keyframes ncPinShake{0%,100%{transform:translateX(0)}15%{transform:translateX(-8px)}30%{transform:translateX(8px)}45%{transform:translateX(-6px)}60%{transform:translateX(6px)}75%{transform:translateX(-4px)}90%{transform:translateX(4px)}}';
+      document.head.appendChild(s);
+    }
+
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);';
+
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px 32px 28px;width:320px;text-align:center;box-shadow:0 24px 48px rgba(0,0,0,0.5);';
+
+    // Lock icon
+    const icon = document.createElement('div');
+    icon.style.cssText = 'font-size:32px;margin-bottom:12px;line-height:1;';
+    icon.textContent = '🔐';
+
+    const titleEl = document.createElement('h3');
+    titleEl.style.cssText = 'margin:0 0 6px;color:var(--text);font-size:17px;font-weight:700;letter-spacing:-0.01em;';
+    titleEl.textContent = title;
+
+    const subtitleEl = document.createElement('p');
+    subtitleEl.style.cssText = 'margin:0 0 20px;color:var(--text-muted);font-size:13px;min-height:18px;line-height:1.4;';
+    subtitleEl.innerHTML = subtitle;
+
+    // PIN dot indicators
+    const dotsRow = document.createElement('div');
+    dotsRow.style.cssText = 'display:flex;justify-content:center;gap:14px;margin-bottom:16px;';
+    const dots: HTMLElement[] = [];
+    for (let i = 0; i < 4; i++) {
+      const dot = document.createElement('div');
+      dot.style.cssText = 'width:14px;height:14px;border-radius:50%;border:2px solid var(--border);background:transparent;transition:background 0.15s,border-color 0.15s;';
+      dots.push(dot);
+      dotsRow.appendChild(dot);
+    }
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.inputMode = 'numeric';
+    input.maxLength = 4;
+    input.pattern = '[0-9]{4}';
+    input.autocomplete = 'off';
+    input.style.cssText = 'position:absolute;opacity:0;pointer-events:none;';
+
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:10px;margin-top:24px;';
+
+    const btnCancel = document.createElement('button');
+    btnCancel.textContent = 'Cancel';
+    btnCancel.style.cssText = 'flex:1;padding:10px 0;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--text-dim);font-size:14px;font-weight:500;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 0.15s;';
+    btnCancel.onmouseenter = () => { btnCancel.style.background = 'var(--surface2)'; };
+    btnCancel.onmouseleave = () => { btnCancel.style.background = 'transparent'; };
+
+    const btnOk = document.createElement('button');
+    btnOk.textContent = 'Confirm';
+    btnOk.style.cssText = 'flex:1;padding:10px 0;border-radius:10px;border:none;background:var(--primary);color:#fff;font-size:14px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 0.15s;';
+    btnOk.onmouseenter = () => { btnOk.style.background = 'var(--primary-hover)'; };
+    btnOk.onmouseleave = () => { btnOk.style.background = 'var(--primary)'; };
+
+    // Clicking anywhere on the card focuses the hidden input
+    card.addEventListener('click', () => input.focus());
+
+    const updateDots = () => {
+      const len = input.value.length;
+      dots.forEach((dot, i) => {
+        if (i < len) {
+          dot.style.background = 'var(--primary)';
+          dot.style.borderColor = 'var(--primary)';
+        } else {
+          dot.style.background = 'transparent';
+          dot.style.borderColor = 'var(--border)';
+        }
+      });
+    };
+
+    btnRow.appendChild(btnCancel);
+    btnRow.appendChild(btnOk);
+    card.appendChild(icon);
+    card.appendChild(titleEl);
+    card.appendChild(subtitleEl);
+    card.appendChild(dotsRow);
+    card.appendChild(input);
+    card.appendChild(btnRow);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    // Focus hidden input; slight delay so overlay is mounted
+    setTimeout(() => input.focus(), 50);
+
+    const finish = (value: string | null) => {
+      document.body.removeChild(overlay);
+      resolve(value);
+    };
+
+    const showError = (message: string) => {
+      subtitleEl.innerHTML = `<span style="color:var(--danger)">${message}</span>`;
+      dots.forEach(d => {
+        d.style.opacity = '';
+        d.style.background = 'var(--danger)';
+        d.style.borderColor = 'var(--danger)';
+      });
+      // Restart animation even if already playing (force reflow trick)
+      card.style.animation = 'none';
+      void card.offsetWidth;
+      card.style.animation = 'ncPinShake 0.45s ease';
+      card.addEventListener('animationend', () => {
+        card.style.animation = '';
+        input.value = '';
+        updateDots();
+        btnOk.disabled = false;
+        btnCancel.disabled = false;
+        setTimeout(() => input.focus(), 50);
+      }, { once: true });
+    };
+
+    let validating = false;
+
+    const tryConfirm = async () => {
+      if (validating) return;
+      const pin = input.value.trim();
+      if (!/^\d{4}$/.test(pin)) {
+        showError('Enter exactly 4 digits');
+        return;
+      }
+      if (!validate) { finish(pin); return; }
+      validating = true;
+      btnOk.disabled = true;
+      btnCancel.disabled = true;
+      // Show immediate visual feedback while async validation (PBKDF2) runs
+      subtitleEl.innerHTML = '<span style="color:var(--text-muted)"><span class="spinner"></span> Verifying…</span>';
+      dots.forEach(d => { d.style.opacity = '0.45'; });
+      const result = await validate(pin);
+      if (result === 'ok') { finish(pin); return; }
+      if (result === 'cancel') { finish(null); return; }
+      validating = false;
+      showError(result);
+    };
+
+    btnOk.addEventListener('click', tryConfirm);
+    btnCancel.addEventListener('click', () => finish(null));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') tryConfirm();
+      if (e.key === 'Escape') finish(null);
+    });
+    input.addEventListener('input', () => {
+      // Strip non-digits
+      input.value = input.value.replace(/\D/g, '').slice(0, 4);
+      updateDots();
+      if (input.value.length === 4) setTimeout(tryConfirm, 80);
+    });
+  });
+}
+
+/**
+ * Require PIN confirmation for a sensitive action.
+ *
+ * Checks lockout state, returns true if the user is authorised to proceed.
+ * Returns false if the user cancels, is locked out, or fails the PIN check.
+ * Legacy accounts (no PIN configured) return true immediately.
+ *
+ * The derived PIN key is cached in pinSessionCache for 5 minutes.
+ */
+async function requirePin(account: AccountWithKeys): Promise<boolean> {
+  const acc = account as AccountWithKeys & { pinSalt?: string; pinVerifier?: string };
+  const { pub } = acc;
+  let pinSalt = acc.pinSalt;
+  let pinVerifier = acc.pinVerifier;
+
+  // If missing from the in-memory account (wallet created before PIN propagation was
+  // fixed, or loaded without these fields), try to fetch them from the key blob in IDB.
+  if (!pinSalt || !pinVerifier) {
+    const blobData = await node.net.loadKeyBlob(pub)
+      || await node.net.findKeyBlobByUsername(acc.username);
+    if (blobData) {
+      pinSalt = blobData.pinSalt ? String(blobData.pinSalt) : undefined;
+      pinVerifier = blobData.pinVerifier ? String(blobData.pinVerifier) : undefined;
+      if (pinSalt && pinVerifier) {
+        // Patch the live account object and persist so this lookup only happens once
+        Object.assign(acc, { pinSalt, pinVerifier });
+        saveWallet();
+      }
+    }
+  }
+
+  // No PIN configured on this account — allow without PIN
+  if (!pinSalt || !pinVerifier) return true;
+
+  // Check session cache — PIN already verified recently
+  if (getCachedPinKey(pub)) return true;
+
+  // Check lockout
+  const lockout = await checkPinLockout(pub);
+  if (lockout.locked) {
+    const remaining = Math.ceil(lockout.remainingMs / 1000);
+    const mins = Math.floor(remaining / 60);
+    const secs = remaining % 60;
+    const msg = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    toast(`PIN locked — try again in ${msg}`, 'error');
+    return false;
+  }
+
+  const saltBytes = Uint8Array.from(atob(pinSalt), c => c.charCodeAt(0));
+  const storedVerifier = pinVerifier;
+
+  const pin = await promptPin('Enter your PIN', '', async (enteredPin) => {
+    const pinKey = await derivePinKey(enteredPin, saltBytes);
+
+    // Verify against stored verifier (fast — no full blob decryption needed)
+    const result = await decryptWithPinKey(storedVerifier, pinKey);
+    if (result === 'PINOK') {
+      await recordPinSuccess(pub);
+      cachePinKey(pub, pinKey);
+      return 'ok';
+    }
+
+    // Wrong PIN
+    const state = await recordPinFailure(pub);
+    const backoffMs = getBackoffMs(state.failedAttempts);
+
+    // Publish decentralised lockout notice when backoff kicks in
+    if (backoffMs > 0 && node.net.running) {
+      const notice: LockoutNotice = {
+        accountPub: pub,
+        failedAttempts: state.failedAttempts,
+        lockedUntil: state.lockedUntil,
+        timestamp: Date.now(),
+      };
+      node.net.publishLockout(notice);
+    }
+
+    if (state.lockedUntil > Date.now()) {
+      const remaining = Math.ceil((state.lockedUntil - Date.now()) / 1000);
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      toast(`Wrong PIN — locked for ${mins > 0 ? `${mins}m ${secs}s` : `${secs}s`}`, 'error');
+      return 'cancel';
+    }
+
+    return `Wrong PIN (attempt ${state.failedAttempts}) — try again`;
+  });
+
+  return pin !== null;
+}
+
+/** Prompt user to set a new 4-digit PIN, confirming entry twice. Returns the PIN string or null. */
+async function promptSetPin(): Promise<string | null> {
+  while (true) {
+    const pin1 = await promptPin('Set a 4-digit PIN', 'This PIN will be required for sensitive actions');
+    if (pin1 === null) return null;
+    const pin2 = await promptPin('Confirm your PIN', 'Enter the same PIN again to confirm');
+    if (pin2 === null) return null;
+    if (pin1 === pin2) return pin1;
+    toast('PINs do not match — try again', 'error');
+  }
+}
 
 // ──── DOM Helpers ────
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
@@ -44,6 +345,79 @@ function toast(msg: string, type: 'success' | 'error' | 'info' = 'info') {
 const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString();
 const trunc = (s: string, n = 16) => s.length <= n ? s : s.slice(0, n) + '...';
 
+// ──── Compact backup key encoding (Base58) ────
+// Keys are stored as base64(JWK JSON). Each P-256 JWK private key contains
+// three 32-byte fields: d (private scalar), x and y (public point).
+// We pack all 6 × 32 = 192 bytes and Base58-encode them → ~263 chars.
+// Public keys (pub, epub) are re-derived via Web Crypto on import.
+// PQ keys are recoverable from the face+PIN blob independently.
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function base58Encode(bytes: Uint8Array): string {
+  let num = BigInt(0);
+  for (const b of bytes) num = (num << 8n) | BigInt(b);
+  let result = '';
+  while (num > 0n) { result = BASE58_ALPHABET[Number(num % 58n)] + result; num /= 58n; }
+  for (const b of bytes) { if (b !== 0) break; result = '1' + result; }
+  return result;
+}
+
+function base58Decode(str: string): Uint8Array {
+  let num = BigInt(0);
+  for (const ch of str) {
+    const idx = BASE58_ALPHABET.indexOf(ch);
+    if (idx < 0) throw new Error('Invalid Base58 character');
+    num = num * 58n + BigInt(idx);
+  }
+  const bytes: number[] = [];
+  while (num > 0n) { bytes.unshift(Number(num & 0xffn)); num >>= 8n; }
+  for (const ch of str) { if (ch !== '1') break; bytes.unshift(0); }
+  return new Uint8Array(bytes);
+}
+
+// base64url ↔ standard base64 helpers
+const b64urlToB64 = (s: string) => s.replace(/-/g, '+').replace(/_/g, '/').padEnd(s.length + (4 - s.length % 4) % 4, '=');
+const b64ToB64url = (s: string) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+function encodeBackupKey(keys: KeyPair): string {
+  const pJwk = JSON.parse(atob(keys.priv))  as { d: string; x: string; y: string };
+  const eJwk = JSON.parse(atob(keys.epriv)) as { d: string; x: string; y: string };
+  const dec = (s: string) => Uint8Array.from(atob(b64urlToB64(s)), c => c.charCodeAt(0));
+  const combined = new Uint8Array(192);
+  let off = 0;
+  for (const chunk of [pJwk.d, pJwk.x, pJwk.y, eJwk.d, eJwk.x, eJwk.y]) {
+    combined.set(dec(chunk), off); off += 32;
+  }
+  return base58Encode(combined);
+}
+
+async function decodeBackupKey(code: string): Promise<Pick<KeyPair, 'pub' | 'priv' | 'epub' | 'epriv'> | null> {
+  try {
+    const bytes = base58Decode(code.trim());
+    if (bytes.length !== 192) return null;
+    const enc = (b: Uint8Array) => b64ToB64url(btoa(String.fromCharCode(...b)));
+    const [d1, x1, y1, d2, x2, y2] = [0, 32, 64, 96, 128, 160].map((o) => enc(bytes.slice(o, o + 32)));
+
+    const privJwk  = { crv: 'P-256', d: d1, ext: true, key_ops: ['sign'],   kty: 'EC', x: x1, y: y1 };
+    const eprivJwk = { crv: 'P-256', d: d2, ext: true, key_ops: ['deriveKey'], kty: 'EC', x: x2, y: y2 };
+
+    // Re-derive canonical public keys via Web Crypto (ensures pub matches on-chain format)
+    const sigKey  = await crypto.subtle.importKey('jwk', privJwk,  { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+    const encKey  = await crypto.subtle.importKey('jwk', eprivJwk, { name: 'ECDH',  namedCurve: 'P-256' }, true, ['deriveKey']);
+    // exportKey for private key returns JWK with x,y,d — strip d to get public JWK
+    const sigJwk  = await crypto.subtle.exportKey('jwk', sigKey)  as Record<string, unknown>;
+    const encJwk  = await crypto.subtle.exportKey('jwk', encKey)  as Record<string, unknown>;
+    const toPub   = (jwk: Record<string, unknown>, ops: string[]) => { const { d: _, ...pub } = jwk; return btoa(JSON.stringify({ ...pub, key_ops: ops })); };
+
+    return {
+      priv:  btoa(JSON.stringify({ ...sigJwk,  key_ops: ['sign'] })),
+      epub:  toPub(encJwk, []),
+      epriv: btoa(JSON.stringify({ ...encJwk,  key_ops: ['deriveKey'] })),
+      pub:   toPub(sigJwk, ['verify']),
+    };
+  } catch { return null; }
+}
+
 /** Escape HTML to prevent XSS when inserting user-supplied data into innerHTML */
 function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -52,14 +426,114 @@ function escHtml(s: string): string {
 const cpBtn = (text: string) => `<button class="btn-copy" onclick="navigator.clipboard.writeText('${escHtml(text)}')" title="Copy">&#x2398;</button>`;
 const copyBtn = (text: string, display?: string) => `${cpBtn(text)}<span class="hash truncate">${escHtml(display || trunc(text, 14))}</span>`;
 
-function addLog(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info') {
-  const log = $('#nodeLog');
+const logBuffer: { html: string; level: string }[] = [];
+let unreadLogCount = 0;
+
+function makeLogEntry(msg: string, level: string): HTMLElement {
   const entry = document.createElement('div');
   entry.className = `log-entry ${level}`;
   entry.innerHTML = `<span class="time">[${fmtTime(Date.now())}]</span><span class="msg">${escHtml(msg)}</span>`;
-  log.appendChild(entry);
-  log.scrollTop = log.scrollHeight;
+  return entry;
 }
+
+function addLog(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info') {
+  const entry = makeLogEntry(msg, level);
+  const html = entry.outerHTML;
+
+  // Keep buffer bounded
+  logBuffer.push({ html, level });
+  if (logBuffer.length > 500) logBuffer.shift();
+
+  // Write to Node-tab console (may not exist yet during early init)
+  const log = document.querySelector('#nodeLog');
+  if (log) { log.appendChild(entry.cloneNode(true)); log.scrollTop = log.scrollHeight; }
+
+  // Write to mobile panel if open, otherwise increment badge
+  const panel = document.getElementById('mobileLogPanel');
+  const scroller = document.getElementById('mobileLogScroller');
+  if (panel?.classList.contains('open') && scroller) {
+    scroller.appendChild(entry);
+    scroller.scrollTop = scroller.scrollHeight;
+  } else {
+    unreadLogCount++;
+    const badge = document.getElementById('logFabBadge');
+    if (badge) {
+      badge.textContent = unreadLogCount > 99 ? '99+' : String(unreadLogCount);
+      badge.style.display = 'flex';
+    }
+  }
+}
+
+// Intercept all console.* calls so every module's logs appear in the custom console.
+// Originals are preserved so browser devtools still work normally.
+{
+  const _log   = console.log.bind(console);
+  const _info  = console.info.bind(console);
+  const _warn  = console.warn.bind(console);
+  const _error = console.error.bind(console);
+
+  const fmt = (args: unknown[]) => args.map(a =>
+    typeof a === 'string' ? a : (() => { try { return JSON.stringify(a); } catch { return String(a); } })()
+  ).join(' ');
+
+  console.log   = (...a: unknown[]) => { _log(...a);   addLog(fmt(a), 'info'); };
+  console.info  = (...a: unknown[]) => { _info(...a);  addLog(fmt(a), 'info'); };
+  console.warn  = (...a: unknown[]) => { _warn(...a);  addLog(fmt(a), 'warn'); };
+  console.error = (...a: unknown[]) => { _error(...a); addLog(fmt(a), 'error'); };
+}
+
+// Wire up log FAB and panel after DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+  const fab = document.getElementById('logFab');
+  const panel = document.getElementById('mobileLogPanel');
+  const scroller = document.getElementById('mobileLogScroller');
+  const closeBtn = document.getElementById('mobileLogClose');
+  const copyBtn = document.getElementById('mobileLogCopy');
+  const clearBtn = document.getElementById('mobileLogClear');
+  const badge = document.getElementById('logFabBadge');
+  if (!fab || !panel || !scroller || !closeBtn || !copyBtn || !clearBtn || !badge) return;
+
+  const openPanel = () => {
+    // Populate from buffer (replace scroller contents)
+    scroller.innerHTML = logBuffer.map(e => e.html).join('');
+    panel.classList.add('open');
+    scroller.scrollTop = scroller.scrollHeight;
+    // Reset badge
+    unreadLogCount = 0;
+    badge.style.display = 'none';
+  };
+
+  const closePanel = () => panel.classList.remove('open');
+
+  fab.addEventListener('click', () => {
+    if (panel.classList.contains('open')) closePanel(); else openPanel();
+  });
+  closeBtn.addEventListener('click', closePanel);
+
+  clearBtn.addEventListener('click', () => {
+    logBuffer.length = 0;
+    scroller.innerHTML = '';
+    unreadLogCount = 0;
+    badge.style.display = 'none';
+    // Also clear the Node-tab console
+    const nodeLog = document.querySelector('#nodeLog');
+    if (nodeLog) nodeLog.innerHTML = '';
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    const text = logBuffer.map(e => {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = e.html;
+      return tmp.textContent ?? '';
+    }).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      const orig = copyBtn.innerHTML;
+      copyBtn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="var(--success)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="2,8 6,12 14,4"/></svg>';
+      setTimeout(() => { copyBtn.innerHTML = orig; }, 1200);
+    } catch { /* clipboard denied */ }
+  });
+});
 
 function resolveNamePlain(pub: string): string {
   if (!pub) return '-';
@@ -160,7 +634,7 @@ function showAccountDetail(pub: string) {
         <div class="stat-item"><div class="stat-label">Public Key</div><div class="stat-value small">${cpBtn(pub)}${escHtml(trunc(pub, 24))}</div></div>
         <div class="stat-item"><div class="stat-label">UNIT Balance</div><div class="stat-value">${formatUNIT(balance)} UNIT</div></div>
         <div class="stat-item"><div class="stat-label">Blocks</div><div class="stat-value">${chain.length}</div></div>
-        ${acc ? `<div class="stat-item"><div class="stat-label">Generation</div><div class="stat-value">${acc.generation ?? 0}</div></div>` : ''}
+        ${acc ? `<div class="stat-item"><div class="stat-label">Generation</div><div class="stat-value">${(acc as unknown as Record<string, unknown>).generation ?? 0}</div></div>` : ''}
       </div>
     </div>
 
@@ -210,20 +684,38 @@ function showAccountDetail(pub: string) {
 const SESSION_KEY_NAME = 'neuronchain_session_key';
 
 async function getOrCreateSessionKey(): Promise<CryptoKey> {
-  const existing = sessionStorage.getItem(SESSION_KEY_NAME);
-  if (existing) {
-    const raw = Uint8Array.from(atob(existing), c => c.charCodeAt(0));
+  // Use localStorage so the key survives page reloads (including location.reload()).
+  // sessionStorage is cleared by mobile browsers (especially iOS Safari) on reload,
+  // which broke wallet decryption and silently wiped all accounts after any reload.
+  const fromLocal = localStorage.getItem(SESSION_KEY_NAME);
+  if (fromLocal) {
+    const raw = Uint8Array.from(atob(fromLocal), c => c.charCodeAt(0));
+    return crypto.subtle.importKey('raw', raw, 'AES-GCM', true, ['encrypt', 'decrypt']);
+  }
+  // Migrate from sessionStorage if still available (same browser session, first upgrade)
+  const fromSession = sessionStorage.getItem(SESSION_KEY_NAME);
+  if (fromSession) {
+    localStorage.setItem(SESSION_KEY_NAME, fromSession);
+    sessionStorage.removeItem(SESSION_KEY_NAME);
+    const raw = Uint8Array.from(atob(fromSession), c => c.charCodeAt(0));
     return crypto.subtle.importKey('raw', raw, 'AES-GCM', true, ['encrypt', 'decrypt']);
   }
   const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   const exported = await crypto.subtle.exportKey('raw', key);
-  sessionStorage.setItem(SESSION_KEY_NAME, btoa(String.fromCharCode(...new Uint8Array(exported))));
+  localStorage.setItem(SESSION_KEY_NAME, btoa(String.fromCharCode(...new Uint8Array(exported))));
   return key;
 }
 
 async function saveWallet() {
   const data = JSON.stringify(
-    localAccounts.map((a) => ({ username: a.username, pub: a.pub, keys: a.keys, createdAt: a.createdAt, faceMapHash: a.faceMapHash }))
+    localAccounts.map((a) => {
+      const acc = a as AccountWithKeys & { pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string };
+      return {
+        username: a.username, pub: a.pub, keys: a.keys, createdAt: a.createdAt, faceMapHash: a.faceMapHash,
+        pinSalt: acc.pinSalt, pinVerifier: acc.pinVerifier, linkedAnchor: acc.linkedAnchor,
+        pqPub: acc.pqPub, pqKemPub: acc.pqKemPub, encryptedFaceDescriptor: acc.encryptedFaceDescriptor,
+      };
+    })
   );
   try {
     const key = await getOrCreateSessionKey();
@@ -257,15 +749,22 @@ async function loadWallet() {
       // Fallback: try parsing as plain JSON (migration from unencrypted format)
       parsed = raw;
     }
-    localAccounts = (JSON.parse(parsed) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string }[])
-      .map((d) => ({ username: d.username, pub: d.pub, keys: d.keys, balance: 0, nonce: 0, createdAt: d.createdAt, faceMapHash: d.faceMapHash || '' }));
+    localAccounts = (JSON.parse(parsed) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string; pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string }[])
+      .map((d) => Object.assign({ username: d.username, pub: d.pub, keys: d.keys, balance: 0, nonce: 0, createdAt: d.createdAt, faceMapHash: d.faceMapHash || '' }, {
+        pinSalt: d.pinSalt, pinVerifier: d.pinVerifier, linkedAnchor: d.linkedAnchor,
+        pqPub: d.pqPub, pqKemPub: d.pqKemPub, encryptedFaceDescriptor: d.encryptedFaceDescriptor,
+      }));
   } catch { /* corrupt */ }
 }
 
 function registerLocalKeys() {
   for (const acc of localAccounts) {
     node.addLocalKey(acc.pub, acc.keys);
-    node.ledger.registerAccount(buildAccount(acc.username, acc.pub, acc.faceMapHash));
+    const a = acc as AccountWithKeys & { pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string };
+    node.ledger.registerAccount(buildAccount(acc.username, acc.pub, acc.faceMapHash, {
+      pinSalt: a.pinSalt, pinVerifier: a.pinVerifier, linkedAnchor: a.linkedAnchor,
+      pqPub: a.pqPub, pqKemPub: a.pqKemPub, encryptedFaceDescriptor: a.encryptedFaceDescriptor,
+    }));
   }
 }
 
@@ -360,7 +859,14 @@ function refreshChain() {
           <td>${copyBtn(b.hash)}</td>
           <td><span class="badge badge-${b.type === 'send' ? 'transfer' : b.type === 'receive' ? 'create' : b.type === 'deploy' ? 'deploy' : b.type === 'call' ? 'call' : 'verify'}">${b.type}</span></td>
           <td>${resolveName(b.accountPub)}</td>
-          <td>${b.type === 'send' ? '-' + formatUNIT(b.amount || 0) : b.type === 'receive' ? '+' + formatUNIT(b.receiveAmount || 0) : b.type === 'open' ? '+' + formatUNIT(VERIFICATION_MINT_AMOUNT) : '-'}</td>
+          <td>${
+            b.type === 'send' ? '-' + formatUNIT(b.amount || 0) :
+            b.type === 'receive' ? '+' + formatUNIT(b.receiveAmount || 0) :
+            b.type === 'open' ? '+' + formatUNIT(VERIFICATION_MINT_AMOUNT) :
+            b.type === 'storage-register' && b.contractData ? (() => { try { return (JSON.parse(b.contractData) as { capacityGB: number }).capacityGB + ' GB'; } catch { return '-'; } })() :
+            b.type === 'storage-deregister' && b.contractData ? (() => { try { return `-${(JSON.parse(b.contractData) as { capacityGB: number }).capacityGB} GB`; } catch { return '0 GB'; } })() :
+            '-'
+          }</td>
           <td style="color:${statusColor}">${status}</td>
         </tr>`;
       }).join('');
@@ -404,6 +910,7 @@ function refreshAccount() {
       if (!confirm(`Delete account "${acc.username}"? This removes it from your local wallet. You can recover it later with FaceID or key pair.`)) return;
       localAccounts = localAccounts.filter((a) => a.pub !== pub);
       node.localKeys.delete(pub);
+      clearPinCache(pub);
       saveWallet();
       refreshAccount();
       refreshTransfer();
@@ -411,6 +918,17 @@ function refreshAccount() {
       toast(`Account "${acc.username}" removed`, 'info');
     });
   });
+
+  // Show/populate the Update PIN/Face card if any local account has a PIN set
+  const secCard = $('#updateSecurityCard');
+  const pinAccounts = localAccounts.filter(a => (a as AccountWithKeys & { pinSalt?: string }).pinSalt);
+  if (pinAccounts.length > 0) {
+    secCard.style.display = '';
+    const sel = $<HTMLSelectElement>('#updateSecurityAccount');
+    sel.innerHTML = pinAccounts.map(a => `<option value="${escHtml(a.pub)}">${escHtml(a.username)}</option>`).join('');
+  } else {
+    secCard.style.display = 'none';
+  }
 }
 
 function refreshTransfer() {
@@ -606,8 +1124,10 @@ function renderExplorerRow(b: AccountBlock): string {
   } else if (b.type === 'storage-register' && b.contractData) {
     try {
       const d = JSON.parse(b.contractData) as { capacityGB: number };
-      name = `${d.capacityGB} GB`;
+      amount = `${d.capacityGB} GB`;
     } catch { /* skip */ }
+  } else if (b.type === 'storage-deregister' && b.contractData) {
+    try { amount = `-${(JSON.parse(b.contractData) as { capacityGB: number }).capacityGB} GB`; } catch { amount = '0 GB'; }
   }
 
   return `<tr>
@@ -673,8 +1193,14 @@ function refreshExplorer() {
 }
 
 function refreshContracts() {
+  const contractAcctHtml = localAccounts.map((a) => `<option value="${escHtml(a.username)}">${escHtml(a.username)}</option>`).join('');
   ['#contractFrom', '#callFrom'].forEach((sel) => {
-    $(sel).innerHTML = localAccounts.map((a) => `<option value="${escHtml(a.username)}">${escHtml(a.username)}</option>`).join('');
+    const el = $<HTMLSelectElement>(sel);
+    if (el.innerHTML !== contractAcctHtml) {
+      const prev = el.value;
+      el.innerHTML = contractAcctHtml;
+      if (prev && Array.from(el.options).some(o => o.value === prev)) el.value = prev;
+    }
   });
   const tbody = $('#contractsList');
   const contracts = Array.from(node.ledger.contracts.entries());
@@ -823,28 +1349,59 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       statusEl.innerHTML = '<span style="color:var(--danger)">Face enrollment failed. Try again with better lighting.</span>';
       restoreCreateBtn(); return;
     }
-    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Generating keys and encrypting with face...</span>';
 
-    // Generate ECDSA key pair
+    // Step 3: PIN setup
+    statusEl.innerHTML = '<span style="color:var(--accent)">Face enrolled. Now set your account PIN...</span>';
+    const pin = await promptSetPin();
+    if (!pin) {
+      statusEl.innerHTML = '<span style="color:var(--danger)">PIN setup cancelled. Account not created.</span>';
+      restoreCreateBtn(); return;
+    }
+
+    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Generating keys and encrypting with face + PIN...</span>';
+
+    // Generate ECDSA + PQ key pair
     const keys = await generateAccountKeys();
 
-    // Encrypt keys with face-derived AES key
-    const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.quantized, faceMap.hash);
+    // Double-encrypt keys with face key (inner) + PIN key (outer)
+    const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin);
+
+    // Encrypt face descriptor with PIN key for local privacy
+    const pinSalt = keyBlob.pinSalt!;
+    const saltBytes = Uint8Array.from(atob(pinSalt), c => c.charCodeAt(0));
+    const pinKey = await derivePinKey(pin, saltBytes);
+    const encryptedFaceDescriptor = await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey);
 
     // Register account
     statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Creating account on-chain...</span>';
-    const account = buildAccount(username, keys.pub, faceMap.hash, faceMap.canonical);
+    const account = buildAccount(username, keys.pub, faceMap.hash, {
+      encryptedFaceDescriptor,
+      pinSalt,
+      pinVerifier: keyBlob.pinVerifier,
+      linkedAnchor: keyBlob.linkedAnchor,
+      pqPub: keys.pqPub,
+      pqKemPub: keys.pqKemPub,
+    });
     node.ledger.registerAccount(account);
 
     // Create open block (mints 1M UNIT)
-    const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys, faceMap.canonical);
+    const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys);
 
     // Submit through node (publishes to libp2p network, triggers auto-vote)
     await node.submitBlock(openBlock);
     const accPayload = `account:${keys.pub}:${username}:${account.createdAt}:${faceMap.hash}`;
     const accSig = await signData(accPayload, keys);
-    node.net.saveAccount(keys.pub, { username, pub: keys.pub, balance: 1000000, nonce: 0, createdAt: account.createdAt, faceMapHash: faceMap.hash, faceDescriptor: JSON.stringify(faceMap.canonical), keyBlobHash: keyBlob.blobHash || '', _sig: accSig });
+    node.net.saveAccount(keys.pub, {
+      username, pub: keys.pub, balance: 1000000, nonce: 0,
+      createdAt: account.createdAt, faceMapHash: faceMap.hash,
+      encryptedFaceDescriptor, pinSalt, pinVerifier: keyBlob.pinVerifier,
+      linkedAnchor: keyBlob.linkedAnchor, pqPub: keys.pqPub, pqKemPub: keys.pqKemPub,
+      _sig: accSig,
+    });
     node.net.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
+
+    // Cache PIN for this session
+    cachePinKey(keys.pub, pinKey);
 
     // Store locally
     const fullAcc: AccountWithKeys = { ...account, keys, balance: 1000000 };
@@ -852,17 +1409,19 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     node.addLocalKey(keys.pub, keys);
     saveWallet();
 
-    const keysJson = JSON.stringify(keys, null, 2);
+    const backupCode = encodeBackupKey(keys);
     statusEl.innerHTML = `<div style="margin-top:12px;">
       <span style="color:var(--success);font-weight:600;">Account created! +${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT minted.</span><br>
-      <div class="stat-item" style="margin-top:8px;"><div class="stat-label">Username</div><div class="stat-value small" style="user-select:all;">${username}</div></div>
-      <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Public Key</div><div class="stat-value small" style="user-select:all;">${trunc(keys.pub, 40)}</div></div>
-      <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Face Map Hash</div><div class="stat-value small" style="user-select:all;">${trunc(faceMap.hash, 24)}</div></div>
+      <div class="stat-item" style="margin-top:8px;"><div class="stat-label">Username</div><div class="stat-value small" style="user-select:all;">${escHtml(username)}</div></div>
+      <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Public Key</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(keys.pub)}" onclick="this.select()"/></div>
+      <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Face Map Hash</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(faceMap.hash)}" onclick="this.select()"/></div>
       <div class="secret-box" style="margin-top:12px;">
-        <div class="warn-text">&#9888; BACKUP KEY PAIR - save this as a secondary recovery method.</div>
-        <pre class="secret-value" style="white-space:pre-wrap;font-size:11px;">${keysJson}</pre>
+        <div class="warn-text">&#9888; BACKUP KEY — save this secret key as a secondary recovery method.</div>
+        <input readonly class="form-input secret-value" style="font-size:12px;font-family:monospace;user-select:all;letter-spacing:1px;" value="${escHtml(backupCode)}" onclick="this.select()"/>
+        <p style="color:var(--text-muted);font-size:11px;margin-top:6px;">Contains your two private keys encoded as Base58. Import via "Recover with Key Pair" on any device.</p>
       </div>
-      <p style="color:var(--accent);font-size:12px;margin-top:8px;">Primary recovery: scan your face on any device. Backup: paste this key pair.</p>
+      <p style="font-size:12px;margin-top:10px;line-height:1.7;">Primary recovery: <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(99,102,241,0.15);color:var(--primary-hover);border:1px solid rgba(99,102,241,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F4F7; Face</span> + <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(34,211,238,0.12);color:var(--accent);border:1px solid rgba(34,211,238,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F511; PIN</span> on any device.</p>
+      <p style="font-size:12px;margin-top:4px;line-height:1.7;">Backup: <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.12);color:var(--success);border:1px solid rgba(16,185,129,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F4CB; Secret Key</span> — paste in the recovery field.</p>
     </div>`;
 
     toast(`${username} created - ${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT`, 'success');
@@ -893,6 +1452,15 @@ $('#btnCancelCreate').addEventListener('click', () => {
 // ──── Account Recovery by Face ────
 // ══════════════════════════════════════════════════════════
 
+function finishRecovery(): void {
+  isRecovering = false;
+  if (pendingGenerationReset) {
+    pendingGenerationReset = false;
+    toast('Network reset received - reloading...', 'info');
+    setTimeout(() => location.reload(), 800);
+  }
+}
+
 $('#btnRecoverFace').addEventListener('click', async () => {
   const username = $<HTMLInputElement>('#recoverUsername').value.trim().toLowerCase();
   if (!username) { toast('Enter your username', 'error'); return; }
@@ -900,6 +1468,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
   const statusEl = $('#recoverStatus');
   const video = $<HTMLVideoElement>('#faceVideo');
 
+  isRecovering = true;
   $('#btnRecoverFace').setAttribute('disabled', '');
   showCameraModal();
 
@@ -913,8 +1482,8 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     if (!blobData) {
       toast('No key blob found for this username on the chain', 'error');
       hideCameraModal();
-      $('#btnRecoverFace').removeAttribute('disabled');
       statusEl.innerHTML = '<span style="color:var(--danger)">Account not found on chain. Start node first.</span>';
+      finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled');
       return;
     }
     const blob: EncryptedKeyBlob = {
@@ -923,47 +1492,97 @@ $('#btnRecoverFace').addEventListener('click', async () => {
       username: String(blobData.username),
       pub: String(blobData.pub),
       createdAt: Number(blobData.createdAt),
-      blobHash: blobData.blobHash ? String(blobData.blobHash) : undefined,
+      linkedAnchor: blobData.linkedAnchor ? String(blobData.linkedAnchor) : undefined,
+      pinSalt: blobData.pinSalt ? String(blobData.pinSalt) : undefined,
+      pinVersion: typeof blobData.pinVersion === 'number' ? blobData.pinVersion : 0,
+      pinAttemptState: blobData.pinAttemptState ? String(blobData.pinAttemptState) : undefined,
+      pinVerifier: blobData.pinVerifier ? String(blobData.pinVerifier) : undefined,
+      encryptedCanonical: blobData.encryptedCanonical ? String(blobData.encryptedCanonical) : undefined,
     };
 
-    // Verify key blob hash against on-chain account data (prevents relay from serving fake blobs)
+    // Verify linked anchor against on-chain account data (prevents relay from serving fake blobs)
     const onChainAccount = await node.net.loadAccount(blob.pub);
-    if (onChainAccount && onChainAccount.keyBlobHash && blob.blobHash) {
-      const { verifyKeyBlobHash } = await import('./core/face-store');
-      const hashValid = await verifyKeyBlobHash(blob, String(onChainAccount.keyBlobHash));
+    if (onChainAccount && onChainAccount.linkedAnchor && blob.linkedAnchor) {
+      const hashValid = await verifyKeyBlobHash(blob, String(onChainAccount.linkedAnchor));
       if (!hashValid) {
-        toast('Key blob hash mismatch - blob may be tampered', 'error');
+        toast('Key blob integrity check failed — blob may be tampered', 'error');
         hideCameraModal();
-        $('#btnRecoverFace').removeAttribute('disabled');
         statusEl.innerHTML = '<span style="color:var(--danger)">Key blob integrity check failed. The relay may have served a tampered blob.</span>';
+        finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled');
         return;
       }
+    }
+
+    // If PIN-protected, ask for PIN before camera (needed for outer decryption)
+    let pin: string | undefined;
+    if (blob.pinVersion === 1) {
+      hideCameraModal();
+      const enteredPin = await promptPin('Enter your account PIN', 'Required to recover your keys');
+      if (!enteredPin) {
+        statusEl.innerHTML = '<span style="color:var(--danger)">PIN entry cancelled.</span>';
+        finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled');
+        return;
+      }
+      pin = enteredPin;
+      showCameraModal();
     }
 
     setCameraStatus('<span class="spinner"></span> Starting camera...');
     cameraStream = await startCamera(video);
 
-    setCameraStatus('<span class="spinner"></span> Look at the camera - capturing face...');
-    await new Promise((r) => setTimeout(r, 1500));
-
-    const desc = await captureFaceDescriptor(video);
+    // Use the same multi-sample enrollment as account creation so the quantized
+    // descriptor matches exactly (single-frame capture can differ enough to break
+    // the derived AES key).
+    const faceMap = await enrollFace(video, (step, total, status) => {
+      setCameraStatus(`<span class="spinner"></span> ${status} (${step}/${total})`);
+    });
     hideCameraModal();
 
-    if (!desc) { toast('No face detected', 'error'); statusEl.innerHTML = '<span style="color:var(--danger)">No face detected. Try again.</span>'; $('#btnRecoverFace').removeAttribute('disabled'); return; }
+    if (!faceMap) { toast('No face detected', 'error'); statusEl.innerHTML = '<span style="color:var(--danger)">No face detected. Try again with better lighting.</span>'; finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled'); return; }
 
-    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Decrypting keys with face...</span>';
+    statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Decrypting keys with face + PIN...</span>';
 
-    const keys = await recoverKeysWithFace(blob, desc.data);
+    const recoveryResult = await recoverKeysWithFace(blob, faceMap.canonical, pin);
 
-    if (!keys) {
-      statusEl.innerHTML = '<span style="color:var(--danger)">Face did not match. Decryption failed. Try again with better lighting.</span>';
-      toast('Face mismatch - recovery failed', 'error');
-      $('#btnRecoverFace').removeAttribute('disabled');
+    if (!recoveryResult) {
+      const msg = blob.pinVersion === 1
+        ? 'Face or PIN did not match. Decryption failed.'
+        : 'Face did not match. Decryption failed. Try again with better lighting.';
+      if (blob.pinVersion === 1 && pin) {
+        const state = await recordPinFailure(blob.pub);
+        const backoffMs = getBackoffMs(state.failedAttempts);
+        if (backoffMs > 0 && node.net.running) {
+          node.net.publishLockout({ accountPub: blob.pub, failedAttempts: state.failedAttempts, lockedUntil: state.lockedUntil, timestamp: Date.now() });
+        }
+        // Update attempt state in blob and re-save
+        if (recoveryResult === null) { /* face key unknown, skip blob update */ }
+      }
+      statusEl.innerHTML = `<span style="color:var(--danger)">${msg}</span>`;
+      toast('Recovery failed', 'error');
+      finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled');
       return;
     }
 
+    const { keys, faceKey } = recoveryResult;
+
+    // Reset attempt counter on successful recovery
+    await recordPinSuccess(blob.pub);
+    const updatedBlob = await updateAttemptStateInBlob(blob, faceKey, { failedAttempts: 0, lockedUntil: 0 });
+    node.net.saveKeyBlob(keys.pub, updatedBlob as unknown as Record<string, unknown>);
+
+    // Cache PIN key for this session
+    if (pin && blob.pinSalt) {
+      const saltBytes = Uint8Array.from(atob(blob.pinSalt), c => c.charCodeAt(0));
+      const pinKey = await derivePinKey(pin, saltBytes);
+      cachePinKey(keys.pub, pinKey);
+    }
+
     // Recovery successful!
-    const account = buildAccount(username, keys.pub, blob.faceMapHash);
+    const account = buildAccount(username, keys.pub, blob.faceMapHash, {
+      pinSalt: blob.pinSalt,
+      pinVerifier: blob.pinVerifier,
+      linkedAnchor: blob.linkedAnchor,
+    });
     node.ledger.registerAccount(account);
     const fullAcc: AccountWithKeys = { ...account, keys, balance: 0 };
     if (!localAccounts.find((a) => a.pub === keys.pub)) {
@@ -974,12 +1593,13 @@ $('#btnRecoverFace').addEventListener('click', async () => {
 
     statusEl.innerHTML = `<div style="margin-top:8px;"><span style="color:var(--success);font-weight:600;">Account recovered: ${username}</span></div>`;
     toast(`Recovered: ${username}`, 'success');
-    addLog(`Account recovered via face: ${username}`, 'success');
+    addLog(`Account recovered via face + PIN: ${username}`, 'success');
     refreshAccount(); refreshTransfer(); refreshContracts();
   } catch (err) {
     toast(`Recovery error: ${err}`, 'error');
     hideCameraModal();
   }
+  finishRecovery();
   $('#btnRecoverFace').removeAttribute('disabled');
 });
 
@@ -990,19 +1610,39 @@ $('#btnToggleKeyRecover').addEventListener('click', () => {
   section.style.display = section.style.display === 'none' ? 'block' : 'none';
 });
 
-$('#btnRecoverKeys').addEventListener('click', () => {
+$('#btnRecoverKeys').addEventListener('click', async () => {
   const username = $<HTMLInputElement>('#recoverUsername').value.trim().toLowerCase();
   const keysRaw = $<HTMLTextAreaElement>('#recoverKeyPair').value.trim();
-  if (!username || !keysRaw) { toast('Enter username and key pair', 'error'); return; }
+  if (!username || !keysRaw) { toast('Enter username and backup code', 'error'); return; }
 
+  let keys: KeyPair;
   try {
-    const keys = JSON.parse(keysRaw) as KeyPair;
-    if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) { toast('Invalid key format - needs pub, priv, epub, epriv', 'error'); return; }
+    // Accept both the compact Base58 backup code and the legacy full JSON format
+    const isBase58 = /^[1-9A-HJ-NP-Za-km-z]+$/.test(keysRaw) && !keysRaw.startsWith('{');
+    if (isBase58) {
+      const decoded = await decodeBackupKey(keysRaw);
+      if (!decoded) { toast('Invalid backup code', 'error'); return; }
+      keys = decoded as KeyPair;
+    } else {
+      keys = JSON.parse(keysRaw) as KeyPair;
+    }
+    if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) { toast('Invalid key format', 'error'); return; }
 
     const existing = node.ledger.getAccountByUsername(username);
     if (existing && existing.pub !== keys.pub) { toast('Key does not match this username', 'error'); return; }
 
-    const account = buildAccount(username, keys.pub, existing?.faceMapHash || '');
+    // Fetch the key blob to reliably get pinSalt/pinVerifier — don't rely on sync timing
+    const blobData = await node.net.findKeyBlobByUsername(username);
+    const blobPinSalt = blobData?.pinSalt ? String(blobData.pinSalt) : (existing as Account & { pinSalt?: string } | undefined)?.pinSalt;
+    const blobPinVerifier = blobData?.pinVerifier ? String(blobData.pinVerifier) : (existing as Account & { pinVerifier?: string } | undefined)?.pinVerifier;
+
+    const account = buildAccount(username, keys.pub, existing?.faceMapHash || blobData?.faceMapHash as string || '', {
+      pinSalt: blobPinSalt,
+      pinVerifier: blobPinVerifier,
+      linkedAnchor: blobData?.linkedAnchor ? String(blobData.linkedAnchor) : existing?.linkedAnchor,
+      pqPub: existing?.pqPub,
+      pqKemPub: existing?.pqKemPub,
+    });
     if (!existing) node.ledger.registerAccount(account);
 
     if (!localAccounts.find((a) => a.pub === keys.pub)) {
@@ -1014,9 +1654,209 @@ $('#btnRecoverKeys').addEventListener('click', () => {
 
     $('#recoverStatus').innerHTML = `<span style="color:var(--success);">Recovered: ${username}</span>`;
     toast(`Recovered: ${username}`, 'success');
-    addLog(`Account recovered via key pair: ${username}`, 'success');
+    addLog(`Account recovered via backup code: ${username}`, 'success');
     refreshAccount(); refreshTransfer(); refreshContracts();
-  } catch { toast('Invalid JSON', 'error'); }
+  } catch { toast('Invalid backup code or JSON', 'error'); }
+});
+
+// ──── Update PIN ────
+$('#btnUpdatePin').addEventListener('click', async () => {
+  const pub = $<HTMLSelectElement>('#updateSecurityAccount').value;
+  const acc = localAccounts.find(a => a.pub === pub) as (AccountWithKeys & { pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string }) | undefined;
+  if (!acc || !acc.pinSalt || !acc.pinVerifier) { toast('Account not found or no PIN set', 'error'); return; }
+  const statusEl = $('#updateSecurityStatus');
+
+  // Verify current PIN first
+  if (!await requirePin(acc)) { statusEl.innerHTML = '<span style="color:var(--danger)">PIN verification cancelled or failed.</span>'; return; }
+
+  // Prompt new PIN
+  const newPin = await promptSetPin();
+  if (!newPin) { statusEl.innerHTML = '<span style="color:var(--text-muted)">Cancelled.</span>'; return; }
+
+  try {
+    // Fetch the current encrypted blob from the network.
+    statusEl.innerHTML = '<span class="spinner"></span> Fetching current blob...';
+    const blobRaw = await node.net.findKeyBlobByUsername(acc.username);
+    if (!blobRaw) { toast('Could not fetch key blob from network', 'error'); statusEl.innerHTML = ''; return; }
+
+    const blob: EncryptedKeyBlob = {
+      encryptedKeys: String(blobRaw.encryptedKeys), faceMapHash: String(blobRaw.faceMapHash),
+      username: String(blobRaw.username), pub: String(blobRaw.pub), createdAt: Number(blobRaw.createdAt),
+      linkedAnchor: blobRaw.linkedAnchor ? String(blobRaw.linkedAnchor) : undefined,
+      pinSalt: blobRaw.pinSalt ? String(blobRaw.pinSalt) : undefined,
+      pinVersion: typeof blobRaw.pinVersion === 'number' ? blobRaw.pinVersion : 0,
+      pinAttemptState: blobRaw.pinAttemptState ? String(blobRaw.pinAttemptState) : undefined,
+      pinVerifier: blobRaw.pinVerifier ? String(blobRaw.pinVerifier) : undefined,
+      encryptedCanonical: blobRaw.encryptedCanonical ? String(blobRaw.encryptedCanonical) : undefined,
+    };
+    if (blob.pinVersion !== 1) { toast('Legacy account — no PIN to update', 'error'); statusEl.innerHTML = ''; return; }
+
+    // Derive new PIN key
+    const newSaltBytes = generatePinSalt();
+    const newPinSalt = btoa(String.fromCharCode(...newSaltBytes));
+    const newPinKey = await derivePinKey(newPin, newSaltBytes);
+
+    // Re-encrypt: we need the face-encrypted inner layer. Get it via the cached key.
+    const oldPinKey = getCachedPinKey(pub);
+    if (!oldPinKey) { toast('Session expired — please retry', 'error'); statusEl.innerHTML = ''; return; }
+
+    const innerCiphertext = await decryptWithPinKey(blob.encryptedKeys, oldPinKey);
+    if (!innerCiphertext) { toast('Failed to decrypt with current PIN', 'error'); statusEl.innerHTML = ''; return; }
+
+    // Re-wrap inner with new PIN key
+    const newEncryptedKeys = await encryptWithPinKey(innerCiphertext, newPinKey);
+    const newPinVerifier = await encryptWithPinKey('PINOK', newPinKey);
+
+    // Re-encrypt face descriptor with new PIN key if present
+    let newEncryptedFaceDescriptor: string | undefined;
+    if (acc.encryptedFaceDescriptor) {
+      const oldDesc = await decryptWithPinKey(acc.encryptedFaceDescriptor, oldPinKey);
+      if (oldDesc) newEncryptedFaceDescriptor = await encryptWithPinKey(oldDesc, newPinKey);
+    }
+
+    // Compute new linkedAnchor
+    const newAnchorInput = `${newEncryptedKeys}:${blob.faceMapHash}:${acc.pub}`;
+    const anchorBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(newAnchorInput));
+    const newLinkedAnchor = Array.from(new Uint8Array(anchorBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // Publish update block
+    const updateResult = await node.ledger.createUpdate(acc.pub, acc.keys, {
+      newLinkedAnchor, newPQPub: acc.pqPub, newPQKemPub: acc.pqKemPub,
+    });
+    if ('error' in updateResult && updateResult.error) { toast(`Update failed: ${updateResult.error}`, 'error'); statusEl.innerHTML = ''; return; }
+    const sub = await node.submitBlock(updateResult.block!);
+    if (!sub.success) { toast(`Update block failed: ${sub.error}`, 'error'); statusEl.innerHTML = ''; return; }
+
+    // Update local account
+    Object.assign(acc, { pinSalt: newPinSalt, pinVerifier: newPinVerifier, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedFaceDescriptor });
+    cachePinKey(pub, newPinKey);
+    saveWallet();
+    statusEl.innerHTML = '<span style="color:var(--success)">PIN updated successfully.</span>';
+    toast('PIN updated', 'success');
+    addLog(`PIN updated for ${acc.username}`, 'success');
+    refreshAccount();
+  } catch (e) {
+    toast('PIN update failed', 'error');
+    statusEl.innerHTML = `<span style="color:var(--danger)">Error: ${String(e)}</span>`;
+  }
+});
+
+// ──── Update Face ────
+$('#btnUpdateFace').addEventListener('click', async () => {
+  const pub = $<HTMLSelectElement>('#updateSecurityAccount').value;
+  const acc = localAccounts.find(a => a.pub === pub) as (AccountWithKeys & { pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string }) | undefined;
+  if (!acc) { toast('Account not found', 'error'); return; }
+  const statusEl = $('#updateSecurityStatus');
+
+  // Verify current face+PIN first
+  if (!await requirePin(acc)) { statusEl.innerHTML = '<span style="color:var(--danger)">Authentication cancelled or failed.</span>'; return; }
+
+  const pinKey = getCachedPinKey(pub);
+
+  // Re-enroll face
+  statusEl.innerHTML = '<span class="spinner"></span> Starting camera for face re-enrollment...';
+  const video = $<HTMLVideoElement>('#faceVideo');
+  showCameraModal();
+
+  let faceMap: Awaited<ReturnType<typeof enrollFace>> | null = null;
+  try {
+    setCameraStatus('<span class="spinner"></span> Loading face recognition models...');
+    await loadModels();
+    setCameraStatus('<span class="spinner"></span> Starting camera...');
+    cameraStream = await startCamera(video);
+    setCameraStatus('<span class="spinner"></span> Step 1/2: Slowly turn your head left and right');
+    const isLive = await detectLiveness(video, 15000, (msg: string) => { $('#cameraOverlay').textContent = msg; });
+    if (!isLive) {
+      hideCameraModal();
+      statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
+      return;
+    }
+    setCameraStatus('<span class="spinner"></span> Step 2/2: Hold still - capturing face map');
+    faceMap = await enrollFace(video, (step, total) => {
+      setCameraStatus(`<span class="spinner"></span> Step 2/2: Sample ${step}/${total}`);
+    });
+  } catch {
+    hideCameraModal();
+    statusEl.innerHTML = '<span style="color:var(--danger)">Camera error. Try again.</span>';
+    return;
+  }
+  hideCameraModal();
+
+  if (!faceMap || !faceMap.canonical) {
+    statusEl.innerHTML = '<span style="color:var(--danger)">Face enrollment failed. Try again.</span>';
+    return;
+  }
+
+  try {
+    const newQuantized = quantizeDescriptor(faceMap.canonical);
+    const newFaceKey = await deriveFaceKey(newQuantized);
+
+    // Fetch current blob to get inner ciphertext
+    statusEl.innerHTML = '<span class="spinner"></span> Fetching current blob...';
+    const blobRaw = await node.net.findKeyBlobByUsername(acc.username);
+    if (!blobRaw) { toast('Could not fetch key blob', 'error'); statusEl.innerHTML = ''; return; }
+    const blob: EncryptedKeyBlob = {
+      encryptedKeys: String(blobRaw.encryptedKeys), faceMapHash: String(blobRaw.faceMapHash),
+      username: String(blobRaw.username), pub: String(blobRaw.pub), createdAt: Number(blobRaw.createdAt),
+      linkedAnchor: blobRaw.linkedAnchor ? String(blobRaw.linkedAnchor) : undefined,
+      pinSalt: blobRaw.pinSalt ? String(blobRaw.pinSalt) : undefined,
+      pinVersion: typeof blobRaw.pinVersion === 'number' ? blobRaw.pinVersion : 0,
+      pinAttemptState: blobRaw.pinAttemptState ? String(blobRaw.pinAttemptState) : undefined,
+      pinVerifier: blobRaw.pinVerifier ? String(blobRaw.pinVerifier) : undefined,
+      encryptedCanonical: blobRaw.encryptedCanonical ? String(blobRaw.encryptedCanonical) : undefined,
+    };
+
+    let innerCiphertext: string | null = null;
+    if (blob.pinVersion === 1 && pinKey) {
+      innerCiphertext = await decryptWithPinKey(blob.encryptedKeys, pinKey);
+    } else {
+      innerCiphertext = await decryptWithFaceKey(blob.encryptedKeys, newFaceKey);
+    }
+    if (!innerCiphertext) { toast('Could not decrypt current blob with new face', 'error'); statusEl.innerHTML = ''; return; }
+
+    // Re-encrypt inner with new face key
+    const newInner = await encryptWithFaceKey(innerCiphertext, newFaceKey);
+
+    // Re-wrap with PIN key
+    let newEncryptedKeys = newInner;
+    if (pinKey) {
+      newEncryptedKeys = await encryptWithPinKey(newInner, pinKey);
+    }
+
+    // Compute new faceMapHash
+    const hashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(newQuantized)));
+    const newFaceMapHash = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // Compute new linkedAnchor
+    const anchorInput = `${newEncryptedKeys}:${newFaceMapHash}:${acc.pub}`;
+    const anchorBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(anchorInput));
+    const newLinkedAnchor = Array.from(new Uint8Array(anchorBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // Encrypt face descriptor with PIN key
+    let newEncryptedFaceDescriptor: string | undefined;
+    if (pinKey) {
+      newEncryptedFaceDescriptor = await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey);
+    }
+
+    // Publish update block
+    const updateResult = await node.ledger.createUpdate(acc.pub, acc.keys, {
+      newFaceMapHash, newLinkedAnchor, newPQPub: acc.pqPub, newPQKemPub: acc.pqKemPub,
+    });
+    if ('error' in updateResult && updateResult.error) { toast(`Update failed: ${updateResult.error}`, 'error'); statusEl.innerHTML = ''; return; }
+    const sub = await node.submitBlock(updateResult.block!);
+    if (!sub.success) { toast(`Update block failed: ${sub.error}`, 'error'); statusEl.innerHTML = ''; return; }
+
+    // Update local account
+    Object.assign(acc, { faceMapHash: newFaceMapHash, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedFaceDescriptor });
+    saveWallet();
+    statusEl.innerHTML = '<span style="color:var(--success)">Face updated successfully.</span>';
+    toast('Face re-enrolled and update broadcast', 'success');
+    addLog(`Face updated for ${acc.username}`, 'success');
+    refreshAccount();
+  } catch (e) {
+    toast('Face update failed', 'error');
+    statusEl.innerHTML = `<span style="color:var(--danger)">Error: ${String(e)}</span>`;
+  }
 });
 
 // ──── Transfer ────
@@ -1036,6 +1876,9 @@ $('#btnSendTx').addEventListener('click', async () => {
 
   const sender = localAccounts.find((a) => a.pub === fromPub);
   if (!sender) { toast('Sender not found', 'error'); return; }
+
+  // PIN required for all transfers
+  if (!await requirePin(sender)) return;
 
   if (assetId === '__unit__') {
     const amount = parseUNIT(amountInput);
@@ -1161,6 +2004,8 @@ $('#btnDeployContract').addEventListener('click', async () => {
   const sender = localAccounts.find((a) => a.username === from);
   if (!sender) { toast('Account not found', 'error'); return; }
 
+  if (!await requirePin(sender)) return;
+
   const deployResult = await node.ledger.createDeploy(sender.pub, name || 'Unnamed', code, sender.keys);
   if (deployResult.error) { toast(deployResult.error, 'error'); return; }
   const sub = await node.submitBlock(deployResult.block!);
@@ -1204,23 +2049,34 @@ $('#btnCallContract').addEventListener('click', async () => {
 
 // ──── Node Events ────
 let nodeEventsWired = false;
+// Debounce for high-frequency events (block:received, account:synced) so they
+// don't cause continuous DOM mutations that interfere with native select pickers on mobile.
+let _refreshDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+function debouncedRefreshTab() {
+  if (_refreshDebounceTimer) return; // already queued
+  _refreshDebounceTimer = setTimeout(() => {
+    _refreshDebounceTimer = null;
+    refreshTab();
+  }, 800);
+}
+
 function wireNodeEvents() {
   if (nodeEventsWired) return;
   nodeEventsWired = true;
   node.on('block:confirmed', (b: unknown) => {
     const block = b as { type: string; accountPub: string };
     addLog(`Confirmed: ${block.type} by ${resolveNamePlain(block.accountPub)}`, 'success');
-    refreshTab();
+    debouncedRefreshTab();
   });
   node.on('block:conflict', (b: unknown) => {
     const block = b as { hash: string; type: string; accountPub: string };
     addLog(`CONFLICT: fork detected for ${block.type} by ${resolveNamePlain(block.accountPub)} - voting started`, 'warn');
-    refreshTab();
+    debouncedRefreshTab();
   });
   node.on('block:rejected', (b: unknown) => {
     const block = b as { hash: string };
     addLog(`Rejected: ${trunc(block.hash)}`, 'error');
-    refreshTab();
+    debouncedRefreshTab();
   });
   node.on('peer:connected', () => { refreshNode(); });
   node.on('peer:disconnected', () => { refreshNode(); });
@@ -1244,10 +2100,10 @@ function wireNodeEvents() {
     addLog(`Contract error: ${(data as { error: string }).error}`, 'error');
   });
   node.on('account:synced', () => {
-    refreshTab();
+    debouncedRefreshTab();
   });
   node.on('block:received', () => {
-    refreshTab();
+    debouncedRefreshTab();
   });
   node.on('resync', (data: unknown) => {
     const d = data as { newAccounts: number; newBlocks: number };
@@ -1257,10 +2113,17 @@ function wireNodeEvents() {
     }
   });
   node.on('generation:reset', () => {
-    // Another peer broadcast a higher generation reset - reload to clear all in-memory state
+    // Another peer broadcast a higher generation - reload to clear all in-memory state.
+    // If recovery is in progress, defer the reload until it finishes so the user
+    // doesn't lose their face scan mid-flow.
     localAccounts = [];
     localStorage.removeItem(WALLET_KEY);
-    toast('Network reset received - reloading...', 'warn');
+    if (isRecovering) {
+      pendingGenerationReset = true;
+      toast('Network generation updated - will reload after recovery', 'info');
+      return;
+    }
+    toast('Network reset received - reloading...', 'info');
     setTimeout(() => location.reload(), 800);
   });
   node.net.on('peer:connected', (url: unknown) => {
@@ -1282,7 +2145,11 @@ let refreshInterval: ReturnType<typeof setInterval> | null = null;
 
 function startRefreshInterval() {
   stopRefreshInterval();
-  refreshInterval = setInterval(() => refreshTab(), 5000);
+  refreshInterval = setInterval(() => {
+    refreshTab();
+    // Always keep explorer current in the background so it's ready when switched to
+    if (activeTab() !== 'explorer') refreshExplorer();
+  }, 5000);
 }
 
 function stopRefreshInterval() {
@@ -1296,6 +2163,8 @@ function stopRefreshInterval() {
 
 interface ContentRecord {
   cid: string;
+  /** Inner content CID (the actual data block, separate from the meta envelope) */
+  contentCid?: string;
   name: string;
   contentType: string;
   mimeType: string;
@@ -1331,9 +2200,21 @@ function removeFromContentLibrary(cid: string): void {
   saveContentLibrary(loadContentLibrary().filter(r => r.cid !== cid));
 }
 
-(window as unknown as Record<string, unknown>)['removeFromLibraryAndRefresh'] = (cid: string) => {
+(window as unknown as Record<string, unknown>)['removeFromLibraryAndRefresh'] = async (cid: string) => {
+  const record = loadContentLibrary().find(r => r.cid === cid);
   removeFromContentLibrary(cid);
   refreshStorage();
+
+  if (node.store.isStarted() && record) {
+    const cids = [cid, ...(record.contentCid ? [record.contentCid] : [])];
+    const keys = node.localKeys.get(record.ownerPub);
+    if (keys) {
+      await node.deleteContent(cids, record.ownerPub, keys).catch(() => {});
+    } else {
+      // Keys not loaded (e.g. wallet locked) — delete locally only
+      for (const c of cids) await node.store.deleteBlock(c).catch(() => {});
+    }
+  }
 };
 
 (window as unknown as Record<string, unknown>)['fillRetrieveCid'] = (cid: string) => {
@@ -1351,11 +2232,17 @@ function setStorageTypeFields(type: string): void {
 function refreshStorage() {
   const options = localAccounts.map(a => `<option value="${escHtml(a.pub)}">${escHtml(a.username)}</option>`).join('');
   const noAcct = '<option value="">No accounts</option>';
+  const newHtml = options || noAcct;
 
-  // Populate account selectors
-  $<HTMLSelectElement>('#storageProviderAccount').innerHTML = options || noAcct;
-  $<HTMLSelectElement>('#storageContentFrom').innerHTML = options || noAcct;
-  $<HTMLSelectElement>('#retrieveContentFrom').innerHTML = options || noAcct;
+  // Populate account selectors — preserve selection and skip if unchanged (prevents mobile picker flicker)
+  for (const id of ['#storageProviderAccount', '#storageContentFrom', '#retrieveContentFrom'] as const) {
+    const sel = $<HTMLSelectElement>(id);
+    if (sel.innerHTML !== newHtml) {
+      const prev = sel.value;
+      sel.innerHTML = newHtml;
+      if (prev && Array.from(sel.options).some(o => o.value === prev)) sel.value = prev;
+    }
+  }
 
   // Determine if any local account is already a provider
   const servingAccount = localAccounts.find(a => node.storage.isServing(a.pub));
@@ -1378,6 +2265,7 @@ function refreshStorage() {
       $('#myProviderStatsRow').innerHTML = `<tr>
         <td>${p.capacityGB.toLocaleString()} GB</td>
         <td>${uptime} (${p.heartbeatsLast24h}/6 heartbeats)</td>
+        <td>${latency}</td>
         <td><strong>${p.score.toFixed(3)}</strong></td>
         <td>${formatUNIT(p.earningRate)}</td>
         <td>${formatUNIT(p.totalEarned)}</td>
@@ -1457,7 +2345,7 @@ function refreshStorage() {
 $('#storageContentType')?.addEventListener('change', () => {
   setStorageTypeFields($<HTMLSelectElement>('#storageContentType').value);
 });
-setStorageTypeFields('json');
+setStorageTypeFields($<HTMLSelectElement>('#storageContentType').value);
 
 // Visibility badge
 function updateVisibilityBadge(): void {
@@ -1535,7 +2423,7 @@ $('#btnServeStorage')?.addEventListener('click', async () => {
 
   const acc = localAccounts.find(a => a.pub === pub);
   if (!acc) { toast('Account not found', 'error'); return; }
-  if (!node.helia.isStarted()) { toast('Start the node first', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Start the node first', 'error'); return; }
 
   const result = await node.registerStorage(pub, capacityGB, acc.keys);
   if (result.success) {
@@ -1591,7 +2479,7 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
   const pub = $<HTMLSelectElement>('#storageContentFrom').value;
   const acc = localAccounts.find(a => a.pub === pub);
   if (!acc) { toast('Select an account', 'error'); return; }
-  if (!node.helia.isStarted()) { toast('Node not started', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Node not started', 'error'); return; }
 
   const contentType = $<HTMLSelectElement>('#storageContentType').value;
   const contentName = $<HTMLInputElement>('#storageContentName').value.trim() || contentType;
@@ -1668,17 +2556,25 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     const isEncrypted = visibility === 'private';
 
     const storeResult = isEncrypted
-      ? await node.helia.storeWithMeta(data, { mimeType, name: finalName }, acc.keys)
-      : await node.helia.storeWithMetaPublic(data, { mimeType, name: finalName });
+      ? await node.store.storeWithMeta(data, { mimeType, name: finalName }, acc.keys)
+      : await node.store.storeWithMetaPublic(data, { mimeType, name: finalName });
 
     const { cid } = storeResult;
+    const contentCid = (storeResult.meta as { contentCid?: string }).contentCid;
     const visLabel = isEncrypted ? 'private' : 'public';
+
+    // Distribute to network providers. Pass both the meta CID and the inner content
+    // CID so providers pin both blobs (they are separate UnixFS blocks).
+    const cidsToDistribute = contentCid ? [cid, contentCid] : [cid];
+    const distResult = await node.distributeContent(cidsToDistribute, pub, acc.keys);
+    if (distResult.error) addLog(`Storage distribution: ${distResult.error}`, 'warn');
+    else addLog(`Content distributed to ${distResult.providers.length} provider(s)`, 'success');
 
     const resultEl = $('#storageCidResult');
     resultEl.style.display = 'block';
     resultEl.innerHTML = `<strong>Stored!</strong> (${visLabel})&nbsp; CID: <span>${escHtml(cid)}</span> ${cpBtn(cid)}`;
 
-    addToContentLibrary({ cid, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
+    addToContentLibrary({ cid, contentCid, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
     toast(`Content stored (${visLabel})`, 'success');
     refreshStorage();
   } catch (err) {
@@ -1693,8 +2589,7 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
 
   const pub = $<HTMLSelectElement>('#retrieveContentFrom').value;
   const acc = localAccounts.find(a => a.pub === pub);
-  if (!acc) { toast('Select an account', 'error'); return; }
-  if (!node.helia.isStarted()) { toast('Node not started', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Node not started', 'error'); return; }
 
   const resultEl = $('#retrieveResult');
   resultEl.style.display = 'block';
@@ -1704,14 +2599,24 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
   const hint = knownRecord ? (knownRecord.encrypted ? 'encrypted' : 'public') : 'auto';
   resultEl.innerHTML = `<span class="spinner"></span> Retrieving${hint !== 'auto' ? ` (${hint})` : ''}...`;
 
-  try {
-    // If we know it's public, skip the encrypted attempt to avoid spurious errors
-    const result = hint === 'public'
-      ? await node.helia.retrieveAuto(cid)
-      : await node.helia.retrieveAuto(cid, acc.keys);
+  // Encrypted content requires the owner's keys; public content does not
+  if (hint === 'encrypted' && !acc) { toast('Select the owner account to decrypt', 'error'); return; }
 
+  let result: Awaited<ReturnType<typeof node.store.retrieveAuto>> = undefined;
+  let lastErr: unknown;
+
+  try {
+    result = hint === 'public'
+      ? await node.store.retrieveAuto(cid)
+      : await node.store.retrieveAuto(cid, acc?.keys);
+  } catch (err) {
+    lastErr = err;
+  }
+
+  try {
     if (!result) {
-      resultEl.innerHTML = '<span style="color:var(--danger)">Content not found or decryption failed. Ensure the node is running and you are using the correct account key.</span>';
+      const errMsg = lastErr instanceof Error ? escHtml(lastErr.message) : '';
+      resultEl.innerHTML = `<span style="color:var(--danger)">Content not found. Ensure the uploader's node is running and online. ${errMsg}</span>`;
       return;
     }
 
@@ -1725,14 +2630,15 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
 
     let preview = '';
 
+    const dataBuf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
     if (mime.startsWith('image/')) {
-      const url = URL.createObjectURL(new Blob([data], { type: mime }));
+      const url = URL.createObjectURL(new Blob([dataBuf], { type: mime }));
       preview = `<img src="${url}" alt="${escHtml(meta.name || '')}" style="max-width:100%;max-height:300px;border-radius:var(--radius);display:block;margin-bottom:8px;" />`;
     } else if (mime.startsWith('video/')) {
-      const url = URL.createObjectURL(new Blob([data], { type: mime }));
+      const url = URL.createObjectURL(new Blob([dataBuf], { type: mime }));
       preview = `<video src="${url}" controls muted style="max-width:100%;max-height:300px;border-radius:var(--radius);display:block;margin-bottom:8px;"></video>`;
     } else if (mime.startsWith('audio/')) {
-      const url = URL.createObjectURL(new Blob([data], { type: mime }));
+      const url = URL.createObjectURL(new Blob([dataBuf], { type: mime }));
       preview = `<audio src="${url}" controls style="width:100%;margin-bottom:8px;"></audio>`;
     } else if (mime.startsWith('text/') || mime.includes('json') || mime.includes('javascript') || mime.includes('neuron')) {
       let text = new TextDecoder().decode(data);
@@ -1745,13 +2651,13 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
       preview = `<div style="color:var(--text-dim);font-size:13px;margin-bottom:8px;">Binary content - use the download button to save.</div>`;
     }
 
-    const downloadUrl = URL.createObjectURL(new Blob([data], { type: mime }));
+    const downloadUrl = URL.createObjectURL(new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer], { type: mime }));
     const ext = mime.includes('json') || mime.includes('neuron') ? '.json' : mime.includes('html') ? '.html' : mime.includes('css') ? '.css' : mime.includes('javascript') ? '.js' : '';
     const filename = escHtml((meta.name || cid.slice(0, 12)) + ext);
 
     resultEl.innerHTML = `
       ${preview}
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;line-height:1.8;">
+      <div style="font-size:12px;color:var(--text-muted);margin-top:10px;margin-bottom:8px;line-height:1.8;">
         Visibility: <strong style="color:${wasEncrypted ? 'var(--warning)' : 'var(--accent)'}">${visLabel}</strong>
         &nbsp;|&nbsp; MIME: ${escHtml(mime)} &nbsp;|&nbsp; Size: ${sizeStr}${meta.name ? ` &nbsp;|&nbsp; Name: ${escHtml(meta.name)}` : ''}
       </div>
@@ -1801,7 +2707,7 @@ function getInfo() {
 const NFT_TEMPLATE_NAME = 'NFTCollection';
 const NFT_TEMPLATE_CODE = `// NFT Collection (ERC-721 style)
 // Deploy with:  init("My Collection", "MNFT")
-// Mint with:    mint("My artwork title", "<helia-cid>")
+// Mint with:    mint("My artwork title", "<content-cid>")
 // Transfer with: transfer(1, "recipient_pub_key")
 function init(name, symbol) {
   if (state.initialized) return { error: 'already initialized' };
@@ -1817,7 +2723,7 @@ function mint(metadata, cid) {
   state.tokens[id] = {
     owner: caller,
     metadata,
-    cid,      // Helia/IPFS content CID (image, video, etc.)
+    cid,      // content CID (image, video, etc.)
     mintedAt: Date.now()
   };
   return { tokenId: id, owner: caller, cid };

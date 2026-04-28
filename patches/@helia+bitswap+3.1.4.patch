@@ -1,0 +1,26 @@
+diff --git a/node_modules/@helia/bitswap/dist/src/network.js b/node_modules/@helia/bitswap/dist/src/network.js
+index 639149f..e8bdd8a 100644
+--- a/node_modules/@helia/bitswap/dist/src/network.js
++++ b/node_modules/@helia/bitswap/dist/src/network.js
+@@ -64,6 +64,12 @@ export class Network extends TypedEventEmitter {
+         });
+         // register protocol with topology
+         const topology = {
++            // notifyOnLimitedConnection must mirror runOnLimitedConnections so that
++            // the libp2p registrar fires onConnect for circuit-relay (limited)
++            // connections. Without this flag the registrar silently skips limited
++            // peers and BitSwap's internal peer list stays empty, meaning no WANT
++            // messages are ever sent and every retrieve times out.
++            notifyOnLimitedConnection: this.runOnLimitedConnections,
+             onConnect: (peerId) => {
+                 this.safeDispatchEvent('peer:connected', {
+                     detail: peerId
+@@ -228,7 +234,7 @@ export class Network extends TypedEventEmitter {
+             }
+             this.log('sendMessage to %p', peerId);
+             options?.onProgress?.(new CustomProgressEvent('bitswap:network:send-wantlist', peerId));
+-            const stream = await this.libp2p.dialProtocol(peerId, BITSWAP_120, options);
++            const stream = await this.libp2p.dialProtocol(peerId, BITSWAP_120, { ...options, runOnLimitedConnection: this.runOnLimitedConnections });
+             await stream.closeRead();
+             try {
+                 for (const buf of splitMessage(message, this.maxOutgoingMessageSize)) {

@@ -7,8 +7,20 @@ export interface Account {
   nonce: number;
   createdAt: number;
   faceMapHash: string;
-  /** Canonical 128-D face descriptor for cross-session similarity matching */
+  /** @deprecated Use encryptedFaceDescriptor. Kept for legacy read compatibility. */
   faceDescriptor?: number[];
+  /** Canonical 128-D face descriptor encrypted with the PIN key (privacy-preserving) */
+  encryptedFaceDescriptor?: string;
+  /** base64 32-byte PBKDF2 salt for PIN key derivation (per-account, public) */
+  pinSalt?: string;
+  /** SHA-256(encryptedKeys:faceMapHash:pub) — ties the face+PIN blob to this account on-chain */
+  linkedAnchor?: string;
+  /** ML-DSA-65 public key (base64) — quantum-safe signature verification */
+  pqPub?: string;
+  /** ML-KEM-768 public key (base64) — quantum-safe key encapsulation */
+  pqKemPub?: string;
+  /** AES-GCM(pinKey, "PINOK") — used to verify PIN without decrypting the full key blob */
+  pinVerifier?: string;
 }
 
 export interface AccountWithKeys extends Account {
@@ -34,14 +46,23 @@ export async function generateAccountKeys(): Promise<KeyPair> {
   return generateKeyPair();
 }
 
+export interface AccountExtras {
+  encryptedFaceDescriptor?: string;
+  pinSalt?: string;
+  pinVerifier?: string;
+  linkedAnchor?: string;
+  pqPub?: string;
+  pqKemPub?: string;
+}
+
 /**
- * Build an Account object (without keys - keys are face-locked).
+ * Build an Account object (without keys - keys are face+PIN locked).
  */
 export function buildAccount(
   username: string,
   pub: string,
   faceMapHash: string,
-  faceDescriptor?: number[],
+  extras: AccountExtras = {},
 ): Account {
   return {
     username,
@@ -50,6 +71,6 @@ export function buildAccount(
     nonce: 0,
     createdAt: Date.now(),
     faceMapHash,
-    faceDescriptor,
+    ...extras,
   };
 }

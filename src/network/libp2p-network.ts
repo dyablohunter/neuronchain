@@ -105,6 +105,7 @@ import { EventEmitter } from '../core/events';
 import { AccountBlock } from '../core/dag-block';
 import { Vote } from '../core/vote';
 import { verifySignature } from '../core/crypto';
+import { LockoutNotice } from '../core/pin-crypto';
 
 export const NUM_SYNAPSES = 4;
 
@@ -199,7 +200,12 @@ function topicAccounts(network: string): string { return `neuronchain/${network}
 function topicInbox(network: string, pubShort: string): string { return `neuronchain/${network}/inbox/${pubShort}`; }
 function topicGeneration(network: string): string { return `neuronchain/${network}/generation`; }
 function topicStorageReceipts(network: string): string { return `neuronchain/${network}/storage/receipts`; }
-function topicStoragePinRequests(network: string): string { return `neuronchain/${network}/storage/pin-requests`; }
+function topicStorageCacheRequests(network: string): string { return `neuronchain/${network}/storage/cache-requests`; }
+function topicStorageDeleteRequests(network: string): string { return `neuronchain/${network}/storage/delete-requests`; }
+function topicLockouts(network: string): string { return `neuronchain/${network}/lockouts`; }
+function topicKeyBlobs(network: string): string { return `neuronchain/${network}/keyblobs`; }
+function topicBlobRequests(network: string): string { return `neuronchain/${network}/blob-requests`; }
+function topicPeerAddrs(network: string): string { return `neuronchain/${network}/peer-addrs`; }
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -238,7 +244,7 @@ export const KNOWN_OPERATORS: string[] = [];
 // ── Main class ────────────────────────────────────────────────────────────────
 
 export class Libp2pNetwork extends EventEmitter {
-  /** The underlying libp2p node - exposed so Helia can share it instead of creating its own */
+  /** The underlying libp2p node */
   libp2p!: Awaited<ReturnType<typeof createLibp2p>>;
   private db!: IDBPDatabase<NeuronDB>;
   private network: string;
@@ -251,6 +257,15 @@ export class Libp2pNetwork extends EventEmitter {
   private generation = 0;
   private watchedInboxes: Set<string> = new Set();
   private static readonly MAX_PROCESSED = 50_000;
+  /** Decentralised lockout notices: accountPub → latest LockoutNotice */
+  private lockoutNotices: Map<string, LockoutNotice> = new Map();
+  private static readonly MAX_LOCKOUTS = 10_000;
+  /** circuit-relay multiaddrs received from other peers: peerId → addrs */
+  knownPeerAddrs: Map<string, string[]> = new Map();
+  private peerAddrTimer: ReturnType<typeof setInterval> | null = null;
+  private peerAddrBroadcastDebounce: ReturnType<typeof setTimeout> | null = null;
+  /** Our own smoke Hub address — included in peer-addrs broadcasts for peer discovery */
+  private smokeAddr = '';
 
   constructor(network: string) {
     super();
@@ -282,11 +297,19 @@ export class Libp2pNetwork extends EventEmitter {
     }] : [];
 
     this.libp2p = await createLibp2p({
+      addresses: {
+        // '/p2p-circuit' triggers the circuit-relay transport's listen() path,
+        // which calls reservationStore.reserveRelay(). Without this entry the
+        // pendingReservations array stays empty, the store considers "enough relays
+        // found" (zero needed = zero required), and never makes a relay reservation —
+        // leaving getMultiaddrs() empty and the node with no reachable address.
+        listen: ['/p2p-circuit'],
+      },
       transports: [
         // Patch dialFilter: the default uses exactMatch which rejects http-path
         // multiaddrs (used to proxy the relay through Vite). Use matches() instead.
         (() => {
-          const factory = webSockets({ allowInsecureConnections: true });
+          const factory = webSockets({ allowInsecureConnections: true } as Parameters<typeof webSockets>[0]);
           return (components: Parameters<typeof factory>[0]) => {
             const t = factory(components);
             (t as unknown as Record<string, unknown>).dialFilter =
@@ -296,7 +319,7 @@ export class Libp2pNetwork extends EventEmitter {
           };
         })(),
         webRTC(),
-        circuitRelayTransport({ discoverRelays: 2 }),
+        circuitRelayTransport(),
       ],
       connectionEncrypters: [noise()],
       streamMuxers: [yamux()],
@@ -304,7 +327,7 @@ export class Libp2pNetwork extends EventEmitter {
         bootstrap({ list: bootstrapList, timeout: 3000 }),
       ],
       services: {
-        pubsub: gossipsub({ allowPublishToZeroTopicPeers: true, emitSelf: false, directPeers: gsDirectPeers, runOnLimitedConnection: true, directConnectTicks: 10 }),
+        pubsub: gossipsub({ allowPublishToZeroTopicPeers: true, emitSelf: false, directPeers: gsDirectPeers, runOnLimitedConnection: true, directConnectTicks: 10 }) as unknown as () => unknown,
         dht: kadDHT({ clientMode: true }),
         identify: identify(),
         ping: ping(),
@@ -330,22 +353,58 @@ export class Libp2pNetwork extends EventEmitter {
     await this.libp2p.start();
 
     // Subscribe to GossipSub topics
-    const pubsub = this.libp2p.services.pubsub as ReturnType<typeof gossipsub>;
+    const pubsub = this.libp2p.services.pubsub as unknown as GossipSub;
     for (let i = 0; i < NUM_SYNAPSES; i++) pubsub.subscribe(topicBlocks(this.network, i));
     pubsub.subscribe(topicVotes(this.network));
     pubsub.subscribe(topicAccounts(this.network));
     pubsub.subscribe(topicGeneration(this.network));
     pubsub.subscribe(topicStorageReceipts(this.network));
-    pubsub.subscribe(topicStoragePinRequests(this.network));
+    pubsub.subscribe(topicStorageCacheRequests(this.network));
+    pubsub.subscribe(topicStorageDeleteRequests(this.network));
+    pubsub.subscribe(topicLockouts(this.network));
+    pubsub.subscribe(topicKeyBlobs(this.network));
+    pubsub.subscribe(topicBlobRequests(this.network));
+    pubsub.subscribe(topicPeerAddrs(this.network));
 
     pubsub.addEventListener('message', (evt) => {
       const msg = evt.detail;
       this.handleMessage(msg.topic, msg.data).catch(console.error);
     });
 
+    // When a remote peer subscribes to the peer-addrs topic it means a new node
+    // is joining and wants to discover peer addresses. Re-broadcast immediately so
+    // they don't have to wait for the next heartbeat. This is the most reliable
+    // trigger because it fires on the publisher's side exactly when a new subscriber
+    // appears in the GossipSub mesh — regardless of whether there's a direct libp2p
+    // connection between the two browser peers.
+    pubsub.addEventListener('subscription-change', (evt: Event) => {
+      const detail = (evt as CustomEvent<{ subscriptions: Array<{ topic: string; subscribe: boolean }> }>).detail;
+      const interested = detail?.subscriptions?.some(
+        s => s.topic === topicPeerAddrs(this.network) && s.subscribe
+      );
+      if (interested) {
+        this.scheduleBroadcastPeerAddrs(500);
+      }
+    });
+
     this.running = true;
     this.startedAt = Date.now();
     this.emit('network:started', this.peerId);
+
+    // Broadcast peer-addrs as soon as our own circuit-relay address appears.
+    this.libp2p.addEventListener('self:peer:update', () => this.scheduleBroadcastPeerAddrs(500));
+
+    // Re-broadcast at staggered delays when a peer connects.
+    // GossipSub streams take 2-8s to form; retrying at 6s and 16s ensures at
+    // least one broadcast lands after the stream is established.
+    this.libp2p.addEventListener('peer:connect', () => {
+      setTimeout(() => this.broadcastPeerAddrs(), 2_000);
+      setTimeout(() => this.broadcastPeerAddrs(), 6_000);
+      setTimeout(() => this.broadcastPeerAddrs(), 16_000);
+    });
+
+    // Heartbeat every 15s as a fallback for any missed events.
+    this.peerAddrTimer = setInterval(() => this.broadcastPeerAddrs(), 15_000);
 
     // Fallback: if the relay wasn't up during fetchRelayInfo (all retries exhausted),
     // try one more time after the node has been running for 3s. This covers the edge
@@ -367,16 +426,43 @@ export class Libp2pNetwork extends EventEmitter {
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
+    if (this.peerAddrTimer) { clearInterval(this.peerAddrTimer); this.peerAddrTimer = null; }
+    if (this.peerAddrBroadcastDebounce) { clearTimeout(this.peerAddrBroadcastDebounce); this.peerAddrBroadcastDebounce = null; }
     await this.libp2p?.stop();
     this.trackedPeers.clear();
     this.emit('network:stopped');
+  }
+
+  private scheduleBroadcastPeerAddrs(delayMs: number): void {
+    if (!this.running) return;
+    if (this.peerAddrBroadcastDebounce) return; // already scheduled
+    this.peerAddrBroadcastDebounce = setTimeout(() => {
+      this.peerAddrBroadcastDebounce = null;
+      this.broadcastPeerAddrs();
+    }, delayMs);
+  }
+
+  /** Set our smoke Hub address so it is included in peer-addrs broadcasts. */
+  setSmokeAddr(addr: string): void {
+    this.smokeAddr = addr;
+    if (this.running) this.scheduleBroadcastPeerAddrs(200);
+  }
+
+  private broadcastPeerAddrs(): void {
+    if (!this.running) return;
+    const all = (this.libp2p?.getMultiaddrs?.() ?? []).map(ma => ma.toString());
+    const addrs = all.filter(a => a.includes('p2p-circuit'));
+    if (addrs.length === 0) { console.warn('[Libp2p] No circuit-relay addrs yet — relay reservation may not have completed'); return; }
+    const msg: Record<string, unknown> = { peerId: this.peerId, addrs };
+    if (this.smokeAddr) msg.smokeAddr = this.smokeAddr;
+    this.publish(topicPeerAddrs(this.network), msg);
   }
 
   // ── Message handler ───────────────────────────────────────────────────────
 
   private async handleMessage(topic: string, data: Uint8Array): Promise<void> {
     if (topic === topicGeneration(this.network)) {
-      const msg = decode<{ generation?: number; signature?: string; operatorPub?: string }>(data);
+      const msg = decode<{ generation?: number; signature?: string; operatorPub?: string; resetAt?: number }>(data);
       if (typeof msg.generation !== 'number' || msg.generation <= this.generation) return;
       if (this.network === 'mainnet') {
         if (!msg.signature || !msg.operatorPub || !KNOWN_OPERATORS.includes(msg.operatorPub)) return;
@@ -385,25 +471,22 @@ export class Libp2pNetwork extends EventEmitter {
       }
       this.generation = msg.generation;
       this.saveGeneration();
-      // Mirror what clearAll() does locally: wipe DB and dedup sets so this peer
-      // accepts the reset-generation blocks from other peers.
-      //
-      // Without this, if Device A resets (gen 0→1) and Device B later also resets
-      // (gen 1→2), Device A would receive the gen=2 message and update its counter
-      // in localStorage, but keep stale blocks in IndexedDB and processedBlocks.
-      // On next startup Device A would publish those blocks with _gen=1, and Device B
-      // (now gen=2) would drop them via the `raw._gen < this.generation` guard.
-      // Wiping here + emitting generation:changed (→ node.ts → ledger.reset() →
-      // location.reload()) ensures both devices land at the same clean state.
-      try {
-        await this.db.clear('blocks');
-        await this.db.clear('accounts');
-        await this.db.clear('votes');
-        await this.db.clear('contracts');
-      } catch { /* ignore */ }
-      this.processedBlocks.clear();
-      this.processedVotes.clear();
-      this.emit('generation:changed', this.generation);
+      // isReset = true only when clearAll() triggered this — it stamps resetAt.
+      // publishLocalData() re-broadcasts without resetAt, so peers syncing their
+      // generation counter don't have their data wiped.
+      const isReset = typeof msg.resetAt === 'number' && (Date.now() - msg.resetAt < 10 * 60 * 1000);
+      if (isReset) {
+        // Real testnet reset: wipe all stored data so old-gen blocks don't re-enter
+        try {
+          await this.db.clear('blocks');
+          await this.db.clear('accounts');
+          await this.db.clear('votes');
+          await this.db.clear('contracts');
+        } catch { /* ignore */ }
+        this.processedBlocks.clear();
+        this.processedVotes.clear();
+      }
+      this.emit('generation:changed', isReset);
       return;
     }
 
@@ -421,6 +504,11 @@ export class Libp2pNetwork extends EventEmitter {
         // re-broadcasts. That's why sweepUnclaimedReceives() in node.ts periodically
         // scans ledger.unclaimedSends directly instead of relying on this event.
         if (block && !this.processedBlocks.has(block.hash)) {
+          // Enforce decentralised lockout: drop blocks from accounts under active lockout
+          const lockout = this.lockoutNotices.get(block.accountPub);
+          if (lockout && lockout.lockedUntil > Date.now()) {
+            return; // Silently drop — account is locked out by peer consensus
+          }
           this.processedBlocks.add(block.hash);
           this.capSet(this.processedBlocks);
           await this.db.put('blocks', block as NeuronDB['blocks']);
@@ -433,7 +521,7 @@ export class Libp2pNetwork extends EventEmitter {
     if (topic === topicVotes(this.network)) {
       const raw = decode<Record<string, unknown>>(data);
       if (raw.blockHash === null || raw.voterPub === null || raw.signature === null) return;
-      const vote = raw as Vote;
+      const vote = raw as unknown as Vote;
       const key = `${vote.blockHash}:${vote.voterPub}`;
       if (vote.blockHash && vote.voterPub && !this.processedVotes.has(key)) {
         this.processedVotes.add(key);
@@ -471,10 +559,73 @@ export class Libp2pNetwork extends EventEmitter {
       return;
     }
 
-    if (topic === topicStoragePinRequests(this.network)) {
+    if (topic === topicStorageCacheRequests(this.network)) {
       const req = decode<Record<string, unknown>>(data);
       if (req.cid && req.uploaderPub && Array.isArray(req.targetProviders)) {
-        this.emit('storage:pin-request', req);
+        this.emit('storage:cache-request', req);
+      }
+      return;
+    }
+
+    if (topic === topicStorageDeleteRequests(this.network)) {
+      const req = decode<Record<string, unknown>>(data);
+      if (Array.isArray(req.cids) && req.ownerPub && req.signature) {
+        this.emit('storage:delete-request', req);
+      }
+      return;
+    }
+
+    if (topic === topicLockouts(this.network)) {
+      const notice = decode<LockoutNotice>(data);
+      if (
+        notice.accountPub &&
+        typeof notice.failedAttempts === 'number' &&
+        typeof notice.lockedUntil === 'number' &&
+        typeof notice.timestamp === 'number' &&
+        Date.now() - notice.timestamp < 5 * 60 * 1000 // reject stale notices >5min old
+      ) {
+        const existing = this.lockoutNotices.get(notice.accountPub);
+        // Only update if this notice has a higher attempt count or later lockout
+        if (!existing || notice.failedAttempts >= existing.failedAttempts) {
+          if (this.lockoutNotices.size >= Libp2pNetwork.MAX_LOCKOUTS) {
+            // Evict the oldest/least-locked entry
+            const oldestKey = this.lockoutNotices.keys().next().value;
+            if (oldestKey) this.lockoutNotices.delete(oldestKey);
+          }
+          this.lockoutNotices.set(notice.accountPub, notice);
+          this.emit('lockout:received', notice);
+        }
+      }
+      return;
+    }
+
+    if (topic === topicKeyBlobs(this.network)) {
+      const blob = decode<Record<string, unknown>>(data);
+      if (blob.pub && blob.encryptedKeys && blob.username) {
+        await this.db.put('keyblobs', blob as NeuronDB['keyblobs']).catch(() => {});
+        this.emit('blob:received', blob);
+      }
+      return;
+    }
+
+    if (topic === topicBlobRequests(this.network)) {
+      const req = decode<{ username: string }>(data);
+      if (req.username) {
+        // Respond if we have this blob locally
+        const all = await this.db.getAll('keyblobs').catch(() => [] as NeuronDB['keyblobs'][]);
+        const found = all.find(b => (b as Record<string, unknown>).username === req.username);
+        if (found) {
+          this.publish(topicKeyBlobs(this.network), found);
+        }
+      }
+      return;
+    }
+
+    if (topic === topicPeerAddrs(this.network)) {
+      const msg = decode<{ peerId?: string; addrs?: string[]; smokeAddr?: string }>(data);
+      if (msg.peerId && msg.peerId !== this.peerId && Array.isArray(msg.addrs) && msg.addrs.length > 0) {
+        this.knownPeerAddrs.set(msg.peerId, msg.addrs);
+        this.emit('peer:addrs', { peerId: msg.peerId, addrs: msg.addrs, smokeAddr: msg.smokeAddr });
       }
       return;
     }
@@ -504,6 +655,19 @@ export class Libp2pNetwork extends EventEmitter {
     });
   }
 
+  publishLockout(notice: LockoutNotice): void {
+    if (!this.running) return;
+    // Store locally so our own blocks aren't affected during this session
+    this.lockoutNotices.set(notice.accountPub, notice);
+    this.publish(topicLockouts(this.network), notice);
+  }
+
+  /** Check if an account is currently under a decentralised lockout (held by any peer) */
+  isLockedOut(accountPub: string): boolean {
+    const notice = this.lockoutNotices.get(accountPub);
+    return !!notice && notice.lockedUntil > Date.now();
+  }
+
   publishInboxSignal(recipientPub: string, senderPub: string, blockHash: string, amount: number, signature?: string): void {
     if (!this.running) return;
     const pubShort = recipientPub.slice(0, 16);
@@ -516,7 +680,7 @@ export class Libp2pNetwork extends EventEmitter {
     const pubShort = recipientPub.slice(0, 16);
     const topic = topicInbox(this.network, pubShort);
     if (this.running) {
-      (this.libp2p.services.pubsub as ReturnType<typeof gossipsub>).subscribe(topic);
+      (this.libp2p.services.pubsub as unknown as GossipSub).subscribe(topic);
     }
     this.on('inbox:signal', (sig: unknown) => {
       const s = sig as { sender?: string; blockHash?: string; amount?: number; timestamp?: number; signature?: string };
@@ -529,7 +693,7 @@ export class Libp2pNetwork extends EventEmitter {
   saveAccount(pub: string, account: Record<string, unknown>): void {
     if (!this.running) return;
     const data = { ...account, _gen: this.generation };
-    this.db.put('accounts', data as NeuronDB['accounts']).catch(() => {});
+    this.db.put('accounts', data as unknown as NeuronDB['accounts']).catch(() => {});
     this.publish(topicAccounts(this.network), data);
   }
 
@@ -540,7 +704,10 @@ export class Libp2pNetwork extends EventEmitter {
 
   saveKeyBlob(pub: string, blob: Record<string, unknown>): void {
     if (!this.running) return;
-    this.db.put('keyblobs', { ...blob, pub } as NeuronDB['keyblobs']).catch(() => {});
+    const entry = { ...blob, pub };
+    this.db.put('keyblobs', entry as NeuronDB['keyblobs']).catch(() => {});
+    // Gossip so other devices can recover without being online at enrollment time
+    this.publish(topicKeyBlobs(this.network), entry);
   }
 
   async loadKeyBlob(pub: string): Promise<Record<string, unknown> | null> {
@@ -550,12 +717,34 @@ export class Libp2pNetwork extends EventEmitter {
     } catch { return null; }
   }
 
-  async findKeyBlobByUsername(username: string): Promise<Record<string, unknown> | null> {
+  async findKeyBlobByUsername(username: string, timeoutMs = 6000): Promise<Record<string, unknown> | null> {
+    // Fast path: local IDB
     try {
       const all = await this.db.getAll('keyblobs');
       const found = all.find(b => (b as Record<string, unknown>).username === username);
-      return found ? (found as Record<string, unknown>) : null;
-    } catch { return null; }
+      if (found) return found as Record<string, unknown>;
+    } catch { /* fall through */ }
+
+    // Slow path: ask peers over GossipSub and wait for a response
+    if (!this.running) return null;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.off('blob:received', handler);
+        resolve(null);
+      }, timeoutMs);
+
+      const handler = (...args: unknown[]) => {
+        const blob = args[0] as Record<string, unknown>;
+        if (blob && blob.username === username) {
+          clearTimeout(timer);
+          this.off('blob:received', handler);
+          resolve(blob);
+        }
+      };
+
+      this.on('blob:received', handler);
+      this.publish(topicBlobRequests(this.network), { username });
+    });
   }
 
   async loadAccount(pub: string): Promise<Record<string, unknown> | null> {
@@ -615,6 +804,12 @@ export class Libp2pNetwork extends EventEmitter {
 
   // ── Reset ─────────────────────────────────────────────────────────────────
 
+  publishGeneration(): void {
+    if (this.generation > 0) {
+      this.publish(topicGeneration(this.network), { generation: this.generation });
+    }
+  }
+
   async clearAll(operatorKeys?: { pub: string; priv: string; epub: string; epriv: string }): Promise<void> {
     if (this.network === 'mainnet' && !operatorKeys) {
       console.error('[Libp2p] Mainnet clearAll requires operator keys');
@@ -630,7 +825,7 @@ export class Libp2pNetwork extends EventEmitter {
       const signature = await signData(payload, operatorKeys);
       this.publish(topicGeneration(this.network), { generation: this.generation, signature, operatorPub: operatorKeys.pub });
     } else {
-      this.publish(topicGeneration(this.network), { generation: this.generation });
+      this.publish(topicGeneration(this.network), { generation: this.generation, resetAt: Date.now() });
     }
 
     try {
@@ -649,8 +844,8 @@ export class Libp2pNetwork extends EventEmitter {
 
   private publish(topic: string, obj: unknown): void {
     if (!this.running) return;
-    const pubsub = this.libp2p.services.pubsub as ReturnType<typeof gossipsub>;
-    pubsub.publish(topic, encode(obj)).catch((e: unknown) => {
+    const pubsub = this.libp2p.services.pubsub as unknown as GossipSub;
+    pubsub.publish(topic, encode(obj)).then(() => { /* ok */ }).catch((e: unknown) => {
       // "not enough peers" is expected when offline - suppress
       const msg = e instanceof Error ? e.message : String(e);
       if (!msg.includes('not enough peers') && !msg.includes('no peers')) {
@@ -676,12 +871,14 @@ export class Libp2pNetwork extends EventEmitter {
       sendBlockHash: block.sendBlockHash || '', sendFrom: block.sendFrom || '',
       receiveAmount: block.receiveAmount ?? 0, faceMapHash: block.faceMapHash || '',
       contractData: block.contractData || '', contentCid: block.contentCid || '',
+      updateData: block.updateData || '',
     };
   }
 
   private static readonly VALID_BLOCK_TYPES = new Set([
     'open', 'send', 'receive', 'deploy', 'call',
     'storage-register', 'storage-deregister', 'storage-heartbeat', 'storage-reward',
+    'update',
   ]);
 
   private deserializeBlock(data: Record<string, unknown>): AccountBlock | null {
@@ -702,6 +899,7 @@ export class Libp2pNetwork extends EventEmitter {
         faceMapHash: data.faceMapHash ? String(data.faceMapHash) : undefined,
         contractData: data.contractData ? String(data.contractData) : undefined,
         contentCid: data.contentCid ? String(data.contentCid) : undefined,
+        updateData: data.updateData ? String(data.updateData) : undefined,
       };
     } catch { return null; }
   }
@@ -717,13 +915,22 @@ export class Libp2pNetwork extends EventEmitter {
     this.on('storage:receipt', callback as (data: unknown) => void);
   }
 
-  publishPinRequest(request: Record<string, unknown>): void {
+  publishCacheRequest(request: Record<string, unknown>): void {
     if (!this.running) return;
-    this.publish(topicStoragePinRequests(this.network), request);
+    this.publish(topicStorageCacheRequests(this.network), request);
   }
 
-  watchPinRequests(callback: (request: Record<string, unknown>) => void): void {
-    this.on('storage:pin-request', callback as (data: unknown) => void);
+  watchCacheRequests(callback: (request: Record<string, unknown>) => void): void {
+    this.on('storage:cache-request', callback as (data: unknown) => void);
+  }
+
+  publishDeleteRequest(request: Record<string, unknown>): void {
+    if (!this.running) return;
+    this.publish(topicStorageDeleteRequests(this.network), request);
+  }
+
+  watchDeleteRequests(callback: (request: Record<string, unknown>) => void): void {
+    this.on('storage:delete-request', callback as (data: unknown) => void);
   }
 
   getStats(): NetworkStats {

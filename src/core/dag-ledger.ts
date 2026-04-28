@@ -37,6 +37,8 @@ export interface DAGStats {
  */
 export interface StorageProvider {
   pub: string;
+  /** Stable device ID of the registering machine - only that device serves content */
+  deviceId: string;
   registeredAt: number;
   /** Offered capacity in GB from latest storage-register block */
   capacityGB: number;
@@ -87,6 +89,11 @@ export class DAGLedger extends EventEmitter {
   registerAccount(account: Account): boolean {
     const existing = this.accounts.get(account.pub);
     if (existing) {
+      // Merge remote data into the existing in-memory account.
+      // Use the higher balance/nonce (authoritative chain state wins, but remote
+      // may know about blocks we haven't seen yet).
+      if (account.balance > existing.balance) existing.balance = account.balance;
+      if (account.nonce > existing.nonce) existing.nonce = account.nonce;
       if (account.username && account.username !== existing.username && account.username !== account.pub) {
         this.usernameToPublicKey.delete(existing.username);
         existing.username = account.username;
@@ -94,6 +101,12 @@ export class DAGLedger extends EventEmitter {
       }
       if (account.faceMapHash && !existing.faceMapHash) existing.faceMapHash = account.faceMapHash;
       if (account.faceDescriptor && !existing.faceDescriptor) existing.faceDescriptor = account.faceDescriptor;
+      if (account.encryptedFaceDescriptor && !existing.encryptedFaceDescriptor) existing.encryptedFaceDescriptor = account.encryptedFaceDescriptor;
+      if (account.linkedAnchor && !existing.linkedAnchor) existing.linkedAnchor = account.linkedAnchor;
+      if (account.pqPub && !existing.pqPub) existing.pqPub = account.pqPub;
+      if (account.pqKemPub && !existing.pqKemPub) existing.pqKemPub = account.pqKemPub;
+      if (account.pinSalt && !existing.pinSalt) existing.pinSalt = account.pinSalt;
+      if (account.pinVerifier && !existing.pinVerifier) existing.pinVerifier = account.pinVerifier;
       return true;
     }
     if (this.usernameToPublicKey.has(account.username) && account.username !== account.pub) return false;
@@ -225,19 +238,43 @@ export class DAGLedger extends EventEmitter {
     return { block };
   }
 
+  /**
+   * Create an account update block to change face hash, linked anchor, and/or PQ keys on-chain.
+   * Must be signed with the account's existing private key — proves ownership.
+   */
+  async createUpdate(
+    pub: string,
+    keys: KeyPair,
+    changes: {
+      newFaceMapHash?: string;
+      newLinkedAnchor: string;
+      newPQPub?: string;
+      newPQKemPub?: string;
+    },
+  ): Promise<{ block?: AccountBlock; error?: string }> {
+    const head = this.getAccountHead(pub);
+    if (!head) return { error: 'Account not opened' };
+    const block = await createAccountBlock({
+      accountPub: pub, index: head.index + 1, type: 'update',
+      previousHash: head.hash, balance: head.balance,
+      updateData: JSON.stringify(changes),
+    }, keys);
+    return { block };
+  }
+
   // ── Storage ledger block creation ─────────────────────────────────────────
 
   /**
    * Register as a storage provider. capacityGB = 0 deregisters.
    */
-  async createStorageRegister(pub: string, capacityGB: number, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
+  async createStorageRegister(pub: string, capacityGB: number, keys: KeyPair, deviceId?: string): Promise<{ block?: AccountBlock; error?: string }> {
     const head = this.getAccountHead(pub);
     if (!head) return { error: 'Account not opened' };
     if (capacityGB <= 0) return { error: 'capacityGB must be a positive number' };
     const block = await createAccountBlock({
       accountPub: pub, index: head.index + 1, type: 'storage-register',
       previousHash: head.hash, balance: head.balance,
-      contractData: JSON.stringify({ type: 'storage-register', capacityGB } satisfies StorageRegisterData),
+      contractData: JSON.stringify({ type: 'storage-register', capacityGB, deviceId } satisfies StorageRegisterData),
     }, keys);
     return { block };
   }
@@ -251,6 +288,7 @@ export class DAGLedger extends EventEmitter {
     const block = await createAccountBlock({
       accountPub: pub, index: head.index + 1, type: 'storage-deregister',
       previousHash: head.hash, balance: head.balance,
+      contractData: JSON.stringify({ capacityGB: provider.capacityGB }),
     }, keys);
     return { block };
   }
@@ -338,7 +376,8 @@ export class DAGLedger extends EventEmitter {
   async addBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
     if (this.allBlocks.has(block.hash)) return { success: true };
 
-    const sigValid = await verifyBlockSignature(block);
+    const account = this.accounts.get(block.accountPub);
+    const sigValid = await verifyBlockSignature(block, account?.pqPub);
     if (!sigValid) return { success: false, error: 'Invalid signature' };
 
     const parent = block.type === 'open' ? null : this.allBlocks.get(block.previousHash) || null;
@@ -372,6 +411,12 @@ export class DAGLedger extends EventEmitter {
 
     const voteResult = this.votes.registerBlock(block.hash, block.previousHash, block.accountPub);
 
+    // Reject a second OPEN block for an account that already has one.
+    // A peer re-broadcasting a stale or forked OPEN block should not corrupt the chain.
+    if (block.type === 'open' && this.accountChains.has(block.accountPub)) {
+      return { success: false, error: 'Account already has an open block' };
+    }
+
     this.allBlocks.set(block.hash, block);
     if (!this.accountChains.has(block.accountPub)) this.accountChains.set(block.accountPub, []);
     this.accountChains.get(block.accountPub)!.push(block);
@@ -404,6 +449,7 @@ export class DAGLedger extends EventEmitter {
         const existing = this.storageProviders.get(block.accountPub);
         const provider: StorageProvider = {
           pub: block.accountPub,
+          deviceId: data.deviceId ?? existing?.deviceId ?? '',
           registeredAt: existing?.registeredAt ?? block.timestamp,
           capacityGB: data.capacityGB,
           lastHeartbeat: existing?.lastHeartbeat ?? 0,
@@ -452,6 +498,33 @@ export class DAGLedger extends EventEmitter {
     if (block.type === 'open' && block.faceMapHash) {
       const prev = this.faceAccountCount.get(block.faceMapHash) || 0;
       this.faceAccountCount.set(block.faceMapHash, prev + 1);
+    }
+
+    if (block.type === 'update' && block.updateData) {
+      try {
+        const data = JSON.parse(block.updateData) as {
+          newFaceMapHash?: string;
+          newLinkedAnchor: string;
+          newPQPub?: string;
+          newPQKemPub?: string;
+        };
+        const acc = this.accounts.get(block.accountPub);
+        if (acc) {
+          if (data.newFaceMapHash) {
+            // Update face count map
+            const oldHash = acc.faceMapHash;
+            const oldCount = this.faceAccountCount.get(oldHash) || 0;
+            if (oldCount > 0) this.faceAccountCount.set(oldHash, oldCount - 1);
+            const newCount = this.faceAccountCount.get(data.newFaceMapHash) || 0;
+            this.faceAccountCount.set(data.newFaceMapHash, newCount + 1);
+            acc.faceMapHash = data.newFaceMapHash;
+          }
+          if (data.newLinkedAnchor) acc.linkedAnchor = data.newLinkedAnchor;
+          if (data.newPQPub) acc.pqPub = data.newPQPub;
+          if (data.newPQKemPub) acc.pqKemPub = data.newPQKemPub;
+          this.emit('account:updated', acc);
+        }
+      } catch { /* invalid updateData */ }
     }
 
     const acc = this.accounts.get(block.accountPub);

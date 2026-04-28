@@ -34,6 +34,7 @@ import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { promises as fs } from 'fs';
 import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
 import { AbstractMessageStream } from '@libp2p/utils';
 import { GossipSub } from '@chainsafe/libp2p-gossipsub';
 
@@ -144,6 +145,12 @@ async function main() {
         reservations: {
           maxReservations: 1024,
           reservationTtl: 2 * 60 * 60 * 1000, // 2h
+          // Default data limit is 128 KB per circuit — raise it so large content
+          // transfers (signaling, libp2p protocol messages) can complete freely.
+          defaultDataLimit: BigInt(1 << 30), // 1 GB per circuit
+          // Default duration limit is 2 minutes — raise it for long-running sessions.
+          // Set to 1 hour so smoke WebRTC sessions don't get cut off mid-transfer.
+          defaultDurationLimit: 60 * 60 * 1000, // 1 hour in ms
         },
       }),
       dht: kadDHT({
@@ -174,15 +181,97 @@ async function main() {
     pubsub.subscribe(`neuronchain/${network}/votes`);
     pubsub.subscribe(`neuronchain/${network}/accounts`);
     pubsub.subscribe(`neuronchain/${network}/generation`);
-    pubsub.subscribe(`neuronchain/${network}/storage-offers`);
+    pubsub.subscribe(`neuronchain/${network}/storage/pin-requests`);
+    pubsub.subscribe(`neuronchain/${network}/storage/receipts`);
+    pubsub.subscribe(`neuronchain/${network}/lockouts`);
+    pubsub.subscribe(`neuronchain/${network}/keyblobs`);
+    pubsub.subscribe(`neuronchain/${network}/blob-requests`);
+    pubsub.subscribe(`neuronchain/${network}/peer-addrs`);
   }
 
+  // ── Peer-addr cache and replay ────────────────────────────────────────────
+  // Problem: when Browser A publishes peer-addrs, Browser B may not be in the
+  // relay's GossipSub mesh yet (mesh formation takes 1–3 gossipsub heartbeats).
+  // Solution: the relay caches the latest peer-addrs per sender and replays
+  // them to new subscribers + re-publishes after a short delay when received
+  // so that peers who join the mesh slightly late still receive the addrs.
+
+  // peerId → { topic, data: Uint8Array, timestamp: number }
+  // Keyed by peerId (not topic:peerId) so we can filter by connection status.
+  const peerAddrCache = new Map();
+  // topic → setTimeout handle (debounce)
+  const rebroadcastTimers = new Map();
+
+  /** Return Set of peer ID strings currently connected to this relay. */
+  function connectedPeerIds() {
+    return new Set(node.getConnections().map(c => c.remotePeer.toString()));
+  }
+
+  /**
+   * Re-broadcast all cached peer-addrs for `topic`, but ONLY for peers that are
+   * currently connected to this relay. Stale entries from previous browser sessions
+   * (which would cause NO_RESERVATION errors) are silently skipped.
+   */
+  function scheduleRebroadcast(topic, delayMs) {
+    if (rebroadcastTimers.has(topic)) return;
+    rebroadcastTimers.set(topic, setTimeout(() => {
+      rebroadcastTimers.delete(topic);
+      const connected = connectedPeerIds();
+      const now = Date.now();
+      let sent = 0;
+      for (const [peerId, cached] of peerAddrCache) {
+        if (cached.topic === topic &&
+            now - cached.timestamp < 3 * 60 * 1000 && // 3-min TTL
+            connected.has(peerId)) {
+          pubsub.publish(topic, cached.data).catch(() => {});
+          sent++;
+        }
+      }
+    }, delayMs));
+  }
+
+  pubsub.addEventListener('message', (evt) => {
+    const msg = evt.detail;
+    if (!msg.topic.endsWith('/peer-addrs')) return;
+    try {
+      const decoded = JSON.parse(new TextDecoder().decode(msg.data));
+      if (decoded.peerId && Array.isArray(decoded.addrs) && decoded.addrs.length > 0) {
+        peerAddrCache.set(decoded.peerId, {
+          topic: msg.topic,
+          data: msg.data,
+          timestamp: Date.now(),
+        });
+        // Re-broadcast after 1.5s so peers that joined the mesh slightly late
+        // (GossipSub mesh formation takes up to ~2 heartbeats) still receive it.
+        scheduleRebroadcast(msg.topic, 1500);
+      }
+    } catch { /* malformed - ignore */ }
+  });
+
   // Dynamically mirror any neuronchain topic a browser peer subscribes to
-  // (covers dynamic inbox topics like neuronchain/{network}/inbox/{pubShort})
+  // (covers dynamic inbox topics like neuronchain/{network}/inbox/{pubShort}).
+  // Also replays cached peer-addrs when a new peer subscribes to a peer-addrs topic.
   pubsub.addEventListener('subscription-change', (evt) => {
     for (const { topic, subscribe } of evt.detail.subscriptions) {
       if (subscribe && topic.startsWith('neuronchain/')) {
         try { pubsub.subscribe(topic); } catch { /* already subscribed */ }
+      }
+      if (subscribe && topic.endsWith('/peer-addrs')) {
+        // New subscriber — replay cached peer-addrs (for currently-connected peers only)
+        // after a delay so the GossipSub stream and mesh have time to fully form.
+        setTimeout(() => {
+          const connected = connectedPeerIds();
+          const now = Date.now();
+          let replayed = 0;
+          for (const [peerId, cached] of peerAddrCache) {
+            if (cached.topic === topic &&
+                now - cached.timestamp < 3 * 60 * 1000 &&
+                connected.has(peerId)) {
+              pubsub.publish(topic, cached.data).catch(() => {});
+              replayed++;
+            }
+          }
+        }, 2000);
       }
     }
   });
@@ -202,6 +291,57 @@ async function main() {
     } else {
       res.writeHead(404);
       res.end();
+    }
+  });
+
+  // ── Smoke Hub ──────────────────────────────────────────────────────────────
+  // WebSocket signaling server for @sinclair/smoke WebRTC connections.
+  // Browsers connect to ws://host:PORT+2/smoke-hub (proxied via Vite in dev).
+  // Each peer registers with its UUID address; the hub routes ICE/offer/answer
+  // messages between peers so smoke's Http-over-WebRTC layer can establish
+  // direct data-channel connections for block transfer.
+
+  const smokeHubWss = new WebSocketServer({ noServer: true });
+  /** address string → WebSocket */
+  const smokeHubPeers = new Map();
+
+  smokeHubWss.on('connection', (ws) => {
+    let address = null;
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (!address && msg.type === 'register' && typeof msg.address === 'string') {
+          address = msg.address;
+          smokeHubPeers.set(address, ws);
+          console.log(`[SmokeHub] Peer registered: ${address.slice(0, 8)}...`);
+          return;
+        }
+        if (address && typeof msg.to === 'string' && smokeHubPeers.has(msg.to)) {
+          const target = smokeHubPeers.get(msg.to);
+          if (target.readyState === 1 /* OPEN */) {
+            target.send(JSON.stringify({ ...msg, from: address }));
+          }
+        }
+      } catch { /* ignore malformed */ }
+    });
+
+    ws.on('close', () => {
+      if (address) {
+        smokeHubPeers.delete(address);
+        console.log(`[SmokeHub] Peer disconnected: ${address.slice(0, 8)}...`);
+        address = null;
+      }
+    });
+  });
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url === '/smoke-hub') {
+      smokeHubWss.handleUpgrade(req, socket, head, (ws) => {
+        smokeHubWss.emit('connection', ws, req);
+      });
+    } else {
+      socket.destroy();
     }
   });
 
