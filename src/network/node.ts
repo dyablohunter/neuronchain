@@ -1,6 +1,6 @@
 import { DAGLedger, NetworkType } from '../core/dag-ledger';
 import { Libp2pNetwork } from './libp2p-network';
-import { SmokeStore } from './smoke-store';
+import { SmokeStore, GossipSubAdapter } from './smoke-store';
 import { StorageManager } from './storage-manager';
 import { AccountBlock } from '../core/dag-block';
 import { VoteManager, Vote } from '../core/vote';
@@ -344,9 +344,27 @@ export class NeuronNode extends EventEmitter {
   async start(): Promise<void> {
     if (this.status !== 'stopped') return;
     await this.net.start();
-    await this.store.start();
-    // Push our smoke Hub address into peer-addrs broadcasts so every peer
-    // can reach us for content retrieval even if they missed our CacheRequests.
+
+    // Build a GossipSubAdapter so WebRTC ICE signaling routes through the existing
+    // GossipSub mesh instead of the relay WebSocket, removing the hub as a SPOF.
+    const pubsub = this.net.libp2p.services.pubsub as unknown as {
+      publish(topic: string, data: Uint8Array): Promise<void>;
+      subscribe(topic: string): void;
+      addEventListener(event: string, handler: EventListener): void;
+      removeEventListener(event: string, handler: EventListener): void;
+    };
+    const gsAdapter: GossipSubAdapter = {
+      peerId: this.net.libp2p.peerId.toString(),
+      networkId: this.ledger.network,
+      publish: (topic, data) => { pubsub.publish(topic, data).catch(() => {}); },
+      subscribe: (topic) => pubsub.subscribe(topic),
+      addEventListener: (evt, cb) => pubsub.addEventListener(evt, cb),
+      removeEventListener: (evt, cb) => pubsub.removeEventListener(evt, cb),
+    };
+
+    await this.store.start(gsAdapter);
+    // Push our smoke address (now the libp2p peer ID) into peer-addrs broadcasts
+    // so every peer can reach us for content retrieval.
     this.store.getSmokeHostname().then(addr => { if (addr) this.net.setSmokeAddr(addr); });
     this.storage.start();
     this.wireEvents();
@@ -378,6 +396,12 @@ export class NeuronNode extends EventEmitter {
     }
 
     this.ledger.rebuildFaceAccountCount();
+
+    // Seed peer fallbacks from heartbeat-recorded smoke addresses. Providers that have
+    // been online recently will have their current (or last known) smoke address on-chain.
+    for (const provider of this.ledger.getStorageProviders()) {
+      if (provider.smokeAddr) this.store.addPeerFallback(provider.smokeAddr);
+    }
 
     for (const [id, cData] of contracts) {
       if (!this.ledger.contracts.has(id)) {

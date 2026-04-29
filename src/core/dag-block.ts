@@ -111,6 +111,13 @@ export interface StorageRegisterData {
   deviceId?: string;
 }
 
+/** Payload for storage-heartbeat block. contractData is optional JSON. */
+export interface StorageHeartbeatData {
+  type: 'storage-heartbeat';
+  /** Current smoke Hub address of the provider — peers use this for WebRTC block transfer. */
+  smokeAddr?: string;
+}
+
 /**
  * Payload for storage-reward block.
  * The provider self-issues this once per day. Other nodes verify the amount

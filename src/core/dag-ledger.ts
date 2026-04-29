@@ -3,6 +3,7 @@ import {
   AccountBlockType,
   ConfirmedBlock,
   StorageRegisterData,
+  StorageHeartbeatData,
   StorageRewardData,
   VERIFICATION_MINT_AMOUNT,
   BASE_STORAGE_RATE_MILLI,
@@ -50,6 +51,8 @@ export interface StorageProvider {
   lastRewardEpoch: number;
   /** Cumulative milli-UNIT minted via storage-reward blocks */
   totalEarned: number;
+  /** Current smoke Hub address — set from heartbeat contractData, used for targeted retrieval */
+  smokeAddr?: string;
   // ── Off-chain metrics (updated by StorageManager, informational only) ────
   /** Rolling average retrieval latency from peer-signed receipts (0 = no data) */
   avgLatencyMs: number;
@@ -295,8 +298,10 @@ export class DAGLedger extends EventEmitter {
 
   /**
    * Broadcast a proof-of-uptime heartbeat. Enforces minimum 4h interval.
+   * smokeAddr is included in contractData so peers can discover the provider's
+   * current WebRTC address from the chain without waiting for a live peer-addrs broadcast.
    */
-  async createStorageHeartbeat(pub: string, keys: KeyPair): Promise<{ block?: AccountBlock; error?: string }> {
+  async createStorageHeartbeat(pub: string, keys: KeyPair, smokeAddr?: string): Promise<{ block?: AccountBlock; error?: string }> {
     const provider = this.storageProviders.get(pub);
     if (!provider || provider.capacityGB === 0) return { error: 'Not a registered storage provider' };
 
@@ -307,9 +312,11 @@ export class DAGLedger extends EventEmitter {
 
     const head = this.getAccountHead(pub);
     if (!head) return { error: 'Account not opened' };
+    const heartbeatData: StorageHeartbeatData = { type: 'storage-heartbeat', smokeAddr };
     const block = await createAccountBlock({
       accountPub: pub, index: head.index + 1, type: 'storage-heartbeat',
       previousHash: head.hash, balance: head.balance,
+      contractData: JSON.stringify(heartbeatData),
     }, keys);
     return { block };
   }
@@ -324,6 +331,15 @@ export class DAGLedger extends EventEmitter {
 
     const epochDay = Math.floor(Date.now() / REWARD_EPOCH_MS);
     if (provider.lastRewardEpoch >= epochDay) return { error: 'Storage reward already claimed for today' };
+    // Guard against two devices with the same account both issuing a reward before
+    // either block is accepted (epoch race). Check the chain directly.
+    const chain = this.accountChains.get(pub) || [];
+    const alreadyInChain = chain.some(b => {
+      if (b.type !== 'storage-reward' || !b.contractData) return false;
+      try { return (JSON.parse(b.contractData) as StorageRewardData).epochDay === epochDay; }
+      catch { return false; }
+    });
+    if (alreadyInChain) return { error: 'Storage reward already in chain for today' };
 
     // Use capacity at epoch start - not current capacity - to prevent bumping GB just before claiming
     const capacityAtEpochStart = this.getCapacityAtEpochStart(pub, epochDay);
@@ -477,6 +493,12 @@ export class DAGLedger extends EventEmitter {
       if (provider) {
         provider.lastHeartbeat = block.timestamp;
         provider.heartbeatsLast24h = this.countHeartbeatsLast24h(block.accountPub, block.timestamp);
+        if (block.contractData) {
+          try {
+            const hbData = JSON.parse(block.contractData) as StorageHeartbeatData;
+            if (hbData.smokeAddr) provider.smokeAddr = hbData.smokeAddr;
+          } catch { /* ignore malformed */ }
+        }
         this.updateProviderScore(provider);
         this.emit('storage:heartbeat', { pub: block.accountPub, timestamp: block.timestamp });
       }

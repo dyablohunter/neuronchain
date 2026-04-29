@@ -45,6 +45,10 @@ export interface StorageReceipt {
   signature: string;
   /** Smoke Hub address of the provider — other nodes use this for Http.fetch fallback */
   providerSmokeAddr?: string;
+  /** 1-indexed response rank among all providers checked in this spot-check round (1 = fastest) */
+  responseRank?: number;
+  /** Total number of providers checked in this spot-check round */
+  totalProviders?: number;
 }
 
 export interface CacheRequest {
@@ -85,6 +89,9 @@ export class StorageManager extends EventEmitter {
 
   /** CIDs we're tracking for redundancy: cid → { owner, confirmedProviders, additionalCids, lastDistributed } */
   private trackedCids: Map<string, { ownerPub: string; confirmedProviders: Set<string>; additionalCids: string[]; lastDistributed: number }> = new Map();
+
+  /** Known providers for each CID (from receipts) — used for targeted retrieval */
+  private cidToSmokeAddrs: Map<string, Set<string>> = new Map();
 
   /** CIDs that failed distribution (no providers at upload time): primaryCid → { ownerPub, additionalCids } */
   private pendingCids: Map<string, { ownerPub: string; additionalCids: string[] }> = new Map();
@@ -184,7 +191,8 @@ export class StorageManager extends EventEmitter {
   }
 
   async broadcastHeartbeat(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
-    const result = await this.ledger.createStorageHeartbeat(pub, keys);
+    const smokeAddr = await this.store.getSmokeHostname();
+    const result = await this.ledger.createStorageHeartbeat(pub, keys, smokeAddr);
     if (!result.block) return { success: false, error: result.error };
     const submitResult = await this.submitBlock(result.block);
     if (submitResult.success) {
@@ -274,18 +282,44 @@ export class StorageManager extends EventEmitter {
     }
   }
 
-  /** Resend cache requests for CIDs that have no confirmed provider yet. */
+  /** Resend cache requests for CIDs that have no confirmed provider yet, or are under-replicated. */
   private async retryUnconfirmedDistributions(): Promise<void> {
     if (this.trackedCids.size === 0) return;
     if (this.selectProviders(1).length === 0) return;
     const now = Date.now();
     for (const [cid, tracked] of this.trackedCids) {
-      if (tracked.confirmedProviders.size > 0) continue; // already confirmed
       if (now - tracked.lastDistributed < 25_000) continue; // too soon to retry
       const keys = this.localKeys.get(tracked.ownerPub);
       if (!keys) continue;
-      tracked.lastDistributed = now;
-      await this.distributeContent(cid, tracked.ownerPub, keys, tracked.additionalCids);
+
+      const confirmed = tracked.confirmedProviders.size;
+      if (confirmed === 0) {
+        // No confirmed providers — full redistribution
+        tracked.lastDistributed = now;
+        await this.distributeContent(cid, tracked.ownerPub, keys, tracked.additionalCids);
+      } else if (confirmed < REDUNDANCY_TARGET / 2) {
+        // Under-replicated (below half target) — top up with additional providers,
+        // excluding those already confirmed so we don't ask them to re-cache.
+        const additional = this.selectProviders(REDUNDANCY_TARGET).filter(
+          p => !tracked.confirmedProviders.has(p.pub),
+        );
+        if (additional.length === 0) continue;
+        tracked.lastDistributed = now;
+        const ts = Date.now();
+        const payload = `cache:${cid}:${tracked.ownerPub}:${ts}`;
+        const sig = await signData(payload, keys);
+        const uploaderSmokeAddr = await this.store.getSmokeHostname();
+        this.net.publishCacheRequest({
+          cid,
+          additionalCids: tracked.additionalCids.length > 0 ? tracked.additionalCids : undefined,
+          targetProviders: additional.map(p => p.pub),
+          uploaderPub: tracked.ownerPub,
+          uploaderSmokeAddr,
+          timestamp: ts,
+          signature: sig,
+        });
+        console.log(`[StorageManager] Re-replication: ${cid.slice(0, 16)}... at ${confirmed}/${REDUNDANCY_TARGET} copies → adding ${additional.length} providers`);
+      }
     }
   }
 
@@ -373,7 +407,7 @@ export class StorageManager extends EventEmitter {
       const start = Date.now();
       const allCids = [req.cid, ...(Array.isArray(req.additionalCids) ? req.additionalCids : [])];
       for (const c of allCids) {
-        await this.store.cache(c, 600_000, req.uploaderSmokeAddr as string | undefined);
+        await this.store.cache(c, 600_000, req.uploaderSmokeAddr as string | undefined, req.uploaderPub as string | undefined);
       }
       const latencyMs = Date.now() - start;
       console.log(`[StorageManager] Cached ${req.cid.slice(0, 16)}... in ${latencyMs}ms`);
@@ -430,6 +464,13 @@ export class StorageManager extends EventEmitter {
 
     if (!this.store.isStarted()) return;
     for (const cid of req.cids) {
+      // Verify the requester is the account that originally uploaded this block.
+      // Skip the check if we have no metadata (block wasn't cached by us, or pre-dates this fix).
+      const meta = await this.store.getCachedMeta(cid);
+      if (meta?.uploaderPub && meta.uploaderPub !== req.ownerPub) {
+        console.warn(`[StorageManager] Rejected delete for ${cid.slice(0, 16)}: ownerPub mismatch`);
+        continue;
+      }
       await this.store.deleteBlock(cid);
     }
     // Remove from tracked CIDs so we stop retrying distribution
@@ -443,11 +484,19 @@ export class StorageManager extends EventEmitter {
     if (receipt.success) {
       const tracked = this.trackedCids.get(receipt.cid);
       if (tracked) tracked.confirmedProviders.add(receipt.providerPub);
-      // Register provider's smoke address so retrieve() can pull from them
+      // Register provider's smoke address for general fallback and per-CID targeted retrieval
       if (receipt.providerSmokeAddr) {
         this.store.addPeerFallback(receipt.providerSmokeAddr);
+        const existing = this.cidToSmokeAddrs.get(receipt.cid) ?? new Set<string>();
+        existing.add(receipt.providerSmokeAddr);
+        this.cidToSmokeAddrs.set(receipt.cid, existing);
       }
     }
+
+    // Self-signed receipts (provider confirming their own cache) only serve as
+    // an acknowledgment — they don't affect score metrics. Only third-party receipts
+    // (from spot-checkers) are counted toward latency and pass rate.
+    if (receipt.requesterPub === receipt.providerPub) return;
 
     // Prune receipts older than 24h
     const cutoff = Date.now() - RECEIPT_WINDOW_MS;
@@ -455,13 +504,21 @@ export class StorageManager extends EventEmitter {
     list.push(receipt);
     this.receipts.set(receipt.providerPub, list);
 
-    // Update provider off-chain metrics
+    // Update provider off-chain metrics.
+    // If the receipt carries rank info, inflate effective latency for later responders
+    // so the score formula rewards being first-to-respond, not just fast on average.
     const provider = this.ledger.storageProviders.get(receipt.providerPub);
     if (provider) {
       const successful = list.filter(r => r.success);
       provider.spotCheckPassRate = list.length > 0 ? successful.length / list.length : 1.0;
       if (successful.length > 0) {
-        provider.avgLatencyMs = successful.reduce((sum, r) => sum + r.latencyMs, 0) / successful.length;
+        const adjustedLatencies = successful.map(r => {
+          const rankMultiplier = (r.responseRank && r.totalProviders && r.totalProviders > 1)
+            ? 1 + (r.responseRank - 1) / r.totalProviders
+            : 1.0;
+          return r.latencyMs * rankMultiplier;
+        });
+        provider.avgLatencyMs = adjustedLatencies.reduce((s, v) => s + v, 0) / adjustedLatencies.length;
       }
       this.ledger.updateProviderScore(provider);
     }
@@ -470,64 +527,77 @@ export class StorageManager extends EventEmitter {
   // ── Spot checks ───────────────────────────────────────────────────────────
 
   /**
-   * Periodically request known CIDs from providers to verify they still hold the data.
-   * Generates a signed receipt on success/failure that updates the provider's score.
+   * Periodically spot-check providers by fetching a block directly from each provider's
+   * smoke address. All providers for a given CID are checked in parallel; the response
+   * arrival order is tracked so faster providers receive a higher score.
+   *
+   * Only third-party-signed receipts (requesterPub ≠ providerPub) affect scores —
+   * this prevents providers from gaming metrics by self-signing.
    */
   private async runSpotChecks(): Promise<void> {
     if (!this.store.isStarted()) return;
 
-    for (const [cid, tracked] of this.trackedCids) {
-      const providers = this.ledger.getStorageProviders().slice(0, 5); // check top 5
-      for (const provider of providers) {
-        try {
-          const start = Date.now();
-          // Attempt to retrieve the CID — tries local storage first, then peer fallbacks
-          const bytes = await Promise.race([
-            this.store.retrieve(cid),
-            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 8_000)),
-          ]);
-          const latencyMs = Date.now() - start;
-          const success = bytes instanceof Uint8Array && bytes.length > 0;
+    const myPub = Array.from(this.localKeys.keys())[0];
+    const myKeys = myPub ? this.localKeys.get(myPub) : undefined;
+    if (!myPub || !myKeys) return;
 
-          // Emit a receipt
-          const myPub = Array.from(this.localKeys.keys())[0];
-          const myKeys = myPub ? this.localKeys.get(myPub) : undefined;
-          if (myPub && myKeys) {
-            const payload = `receipt:${cid}:${provider.pub}:${myPub}:${latencyMs}:${success}:${Date.now()}`;
-            const sig = await signData(payload, myKeys);
-            const receipt: StorageReceipt = {
-              providerPub: provider.pub,
-              requesterPub: myPub,
-              cid,
-              latencyMs,
-              success,
-              timestamp: Date.now(),
-              signature: sig,
-            };
-            this.net.publishStorageReceipt(receipt);
-            this.handleReceipt(receipt);
+    for (const [cid, tracked] of this.trackedCids) {
+      // Gather confirmed providers that have a known smoke address
+      const providerEntries = Array.from(tracked.confirmedProviders)
+        .map(pub => ({ pub, provider: this.ledger.storageProviders.get(pub) }))
+        .filter((e): e is { pub: string; provider: NonNullable<typeof e.provider> } =>
+          !!e.provider?.smokeAddr);
+
+      if (providerEntries.length === 0) continue;
+
+      const totalProviders = providerEntries.length;
+      let rankCounter = 0;
+
+      await Promise.allSettled(providerEntries.map(async ({ pub, provider }) => {
+        const start = Date.now();
+        let latencyMs = 9999;
+        let success = false;
+        let responseRank: number | undefined;
+
+        try {
+          const fetchedBytes = await this.store.fetchBlockFromProvider(provider.smokeAddr!, cid, 8_000);
+
+          // Proof of retrievability: since blocks are content-addressed, the CID IS the
+          // SHA-256 hash. If the provider serves bytes that don't hash to the CID they are
+          // serving tampered or corrupted data. No local copy needed for verification.
+          const integrous = await this.store.verifyBlockIntegrity(cid, fetchedBytes);
+          if (!integrous) {
+            console.warn(`[StorageManager] CID integrity failure from ${pub.slice(0, 12)}… — block is tampered`);
+            tracked.confirmedProviders.delete(pub);
+            // fall through to receipt with success=false and latencyMs=9999
+          } else {
+            latencyMs = Date.now() - start;
+            success = true;
+            responseRank = ++rankCounter; // atomic: only one microtask runs at a time
           }
         } catch {
-          // Spot check failed - record a failure receipt
-          const myPub = Array.from(this.localKeys.keys())[0];
-          const myKeys = myPub ? this.localKeys.get(myPub) : undefined;
-          if (myPub && myKeys) {
-            const payload = `receipt:${cid}:${provider.pub}:${myPub}:9999:false:${Date.now()}`;
-            const sig = await signData(payload, myKeys);
-            const receipt: StorageReceipt = {
-              providerPub: provider.pub,
-              requesterPub: myPub,
-              cid,
-              latencyMs: 9999,
-              success: false,
-              timestamp: Date.now(),
-              signature: sig,
-            };
-            this.net.publishStorageReceipt(receipt);
-            this.handleReceipt(receipt);
-          }
+          // provider failed to serve the block
+          tracked.confirmedProviders.delete(pub); // remove from confirmed so re-replication kicks in
         }
-      }
+
+        const ts = Date.now();
+        const payload = `receipt:${cid}:${pub}:${myPub}:${latencyMs}:${success}:${ts}`;
+        const sig = await signData(payload, myKeys!);
+        const receipt: StorageReceipt = {
+          providerPub: pub,
+          requesterPub: myPub,
+          cid,
+          latencyMs,
+          success,
+          timestamp: ts,
+          signature: sig,
+          providerSmokeAddr: provider.smokeAddr,
+          responseRank,
+          totalProviders,
+        };
+        this.net.publishStorageReceipt(receipt);
+        this.handleReceipt(receipt);
+      }));
     }
   }
 
@@ -547,6 +617,20 @@ export class StorageManager extends EventEmitter {
 
   getTrackedCids(): Map<string, { ownerPub: string; confirmedProviders: Set<string> }> {
     return this.trackedCids;
+  }
+
+  /** Return known provider smoke addresses for a specific CID, for targeted retrieval. */
+  getCidSmokeAddrs(cid: string): string[] {
+    return Array.from(this.cidToSmokeAddrs.get(cid) ?? []);
+  }
+
+  /**
+   * Retrieve a block, routing to known providers for this CID first.
+   * Wraps SmokeStore.retrieve() with per-CID peer hints so retrieval doesn't
+   * broadcast to all peerFallbacks when we know exactly who holds the data.
+   */
+  async retrieve(cid: string, timeoutMs?: number): Promise<Uint8Array> {
+    return this.store.retrieve(cid, timeoutMs, this.getCidSmokeAddrs(cid));
   }
 
   /** Check whether a local account is registered as a storage provider */

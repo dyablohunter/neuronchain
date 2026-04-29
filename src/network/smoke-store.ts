@@ -43,11 +43,82 @@ export interface ContentMeta {
 /** Virtual HTTP port used by each SmokeStore node to serve blocks to peers */
 const SMOKE_BLOCK_PORT = 5891;
 
-// ── Custom Hub for cross-browser signaling ────────────────────────────────────
-// Hubs.Public is unimplemented in @sinclair/smoke 0.8.x (stubs only).
-// This hub connects to our relay server's /smoke-hub WebSocket endpoint and
-// implements the same interface as Hubs.Private so smoke's WebRTC layer works
-// transparently across different browser sessions.
+// ── GossipSub adapter interface ───────────────────────────────────────────────
+// Passed in from node.ts after libp2p starts. Lets GossipSubHub route WebRTC
+// ICE candidates through the existing GossipSub mesh instead of the relay WS,
+// eliminating the relay server as a single point of failure for signaling.
+
+export interface GossipSubAdapter {
+  peerId: string;
+  networkId: string;
+  publish(topic: string, data: Uint8Array): void | Promise<void>;
+  subscribe(topic: string): void;
+  addEventListener(event: 'message', handler: EventListener): void;
+  removeEventListener(event: 'message', handler: EventListener): void;
+}
+
+// ── GossipSubHub — WebRTC signaling over GossipSub ───────────────────────────
+// Each node subscribes to a unique topic keyed by its libp2p peer ID.
+// ICE candidates/SDP flow through the GossipSub mesh; no relay server needed.
+
+function webrtcSignalTopic(networkId: string, targetPeerId: string): string {
+  return `neuronchain/${networkId}/ws/${targetPeerId}`;
+}
+
+const enc2 = new TextEncoder();
+const dec2 = new TextDecoder();
+
+class GossipSubHub {
+  #adapter: GossipSubAdapter;
+  #myTopic: string;
+  #msgListener: EventListener | null = null;
+
+  constructor(adapter: GossipSubAdapter) {
+    this.#adapter = adapter;
+    this.#myTopic = webrtcSignalTopic(adapter.networkId, adapter.peerId);
+    try { adapter.subscribe(this.#myTopic); } catch { /* ignore */ }
+  }
+
+  async configuration(): Promise<RTCConfiguration> {
+    return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  }
+
+  async address(): Promise<string> { return this.#adapter.peerId; }
+
+  send(message: { to: string; data: unknown }): void {
+    const topic = webrtcSignalTopic(this.#adapter.networkId, message.to);
+    const payload = enc2.encode(JSON.stringify({ from: this.#adapter.peerId, to: message.to, data: message.data }));
+    try {
+      const r = this.#adapter.publish(topic, payload);
+      if (r instanceof Promise) r.catch(() => {}); // best-effort; ignore if no subscribers yet
+    } catch { /* ignore */ }
+  }
+
+  receive(callback: (message: { to: string; from: string; data: unknown }) => void): void {
+    const myTopic = this.#myTopic;
+    const myPeerId = this.#adapter.peerId;
+    this.#msgListener = ((evt: Event) => {
+      const detail = (evt as CustomEvent<{ topic: string; data: Uint8Array }>).detail;
+      if (detail.topic !== myTopic) return;
+      try {
+        const parsed = JSON.parse(dec2.decode(detail.data)) as { from: string; to: string; data: unknown };
+        if (parsed.to === myPeerId) callback(parsed);
+      } catch { /* ignore malformed */ }
+    }) as EventListener;
+    this.#adapter.addEventListener('message', this.#msgListener);
+  }
+
+  dispose(): void {
+    if (this.#msgListener) {
+      this.#adapter.removeEventListener('message', this.#msgListener);
+      this.#msgListener = null;
+    }
+  }
+}
+
+// ── Custom Hub for cross-browser signaling (WebSocket fallback) ───────────────
+// Used when no GossipSubAdapter is available (e.g. standalone / test mode).
+// Connects to the relay server's /smoke-hub WebSocket endpoint.
 
 class RelayHub {
   #ws: WebSocket;
@@ -116,15 +187,24 @@ export class SmokeStore {
     return `${proto}//${window.location.host}/smoke-hub`;
   }
 
-  async start(): Promise<void> {
+  /**
+   * Start the store. Pass a GossipSubAdapter (from libp2p) to route WebRTC
+   * signaling through the existing GossipSub mesh instead of the relay WebSocket.
+   * Falls back to the relay WebSocket hub when no adapter is provided.
+   */
+  async start(gsAdapter?: GossipSubAdapter): Promise<void> {
     if (this.started) return;
 
-    this.network = new Network({ hub: new RelayHub(this.hubUrl) as never });
+    const hub = gsAdapter ? new GossipSubHub(gsAdapter) : new RelayHub(this.hubUrl);
+    this.network = new Network({ hub: hub as never });
     this.fs = await FileSystem.open('neuronchain-smoke-blocks');
     await this.fs.mkdir('/blocks');
     await this.fs.mkdir('/cached');
+    await this.fs.mkdir('/cached-meta');
 
-    // Serve locally-stored blocks to any peer that requests them via smoke Http
+    // Serve locally-stored blocks to any peer that requests them via smoke Http.
+    // Supports Range requests so spot-checkers can request arbitrary byte slices
+    // without downloading the full block (proof-of-retrievability for large files).
     this.network.Http.listen({ port: SMOKE_BLOCK_PORT }, async (req: Request) => {
       const pathname = new URL(req.url).pathname;
       const cid = pathname.startsWith('/block/') ? pathname.slice('/block/'.length) : '';
@@ -132,6 +212,24 @@ export class SmokeStore {
       try {
         if (!(await this.fs.exists(`/blocks/${cid}`))) return new Response('Not Found', { status: 404 });
         const data = await this.fs.read(`/blocks/${cid}`);
+
+        // Range request — return only the requested byte slice (206 Partial Content)
+        const rangeHeader = req.headers.get('range');
+        if (rangeHeader) {
+          const m = rangeHeader.match(/^bytes=(\d+)-(\d+)$/);
+          if (m) {
+            const start = parseInt(m[1], 10);
+            const end = Math.min(parseInt(m[2], 10), data.byteLength - 1);
+            if (start >= 0 && end >= start) {
+              const slice = data.slice(start, end + 1);
+              return new Response(
+                slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength) as ArrayBuffer,
+                { status: 206, headers: { 'Content-Range': `bytes ${start}-${end}/${data.byteLength}` } },
+              );
+            }
+          }
+        }
+
         return new Response(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
       } catch {
         return new Response('Not Found', { status: 404 });
@@ -139,7 +237,7 @@ export class SmokeStore {
     });
 
     this.started = true;
-    console.log('[SmokeStore] Started, hub:', this.hubUrl);
+    console.log('[SmokeStore] Started, hub:', gsAdapter ? 'GossipSub' : this.hubUrl);
   }
 
   async stop(): Promise<void> {
@@ -184,10 +282,11 @@ export class SmokeStore {
 
   /**
    * Retrieve raw bytes by CID string.
-   * Checks local storage first. If not found, tries all known peer fallback
-   * addresses in parallel via smoke Http (HTTP over WebRTC).
+   * Checks local storage first. If not found, tries priorityPeers first (known holders
+   * of this specific CID), then all remaining peerFallbacks, all in parallel.
+   * The first peer to respond wins and its data is cached locally.
    */
-  async retrieve(cidStr: string, timeoutMs = 600_000): Promise<Uint8Array> {
+  async retrieve(cidStr: string, timeoutMs = 600_000, priorityPeers?: string[]): Promise<Uint8Array> {
     this.assertStarted();
     const path = `/blocks/${cidStr}`;
 
@@ -195,7 +294,13 @@ export class SmokeStore {
       return this.fs.read(path);
     }
 
-    const peers = Array.from(this.peerFallbacks);
+    // Priority peers first (confirmed holders of this CID), then all remaining fallbacks
+    const prioritySet = new Set(priorityPeers ?? []);
+    const peers = [
+      ...Array.from(prioritySet),
+      ...Array.from(this.peerFallbacks).filter(p => !prioritySet.has(p)),
+    ];
+
     if (peers.length === 0) {
       throw new Error(`[SmokeStore] Block not found locally and no peer fallbacks registered: ${cidStr.slice(0, 20)}`);
     }
@@ -217,6 +322,18 @@ export class SmokeStore {
       Promise.any(peers.map(fetchFromPeer)),
       timeout,
     ]);
+  }
+
+  /**
+   * Verify that bytes actually hash to the given CID (proof of retrievability).
+   * Since blocks are content-addressed, any mismatch means the provider served
+   * tampered or corrupted data.
+   */
+  async verifyBlockIntegrity(cidStr: string, data: Uint8Array): Promise<boolean> {
+    try {
+      const expected = await this.computeCID(data);
+      return expected === cidStr;
+    } catch { return false; }
   }
 
   // ── Encrypted variants ─────────────────────────────────────────────────────
@@ -260,7 +377,7 @@ export class SmokeStore {
     data: Uint8Array,
     meta: Omit<ContentMeta, 'size' | 'encrypted' | 'timestamp'>,
     keys: KeyPair,
-  ): Promise<{ cid: string; meta: ContentMeta }> {
+  ): Promise<{ cid: string; meta: ContentMeta & { contentCid: string } }> {
     const contentCid = await this.storeEncrypted(data, keys);
     const fullMeta: ContentMeta & { contentCid: string } = {
       ...meta, size: data.length, encrypted: true, timestamp: Date.now(), contentCid,
@@ -325,8 +442,9 @@ export class SmokeStore {
    * If the block is already in local storage: just write the /cached marker.
    * If not local and peerHostname is provided: fetch via smoke Http (HTTP over
    * WebRTC), store it, then write the marker. If not local and no peer: throws.
+   * uploaderPub is persisted alongside the marker so delete requests can verify ownership.
    */
-  async cache(cidStr: string, timeoutMs = 600_000, peerHostname?: string): Promise<void> {
+  async cache(cidStr: string, timeoutMs = 600_000, peerHostname?: string, uploaderPub?: string): Promise<void> {
     this.assertStarted();
     const blockPath = `/blocks/${cidStr}`;
 
@@ -364,6 +482,40 @@ export class SmokeStore {
     }
 
     await this.fs.write(`/cached/${cidStr}`, new Uint8Array(0));
+    if (uploaderPub) {
+      const meta = new TextEncoder().encode(JSON.stringify({ uploaderPub }));
+      await this.fs.write(`/cached-meta/${cidStr}`, meta);
+    }
+  }
+
+  /** Return cached metadata (e.g. uploaderPub) for a CID, or null if not present. */
+  async getCachedMeta(cidStr: string): Promise<{ uploaderPub?: string } | null> {
+    this.assertStarted();
+    try {
+      if (!(await this.fs.exists(`/cached-meta/${cidStr}`))) return null;
+      const bytes = await this.fs.read(`/cached-meta/${cidStr}`);
+      return JSON.parse(new TextDecoder().decode(bytes)) as { uploaderPub?: string };
+    } catch { return null; }
+  }
+
+  /**
+   * Fetch a specific block directly from a known provider by their smoke address.
+   * Used by spot checks to target individual providers rather than broadcasting to all peers.
+   */
+  async fetchBlockFromProvider(smokeAddr: string, cidStr: string, timeoutMs = 8_000): Promise<Uint8Array> {
+    this.assertStarted();
+    const url = `http://${smokeAddr}:${SMOKE_BLOCK_PORT}/block/${cidStr}`;
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`spot-check timeout after ${timeoutMs}ms`)), timeoutMs),
+    );
+    const fetch = async (): Promise<Uint8Array> => {
+      let resp: Response;
+      try { resp = await this.network.Http.fetch(url); }
+      catch (e) { throw new Error(`spot-check peer ${smokeAddr.slice(0, 8)}: ${smokeErrStr(e)}`); }
+      if (!resp.ok) throw new Error(`spot-check peer ${smokeAddr.slice(0, 8)} returned ${resp.status}`);
+      return new Uint8Array(await resp.arrayBuffer());
+    };
+    return Promise.race([fetch(), timeout]);
   }
 
   async uncache(cidStr: string): Promise<void> {
@@ -376,6 +528,7 @@ export class SmokeStore {
     this.assertStarted();
     try { await this.fs.delete(`/blocks/${cidStr}`); } catch { /* already gone */ }
     try { await this.fs.delete(`/cached/${cidStr}`); } catch { /* already gone */ }
+    try { await this.fs.delete(`/cached-meta/${cidStr}`); } catch { /* already gone */ }
   }
 
   async isCached(cidStr: string): Promise<boolean> {
