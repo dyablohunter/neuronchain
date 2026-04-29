@@ -58,6 +58,12 @@ export interface EncryptedKeyBlob {
    * is not reliably reproducible across sessions.
    */
   encryptedCanonical?: string;
+  /**
+   * Unix ms timestamp of the last blob modification.
+   * Used to resolve conflicts when multiple nodes gossip the same blob —
+   * only the newest version is kept in local IDB.
+   */
+  updatedAt?: number;
 }
 
 // ── linkedAnchor computation ──────────────────────────────────────────────────
@@ -133,6 +139,7 @@ export async function createEncryptedKeyBlob(
     username,
     pub: keys.pub,
     createdAt: Date.now(),
+    updatedAt: Date.now(),
     linkedAnchor,
     pinVersion,
     pinSalt,
@@ -165,6 +172,7 @@ export async function updateAttemptStateInBlob(
 ): Promise<EncryptedKeyBlob> {
   return {
     ...blob,
+    updatedAt: Date.now(),
     pinAttemptState: await encryptAttemptState(state, faceKey),
   };
 }

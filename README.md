@@ -205,6 +205,8 @@ Face descriptors vary slightly between sessions due to lighting, angle, and dist
 
 This means recovery is as reliable as remembering your PIN. The live scan only needs to be "close enough" to confirm identity — it does not need to be bit-for-bit identical.
 
+**Face re-enrollment** (Update Face) uses a different, simpler path: identity is verified by PIN + liveness check, then the keys already loaded in the active session are re-encrypted under the new face key — no blob decryption or `encryptedCanonical` lookup required. Changing PIN before re-enrolling face works correctly; the blob is always kept consistent on both operations.
+
 **PIN factor:**
 - 4-digit numeric PIN set at account creation (per-account, independent)
 - Key derivation — PBKDF2-SHA-512 (600,000 iterations, OWASP 2024 recommendation)

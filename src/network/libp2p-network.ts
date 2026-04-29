@@ -602,7 +602,15 @@ export class Libp2pNetwork extends EventEmitter {
     if (topic === topicKeyBlobs(this.network)) {
       const blob = decode<Record<string, unknown>>(data);
       if (blob.pub && blob.encryptedKeys && blob.username) {
-        await this.db.put('keyblobs', blob as NeuronDB['keyblobs']).catch(() => {});
+        // Only overwrite if the incoming blob is newer — prevents a stale gossip
+        // from another node from silently reverting a locally-updated blob.
+        const existing = await this.db.get('keyblobs', blob.pub as string).catch(() => null);
+        const incomingTs = typeof blob.updatedAt === 'number' ? blob.updatedAt : 0;
+        const existingTs = existing && typeof (existing as Record<string, unknown>).updatedAt === 'number'
+          ? (existing as Record<string, unknown>).updatedAt as number : 0;
+        if (incomingTs >= existingTs) {
+          await this.db.put('keyblobs', blob as NeuronDB['keyblobs']).catch(() => {});
+        }
         this.emit('blob:received', blob);
       }
       return;
@@ -702,12 +710,13 @@ export class Libp2pNetwork extends EventEmitter {
     this.db.put('contracts', { ...contract, id } as NeuronDB['contracts']).catch(() => {});
   }
 
-  saveKeyBlob(pub: string, blob: Record<string, unknown>): void {
-    if (!this.running) return;
+  saveKeyBlob(pub: string, blob: Record<string, unknown>): Promise<void> {
+    if (!this.running) return Promise.resolve();
     const entry = { ...blob, pub };
-    this.db.put('keyblobs', entry as NeuronDB['keyblobs']).catch(() => {});
+    const writePromise = this.db.put('keyblobs', entry as NeuronDB['keyblobs']).then(() => {}).catch(() => {});
     // Gossip so other devices can recover without being online at enrollment time
     this.publish(topicKeyBlobs(this.network), entry);
+    return writePromise;
   }
 
   async loadKeyBlob(pub: string): Promise<Record<string, unknown> | null> {
@@ -860,6 +869,12 @@ export class Libp2pNetwork extends EventEmitter {
       let count = 0;
       for (const v of set) { if (count++ < excess) set.delete(v); else break; }
     }
+  }
+
+  /** Allow a block hash to be processed again on next re-broadcast.
+   *  Called by node.ts when addBlock fails so re-broadcast cycles can retry. */
+  forgetBlock(hash: string): void {
+    this.processedBlocks.delete(hash);
   }
 
   private serializeBlock(block: AccountBlock): Record<string, unknown> {

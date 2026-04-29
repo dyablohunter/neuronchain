@@ -1347,6 +1347,8 @@ function getCount() { return state.counter; }"></textarea>
             <li><strong>FaceID + PIN (primary):</strong> Enter your username &#8594; PIN prompt &#8594; face scan (3-sample capture, same as enrollment) &#8594; encrypted keys decrypted with both factors. Works from any device. The <code>linkedAnchor</code> is verified against on-chain data to detect blob tampering before decryption. Face key is derived from the PIN-decrypted stored canonical — not from the live scan — so recovery is reliable regardless of session-to-session variation in lighting or angle.</li>
             <li><strong>Backup secret key:</strong> Click "Recover with Key Pair" and paste the Base58 backup code saved at creation. Restores signing and encryption keys without a camera or PIN. The account's PIN requirement is automatically restored from the key blob.</li>
           </ul>
+          <p style="margin-top:8px;"><strong>Re-enrolling your face</strong> (Account tab &#8594; Update PIN / Face &#8594; Update Face): re-uses the keys already loaded in your active session — no blob decryption required. Identity is verified by PIN + liveness check before the camera opens. You can safely re-enroll your face after a PIN change without any extra steps.</p>
+          <p style="margin-top:8px;"><strong>After changing your PIN</strong>, the published key blob is immediately updated on the network. Re-enrollment and recovery from other devices will work correctly with the new PIN straight away.</p>
         </div>
 
         <div class="help-section">
@@ -1360,7 +1362,7 @@ function getCount() { return state.counter; }"></textarea>
             <li><strong><code>call</code></strong> — call a smart contract method (no PIN — may come from external inputs)</li>
             <li><strong><code>update</code></strong> — change PIN or re-enroll face; updates <code>linkedAnchor</code> + PQ keys on-chain — <strong>PIN required</strong></li>
           </ul>
-          <p style="margin-top: 8px;">Transfers require two blocks: a <code>send</code> on the sender's chain and a <code>receive</code> on the recipient's chain. The recipient must <strong>claim</strong> the receive in the Transfer tab (or it is auto-claimed if their node is online).</p>
+          <p style="margin-top: 8px;">Transfers require two blocks: a <code>send</code> on the sender's chain and a <code>receive</code> on the recipient's chain. Receives are <strong>auto-claimed</strong> when the recipient's node is online — no manual action needed. If the node was offline when the send arrived, the pending receive is claimed automatically on reconnect (the sender re-broadcasts every 20 seconds).</p>
         </div>
 
         <div class="help-section">

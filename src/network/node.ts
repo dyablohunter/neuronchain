@@ -107,6 +107,11 @@ export class NeuronNode extends EventEmitter {
         this.emit('block:received', b);
         this.voteIfConflict(b);
         this.autoReceive(b);
+      } else {
+        // Allow the re-broadcast cycle to retry this block later.
+        // Without this, a block arriving before its parent (ordering race) would be
+        // deduped by processedBlocks and permanently lost — never retried on re-broadcast.
+        this.net.forgetBlock(b.hash);
       }
     });
 

@@ -4,7 +4,7 @@ import { NetworkType } from './core/dag-ledger';
 import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, deriveFaceKey, encryptWithFaceKey, decryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
+import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, deriveFaceKey, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import {
@@ -1398,7 +1398,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       linkedAnchor: keyBlob.linkedAnchor, pqPub: keys.pqPub, pqKemPub: keys.pqKemPub,
       _sig: accSig,
     });
-    node.net.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
+    await node.net.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
 
     // Cache PIN for this session
     cachePinKey(keys.pub, pinKey);
@@ -1568,7 +1568,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     // Reset attempt counter on successful recovery
     await recordPinSuccess(blob.pub);
     const updatedBlob = await updateAttemptStateInBlob(blob, faceKey, { failedAttempts: 0, lockedUntil: 0 });
-    node.net.saveKeyBlob(keys.pub, updatedBlob as unknown as Record<string, unknown>);
+    await node.net.saveKeyBlob(keys.pub, updatedBlob as unknown as Record<string, unknown>);
 
     // Cache PIN key for this session
     if (pin && blob.pinSalt) {
@@ -1701,7 +1701,13 @@ $('#btnUpdatePin').addEventListener('click', async () => {
     if (!oldPinKey) { toast('Session expired — please retry', 'error'); statusEl.innerHTML = ''; return; }
 
     const innerCiphertext = await decryptWithPinKey(blob.encryptedKeys, oldPinKey);
-    if (!innerCiphertext) { toast('Failed to decrypt with current PIN', 'error'); statusEl.innerHTML = ''; return; }
+    if (!innerCiphertext) {
+      // The stored blob was not updated when the PIN was last changed (older app version).
+      // Re-enrolling the face will repair the blob and unblock PIN changes.
+      toast('Security data is out of sync — please use Update Face first to repair it, then change your PIN', 'error');
+      statusEl.innerHTML = '<span style="color:var(--danger)">Security data out of sync. Go to <strong>Update Face</strong> to repair, then retry PIN change.</span>';
+      return;
+    }
 
     // Re-wrap inner with new PIN key
     const newEncryptedKeys = await encryptWithPinKey(innerCiphertext, newPinKey);
@@ -1712,6 +1718,15 @@ $('#btnUpdatePin').addEventListener('click', async () => {
     if (acc.encryptedFaceDescriptor) {
       const oldDesc = await decryptWithPinKey(acc.encryptedFaceDescriptor, oldPinKey);
       if (oldDesc) newEncryptedFaceDescriptor = await encryptWithPinKey(oldDesc, newPinKey);
+    }
+
+    // Re-encrypt encryptedCanonical (canonical face descriptor used for face re-enrollment)
+    // with new PIN key. Without this, face re-enrollment and account recovery will fail
+    // after a PIN change because they try to decrypt it with the new key.
+    let newEncryptedCanonical: string | undefined;
+    if (blob.encryptedCanonical) {
+      const oldCanonical = await decryptWithPinKey(blob.encryptedCanonical, oldPinKey);
+      if (oldCanonical) newEncryptedCanonical = await encryptWithPinKey(oldCanonical, newPinKey);
     }
 
     // Compute new linkedAnchor
@@ -1727,8 +1742,21 @@ $('#btnUpdatePin').addEventListener('click', async () => {
     const sub = await node.submitBlock(updateResult.block!);
     if (!sub.success) { toast(`Update block failed: ${sub.error}`, 'error'); statusEl.innerHTML = ''; return; }
 
+    // Publish the full updated blob to the P2P network so face re-enrollment and
+    // recovery work correctly with the new PIN key on all nodes.
+    const updatedBlob: EncryptedKeyBlob = {
+      ...blob,
+      updatedAt: Date.now(),
+      encryptedKeys: newEncryptedKeys,
+      pinSalt: newPinSalt,
+      pinVerifier: newPinVerifier,
+      linkedAnchor: newLinkedAnchor,
+      encryptedCanonical: newEncryptedCanonical ?? blob.encryptedCanonical,
+    };
+    await node.net.saveKeyBlob(acc.pub, updatedBlob as unknown as Record<string, unknown>);
+
     // Update local account
-    Object.assign(acc, { pinSalt: newPinSalt, pinVerifier: newPinVerifier, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedFaceDescriptor });
+    Object.assign(acc, { pinSalt: newPinSalt, pinVerifier: newPinVerifier, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedFaceDescriptor, encryptedCanonical: newEncryptedCanonical });
     cachePinKey(pub, newPinKey);
     saveWallet();
     statusEl.innerHTML = '<span style="color:var(--success)">PIN updated successfully.</span>';
@@ -1752,6 +1780,31 @@ $('#btnUpdateFace').addEventListener('click', async () => {
   if (!await requirePin(acc)) { statusEl.innerHTML = '<span style="color:var(--danger)">Authentication cancelled or failed.</span>'; return; }
 
   const pinKey = getCachedPinKey(pub);
+
+  // Fetch the blob NOW before starting camera so we can detect a missing PIN key
+  // early instead of wasting the user's time on a full face scan.
+  statusEl.innerHTML = '<span class="spinner"></span> Fetching key blob...';
+  const blobRawPre = await node.net.findKeyBlobByUsername(acc.username);
+  if (!blobRawPre) { toast('Could not fetch key blob', 'error'); statusEl.innerHTML = ''; return; }
+  const blobPre: EncryptedKeyBlob = {
+    encryptedKeys: String(blobRawPre.encryptedKeys), faceMapHash: String(blobRawPre.faceMapHash),
+    username: String(blobRawPre.username), pub: String(blobRawPre.pub), createdAt: Number(blobRawPre.createdAt),
+    linkedAnchor: blobRawPre.linkedAnchor ? String(blobRawPre.linkedAnchor) : undefined,
+    pinSalt: blobRawPre.pinSalt ? String(blobRawPre.pinSalt) : undefined,
+    pinVersion: typeof blobRawPre.pinVersion === 'number' ? blobRawPre.pinVersion : 0,
+    pinAttemptState: blobRawPre.pinAttemptState ? String(blobRawPre.pinAttemptState) : undefined,
+    pinVerifier: blobRawPre.pinVerifier ? String(blobRawPre.pinVerifier) : undefined,
+    encryptedCanonical: blobRawPre.encryptedCanonical ? String(blobRawPre.encryptedCanonical) : undefined,
+  };
+
+  // If the blob requires a PIN but we don't have the key cached, requirePin returned via
+  // an early path (no pinSalt/pinVerifier on the in-memory account at the time it ran).
+  // Abort here so the user isn't stuck re-doing the face scan only to hit "Session expired".
+  if (blobPre.pinVersion === 1 && !pinKey) {
+    toast('Session expired — please close and re-open Security Settings to authenticate again', 'error');
+    statusEl.innerHTML = '';
+    return;
+  }
 
   // Re-enroll face
   statusEl.innerHTML = '<span class="spinner"></span> Starting camera for face re-enrollment...';
@@ -1791,37 +1844,25 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     const newQuantized = quantizeDescriptor(faceMap.canonical);
     const newFaceKey = await deriveFaceKey(newQuantized);
 
-    // Fetch current blob to get inner ciphertext
-    statusEl.innerHTML = '<span class="spinner"></span> Fetching current blob...';
-    const blobRaw = await node.net.findKeyBlobByUsername(acc.username);
-    if (!blobRaw) { toast('Could not fetch key blob', 'error'); statusEl.innerHTML = ''; return; }
-    const blob: EncryptedKeyBlob = {
-      encryptedKeys: String(blobRaw.encryptedKeys), faceMapHash: String(blobRaw.faceMapHash),
-      username: String(blobRaw.username), pub: String(blobRaw.pub), createdAt: Number(blobRaw.createdAt),
-      linkedAnchor: blobRaw.linkedAnchor ? String(blobRaw.linkedAnchor) : undefined,
-      pinSalt: blobRaw.pinSalt ? String(blobRaw.pinSalt) : undefined,
-      pinVersion: typeof blobRaw.pinVersion === 'number' ? blobRaw.pinVersion : 0,
-      pinAttemptState: blobRaw.pinAttemptState ? String(blobRaw.pinAttemptState) : undefined,
-      pinVerifier: blobRaw.pinVerifier ? String(blobRaw.pinVerifier) : undefined,
-      encryptedCanonical: blobRaw.encryptedCanonical ? String(blobRaw.encryptedCanonical) : undefined,
-    };
+    // Reuse blob fetched before camera (already validated above)
+    const blob: EncryptedKeyBlob = blobPre;
 
-    let innerCiphertext: string | null = null;
-    if (blob.pinVersion === 1 && pinKey) {
-      innerCiphertext = await decryptWithPinKey(blob.encryptedKeys, pinKey);
-    } else {
-      innerCiphertext = await decryptWithFaceKey(blob.encryptedKeys, newFaceKey);
-    }
-    if (!innerCiphertext) { toast('Could not decrypt current blob with new face', 'error'); statusEl.innerHTML = ''; return; }
+    // Use the in-memory keys directly — identity was already proved by requirePin + liveness.
+    // This avoids any dependency on encryptedCanonical (which may be stale after a PIN change)
+    // and is always reliable since the live wallet always holds the authoritative key pair.
+    const keysJson: string = JSON.stringify(acc.keys);
 
-    // Re-encrypt inner with new face key
-    const newInner = await encryptWithFaceKey(innerCiphertext, newFaceKey);
-
-    // Re-wrap with PIN key
+    // Re-encrypt from raw keys JSON → new face layer → new PIN layer
+    const newInner = await encryptWithFaceKey(keysJson, newFaceKey);
     let newEncryptedKeys = newInner;
     if (pinKey) {
       newEncryptedKeys = await encryptWithPinKey(newInner, pinKey);
     }
+
+    // Update encryptedCanonical with new canonical descriptor
+    const newEncryptedCanonical = pinKey
+      ? await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey)
+      : undefined;
 
     // Compute new faceMapHash
     const hashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(newQuantized)));
@@ -1832,11 +1873,22 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     const anchorBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(anchorInput));
     const newLinkedAnchor = Array.from(new Uint8Array(anchorBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
 
-    // Encrypt face descriptor with PIN key
-    let newEncryptedFaceDescriptor: string | undefined;
-    if (pinKey) {
-      newEncryptedFaceDescriptor = await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey);
-    }
+    // Build and save updated blob.
+    // Use acc.pinSalt (authoritative in-memory value) — the blob fetched from IDB may have a
+    // stale pinSalt from before a previous PIN change that didn't publish an updated blob.
+    const newPinVerifier = pinKey ? await encryptWithPinKey('PINOK', pinKey) : blob.pinVerifier;
+    const newBlob: EncryptedKeyBlob = {
+      ...blob,
+      pinSalt: acc.pinSalt ?? blob.pinSalt,
+      updatedAt: Date.now(),
+      encryptedKeys: newEncryptedKeys,
+      faceMapHash: newFaceMapHash,
+      linkedAnchor: newLinkedAnchor,
+      encryptedCanonical: newEncryptedCanonical ?? blob.encryptedCanonical,
+      pinVerifier: newPinVerifier,
+      pinAttemptState: await encryptWithFaceKey(JSON.stringify({ failedAttempts: 0, lockedUntil: 0 }), newFaceKey),
+    };
+    await node.net.saveKeyBlob(acc.pub, newBlob as unknown as Record<string, unknown>);
 
     // Publish update block
     const updateResult = await node.ledger.createUpdate(acc.pub, acc.keys, {
@@ -1847,10 +1899,10 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     if (!sub.success) { toast(`Update block failed: ${sub.error}`, 'error'); statusEl.innerHTML = ''; return; }
 
     // Update local account
-    Object.assign(acc, { faceMapHash: newFaceMapHash, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedFaceDescriptor });
+    Object.assign(acc, { faceMapHash: newFaceMapHash, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedCanonical });
     saveWallet();
     statusEl.innerHTML = '<span style="color:var(--success)">Face updated successfully.</span>';
-    toast('Face re-enrolled and update broadcast', 'success');
+    toast('Face updated', 'success');
     addLog(`Face updated for ${acc.username}`, 'success');
     refreshAccount();
   } catch (e) {
