@@ -30,6 +30,16 @@ export default defineConfig({
   define: {
     'process.env': {},
     global: 'globalThis',
+    // Bake bootstrap relay multiaddresses into the build.
+    // Format: JSON array of multiaddr strings with /p2p/<peerId> suffix, e.g.:
+    //   __BOOTSTRAP_ADDRS__: JSON.stringify([
+    //     '/dns4/relay1.example.com/tcp/443/wss/http-path/relay-ws/p2p/<peerId1>',
+    //     '/dns4/relay2.example.com/tcp/443/wss/http-path/relay-ws/p2p/<peerId2>',
+    //   ])
+    // The localStorage key 'neuronchain_bootstrap' always takes priority over this list.
+    __BOOTSTRAP_ADDRS__: JSON.stringify(
+      (process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean)
+    ),
   },
   resolve: {
     alias: {

@@ -27,6 +27,8 @@ export const VERIFICATION_MINT_AMOUNT = 1_000_000 * UNIT_FACTOR;
 
 /** Base earning rate: 1 UNIT per GB per day (in milli-UNIT) */
 export const BASE_STORAGE_RATE_MILLI = 1_000;
+/** Bytes in one gigabyte */
+export const GB_BYTES = 1_073_741_824;
 /** Maximum on-chain heartbeat blocks expected per day (one every ~4 hours) */
 export const MAX_HEARTBEATS_PER_DAY = 6;
 /** Minimum interval between consecutive heartbeat blocks in ms (4 hours) */
@@ -114,20 +116,26 @@ export interface StorageRegisterData {
 /** Payload for storage-heartbeat block. contractData is optional JSON. */
 export interface StorageHeartbeatData {
   type: 'storage-heartbeat';
-  /** Current smoke Hub address of the provider — peers use this for WebRTC block transfer. */
+  /** Current smoke Hub address of the provider - peers use this for WebRTC block transfer. */
   smokeAddr?: string;
+  /** Actual bytes currently stored by this device (from SmokeStore.storageUsedBytes()). */
+  actualStoredBytes?: number;
 }
 
 /**
  * Payload for storage-reward block.
  * The provider self-issues this once per day. Other nodes verify the amount
- * against on-chain heartbeat count and registered capacity.
+ * against on-chain heartbeat count and actual bytes reported in heartbeats.
  */
 export interface StorageRewardData {
   type: 'storage-reward';
   /** Day index = Math.floor(Date.now() / REWARD_EPOCH_MS) */
   epochDay: number;
-  /** Registered capacity in GB at reward time (must match latest storage-register) */
+  /**
+   * Effective stored GB used for reward calculation:
+   * min(actualStoredGB reported in epoch heartbeats, registeredCapacityGB).
+   * Falls back to registeredCapacityGB when no heartbeat reports actualStoredBytes.
+   */
   storedGB: number;
   /** On-chain heartbeat blocks counted in this epoch's 24h window */
   heartbeatCount: number;
@@ -138,27 +146,38 @@ export interface StorageRewardData {
 // ── Block hashing ─────────────────────────────────────────────────────────────
 
 export async function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signature' | 'pqSignature'>): Promise<string> {
-  const data = [
+  // JSON.stringify([...]) avoids collision between fields that contain ':'
+  const data = JSON.stringify([
     block.accountPub,
     block.index,
     block.type,
     block.previousHash,
     block.balance,
     block.timestamp,
-    block.recipient || '',
-    block.amount ?? '',
-    block.sendBlockHash || '',
-    block.sendFrom || '',
-    block.receiveAmount ?? '',
-    block.faceMapHash || '',
-    block.contractData || '',
-    block.contentCid || '',
-    block.updateData || '',
-  ].join(':');
+    block.recipient ?? null,
+    block.amount ?? null,
+    block.sendBlockHash ?? null,
+    block.sendFrom ?? null,
+    block.receiveAmount ?? null,
+    block.faceMapHash ?? null,
+    block.contractData ?? null,
+    block.contentCid ?? null,
+    block.updateData ?? null,
+  ]);
 
   const encoded = new TextEncoder().encode(data);
   const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
-  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return bytesToHex(new Uint8Array(hashBuffer));
+}
+
+/** Fast hex encoding - avoids Array.from + map allocation on every block hash. */
+export function bytesToHex(bytes: Uint8Array): string {
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    hex += (b >> 4).toString(16) + (b & 0xf).toString(16);
+  }
+  return hex;
 }
 
 export async function createAccountBlock(
@@ -197,14 +216,14 @@ export async function createAccountBlock(
 
 /**
  * Verify block signature(s).
- * Always checks ECDSA. If pqSignature + pqPub are both present, also checks ML-DSA-65.
- * Both must pass when both are present.
+ * Always checks ECDSA. If pqPub is provided, pqSignature must be present and valid (mandatory).
  */
 export async function verifyBlockSignature(block: AccountBlock, pqPub?: string): Promise<boolean> {
   const result = await verifySignature(block.signature, block.accountPub);
   if (result !== block.hash) return false;
 
-  if (block.pqSignature && pqPub) {
+  if (pqPub) {
+    if (!block.pqSignature) return false;
     if (!pqVerify(block.hash, block.pqSignature, pqPub)) return false;
   }
 

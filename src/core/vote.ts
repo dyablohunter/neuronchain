@@ -22,12 +22,20 @@ export interface Vote {
   signature: string;
   /** Head block hash of voter's chain - allows receivers to verify balance */
   chainHeadHash?: string;
+  /**
+   * G6: true when the voter lacks parent-chain context and cannot make an
+   * informed approve/reject decision. Abstain votes are signed and counted
+   * toward participation but excluded from the approve/reject threshold.
+   */
+  abstain?: boolean;
 }
 
 export interface VoteTally {
   blockHash: string;
   approveStake: number;
   rejectStake: number;
+  /** Stake from nodes that abstained (no parent context). Excluded from threshold. */
+  abstainStake: number;
   totalStake: number;
   voterCount: number;
   votes: Map<string, Vote>;
@@ -48,6 +56,8 @@ export class VoteManager {
   private tallies: Map<string, VoteTally> = new Map();
   /** Seen vote signatures - prevents replaying the exact same signed vote */
   private seenSignatures: Set<string> = new Set();
+
+  private static readonly MAX_SEEN_SIGS = 50_000;
 
   /**
    * Register a block. If no conflict, it's confirmed optimistically.
@@ -79,6 +89,7 @@ export class VoteManager {
           blockHash: hash,
           approveStake: 0,
           rejectStake: 0,
+          abstainStake: 0,
           totalStake: 0,
           voterCount: 0,
           votes: new Map(),
@@ -101,18 +112,26 @@ export class VoteManager {
     // Reject replayed signatures
     if (this.seenSignatures.has(vote.signature)) return;
     this.seenSignatures.add(vote.signature);
+    if (this.seenSignatures.size > VoteManager.MAX_SEEN_SIGS) {
+      const it = this.seenSignatures.values();
+      this.seenSignatures.delete(it.next().value!);
+    }
 
     // Reject stale votes (prevents replay of old votes with outdated stakes)
     if (Date.now() - vote.timestamp > VOTE_MAX_AGE_MS) return;
 
     tally.votes.set(vote.voterPub, vote);
     tally.voterCount++;
-    if (vote.approve) {
+    if (vote.abstain) {
+      // G6: abstain - counted for participation but not for approve/reject threshold
+      tally.abstainStake += vote.stake;
+    } else if (vote.approve) {
       tally.approveStake += vote.stake;
+      tally.totalStake += vote.stake;
     } else {
       tally.rejectStake += vote.stake;
+      tally.totalStake += vote.stake;
     }
-    tally.totalStake += vote.stake;
   }
 
   /**
@@ -149,7 +168,8 @@ export class VoteManager {
       for (const hash of hashes) {
         const tally = this.tallies.get(hash)!;
         if (tally.createdAt < oldestTally) oldestTally = tally.createdAt;
-        if (tally.totalStake === 0) allVoted = false;
+        // G6: a tally of only abstains still counts as "voted" (nodes couldn't decide)
+        if (tally.totalStake + tally.abstainStake === 0) allVoted = false;
         if (tally.approveStake > bestStake) {
           bestStake = tally.approveStake;
           bestHash = hash;
@@ -204,22 +224,37 @@ export class VoteManager {
     stake: number,
     keys: KeyPair,
     chainHeadHash?: string,
+    abstain?: boolean,
   ): Promise<Vote> {
     const timestamp = Date.now();
-    const payload = `vote:${blockHash}:${approve}:${stake}:${timestamp}:${chainHeadHash || ''}`;
+    // G6: abstain flag is included in payload so it cannot be stripped without breaking the sig
+    const payload = `vote:${blockHash}:${approve}:${stake}:${timestamp}:${chainHeadHash || ''}:${abstain ? '1' : '0'}`;
     const signature = await signData(payload, keys);
-    return { blockHash, voterPub: keys.pub, approve, stake, timestamp, signature, chainHeadHash };
+    return { blockHash, voterPub: keys.pub, approve, stake, timestamp, signature, chainHeadHash, abstain };
   }
 
-  /** Verify a vote signature (supports both old format without chainHeadHash and new format) */
+  /** Verify a vote signature. Handles three payload formats for backwards compatibility. */
   static async verifyVote(vote: Vote): Promise<boolean> {
-    // New format includes chainHeadHash in payload
-    const newPayload = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}:${vote.chainHeadHash || ''}`;
     const result = await verifySignature(vote.signature, vote.voterPub);
-    if (result === newPayload) return true;
-    // Backwards compat: old format without chainHeadHash
-    const oldPayload = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}`;
-    return result === oldPayload;
+    // Current format: includes abstain flag
+    const v3 = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}:${vote.chainHeadHash || ''}:${vote.abstain ? '1' : '0'}`;
+    if (result === v3) return true;
+    // v2: includes chainHeadHash but no abstain
+    const v2 = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}:${vote.chainHeadHash || ''}`;
+    if (result === v2) return true;
+    // v1: original format without chainHeadHash
+    const v1 = `vote:${vote.blockHash}:${vote.approve}:${vote.stake}:${vote.timestamp}`;
+    return result === v1;
+  }
+
+  /** Return the hashes of blocks competing against the given block (its conflict siblings). */
+  getSiblings(blockHash: string): string[] {
+    for (const [, siblings] of this.parentToBlocks) {
+      if (siblings.has(blockHash) && siblings.size > 1) {
+        return Array.from(siblings).filter(h => h !== blockHash);
+      }
+    }
+    return [];
   }
 
   clear(): void {

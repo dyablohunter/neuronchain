@@ -41,7 +41,7 @@ export { formatUNIT, parseUNIT };
 export interface ContentHandle {
   /** Meta CID (SHA-256) - store in block.contentCid or contract state */
   cid: string;
-  /** Inner content CID — pass alongside cid to distributeContent so providers cache both blocks */
+  /** Inner content CID - pass alongside cid to distributeContent so providers cache both blocks */
   contentCid?: string;
   /** Original byte length before encryption */
   size: number;
@@ -64,7 +64,7 @@ export class NeuronChainAPI extends EventEmitter {
       'contract:deployed', 'contract:executed', 'contract:error',
       'inbox:signal', 'auto:received', 'resync',
       'storage:registered', 'storage:deregistered', 'storage:heartbeat-sent',
-      'storage:reward-issued', 'storage:cached', 'storage:deleted',
+      'storage:reward-issued', 'storage:cached', 'storage:deleted', 'storage:replaced',
       'node:started', 'node:stopped',
     ];
     for (const ev of events) {
@@ -115,7 +115,7 @@ export class NeuronChainAPI extends EventEmitter {
     return { block: result.block };
   }
 
-  // ── Content storage (smoke — IndexedDB + HTTP-over-WebRTC) ───────────────
+  // ── Content storage (smoke - IndexedDB + HTTP-over-WebRTC) ───────────────
 
   /**
    * Store encrypted content. Returns a ContentHandle with the CID.
@@ -191,11 +191,38 @@ export class NeuronChainAPI extends EventEmitter {
   /**
    * Delete content locally and broadcast a signed delete request to all caching providers.
    * Providers verify the owner's signature before dropping their copies.
-   * Pass all CIDs related to the content — the meta CID and the inner content CID if known.
+   * Pass all CIDs related to the content - the meta CID and the inner content CID if known.
    */
   async deleteContent(cids: string[], ownerPub: string, keys: KeyPair): Promise<void> {
     if (!this.node.store.isStarted()) throw new Error('Node not started');
     return this.node.deleteContent(cids, ownerPub, keys);
+  }
+
+  /**
+   * Replace content across the network with new data. The old CIDs are deleted locally
+   * and a signed ReplaceRequest is broadcast via GossipSub so every provider holding the
+   * old content drops it and caches the new version. The new content is also distributed
+   * to up to 10 providers via the normal CacheRequest path.
+   *
+   * Storage rewards automatically reflect the change: the next heartbeat block each
+   * provider sends includes updated `actualStoredBytes`, which feeds into reward calculation.
+   *
+   * Typical usage:
+   *   const newHandle = await api.storeContent(newData, mimeType, keys);
+   *   await api.replaceContent(
+   *     [oldHandle.cid, oldHandle.contentCid].filter(Boolean) as string[],
+   *     [newHandle.cid, newHandle.contentCid].filter(Boolean) as string[],
+   *     myPub, keys,
+   *   );
+   */
+  async replaceContent(
+    oldCids: string[],
+    newCids: string[],
+    ownerPub: string,
+    keys: KeyPair,
+  ): Promise<{ providers: string[]; error?: string }> {
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.replaceContent(oldCids, newCids, ownerPub, keys);
   }
 
   /** Store a JSON object encrypted. Returns CID. */
@@ -291,12 +318,13 @@ export class NeuronChainAPI extends EventEmitter {
   }
 
   /**
-   * Distribute a stored CID to up to 10 network providers.
+   * Distribute stored CIDs to up to 10 network providers.
+   * Always pass both the meta CID and the inner contentCid so providers pin both blocks.
    * Providers fetch the content via smoke Http (HTTP over WebRTC) and pin it locally.
    * Returns the list of selected provider pub keys.
    */
-  async distributeContent(cid: string, uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {
-    return this.node.distributeContent(cid, uploaderPub, keys);
+  async distributeContent(cids: string | string[], uploaderPub: string, keys: KeyPair): Promise<{ providers: string[]; error?: string }> {
+    return this.node.distributeContent(cids, uploaderPub, keys);
   }
 
   /** Manually trigger a heartbeat for a local provider account (normally automatic). */

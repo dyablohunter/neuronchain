@@ -57,7 +57,7 @@ export interface GossipSubAdapter {
   removeEventListener(event: 'message', handler: EventListener): void;
 }
 
-// ── GossipSubHub — WebRTC signaling over GossipSub ───────────────────────────
+// ── GossipSubHub - WebRTC signaling over GossipSub ───────────────────────────
 // Each node subscribes to a unique topic keyed by its libp2p peer ID.
 // ICE candidates/SDP flow through the GossipSub mesh; no relay server needed.
 
@@ -213,20 +213,22 @@ export class SmokeStore {
         if (!(await this.fs.exists(`/blocks/${cid}`))) return new Response('Not Found', { status: 404 });
         const data = await this.fs.read(`/blocks/${cid}`);
 
-        // Range request — return only the requested byte slice (206 Partial Content)
+        // Range request - return only the requested byte slice (206 Partial Content)
         const rangeHeader = req.headers.get('range');
         if (rangeHeader) {
           const m = rangeHeader.match(/^bytes=(\d+)-(\d+)$/);
           if (m) {
             const start = parseInt(m[1], 10);
             const end = Math.min(parseInt(m[2], 10), data.byteLength - 1);
-            if (start >= 0 && end >= start) {
-              const slice = data.slice(start, end + 1);
-              return new Response(
-                slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength) as ArrayBuffer,
-                { status: 206, headers: { 'Content-Range': `bytes ${start}-${end}/${data.byteLength}` } },
-              );
+            // M2: reject ranges that are out-of-bounds or inverted
+            if (start < 0 || start >= data.byteLength || start > end) {
+              return new Response('Range Not Satisfiable', { status: 416, headers: { 'Content-Range': `bytes */${data.byteLength}` } });
             }
+            const slice = data.slice(start, end + 1);
+            return new Response(
+              slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength) as ArrayBuffer,
+              { status: 206, headers: { 'Content-Range': `bytes ${start}-${end}/${data.byteLength}` } },
+            );
           }
         }
 
@@ -275,8 +277,18 @@ export class SmokeStore {
   /** Store raw bytes. Returns the CID string (sha256 bafkrei… format). */
   async store(data: Uint8Array): Promise<string> {
     this.assertStarted();
+    const mb = (data.byteLength / 1_048_576).toFixed(2);
+    console.log(`[SmokeStore] store: computing CID for ${mb} MB`);
+    const t0 = performance.now();
     const cid = await this.computeCID(data);
-    await this.fs.write(`/blocks/${cid}`, data);
+    console.log(`[SmokeStore] store: CID=${cid.slice(0, 20)}… writing to IDB (${mb} MB)`);
+    try {
+      await this.fs.write(`/blocks/${cid}`, data);
+      console.log(`[SmokeStore] store: IDB write done in ${(performance.now() - t0).toFixed(0)} ms`);
+    } catch (err) {
+      console.error(`[SmokeStore] store: IDB write FAILED for ${mb} MB block — likely quota exceeded or size limit`, err);
+      throw err;
+    }
     return cid;
   }
 
@@ -289,9 +301,14 @@ export class SmokeStore {
   async retrieve(cidStr: string, timeoutMs = 600_000, priorityPeers?: string[]): Promise<Uint8Array> {
     this.assertStarted();
     const path = `/blocks/${cidStr}`;
+    const shortCid = cidStr.slice(0, 20);
 
     if (await this.fs.exists(path)) {
-      return this.fs.read(path);
+      console.log(`[SmokeStore] retrieve: local cache hit for ${shortCid}…`);
+      const t0 = performance.now();
+      const data = await this.fs.read(path);
+      console.log(`[SmokeStore] retrieve: read ${(data.byteLength / 1_048_576).toFixed(2)} MB from IDB in ${(performance.now() - t0).toFixed(0)} ms`);
+      return data;
     }
 
     // Priority peers first (confirmed holders of this CID), then all remaining fallbacks
@@ -301,8 +318,10 @@ export class SmokeStore {
       ...Array.from(this.peerFallbacks).filter(p => !prioritySet.has(p)),
     ];
 
+    console.log(`[SmokeStore] retrieve: ${shortCid}… not local — trying ${peers.length} peer(s)`, peers.map(p => p.slice(0, 12)));
+
     if (peers.length === 0) {
-      throw new Error(`[SmokeStore] Block not found locally and no peer fallbacks registered: ${cidStr.slice(0, 20)}`);
+      throw new Error(`[SmokeStore] Block not found locally and no peer fallbacks registered: ${shortCid}`);
     }
 
     const timeout = new Promise<never>((_, reject) =>
@@ -311,10 +330,21 @@ export class SmokeStore {
 
     const fetchFromPeer = async (peer: string): Promise<Uint8Array> => {
       const url = `http://${peer}:${SMOKE_BLOCK_PORT}/block/${cidStr}`;
+      console.log(`[SmokeStore] retrieve: fetching ${shortCid}… from peer ${peer.slice(0, 12)}`);
+      const t0 = performance.now();
       const resp = await this.network.Http.fetch(url);
       if (!resp.ok) throw new Error(`peer ${peer.slice(0, 8)} returned ${resp.status}`);
+      console.log(`[SmokeStore] retrieve: got response from ${peer.slice(0, 12)} — reading arrayBuffer…`);
       const data = new Uint8Array(await resp.arrayBuffer());
-      await this.fs.write(path, data);
+      const mb = (data.byteLength / 1_048_576).toFixed(2);
+      console.log(`[SmokeStore] retrieve: received ${mb} MB from ${peer.slice(0, 12)} in ${(performance.now() - t0).toFixed(0)} ms — writing to IDB`);
+      try {
+        await this.fs.write(path, data);
+        console.log(`[SmokeStore] retrieve: IDB write done for ${mb} MB`);
+      } catch (err) {
+        console.error(`[SmokeStore] retrieve: IDB write FAILED for ${mb} MB — quota or size limit`, err);
+        throw err;
+      }
       return data;
     };
 
@@ -339,8 +369,12 @@ export class SmokeStore {
   // ── Encrypted variants ─────────────────────────────────────────────────────
 
   async storeEncrypted(data: Uint8Array, keys: KeyPair): Promise<string> {
+    const mb = (data.byteLength / 1_048_576).toFixed(2);
+    console.log(`[SmokeStore] storeEncrypted: deriving AES key, encrypting ${mb} MB`);
+    const t0 = performance.now();
     const aesKey = await deriveContentKey(keys);
     const encrypted = await encryptBytes(data, aesKey);
+    console.log(`[SmokeStore] storeEncrypted: AES-256-GCM done in ${(performance.now() - t0).toFixed(0)} ms — encrypted size ${(encrypted.byteLength / 1_048_576).toFixed(2)} MB`);
     return this.store(encrypted);
   }
 
@@ -378,11 +412,18 @@ export class SmokeStore {
     meta: Omit<ContentMeta, 'size' | 'encrypted' | 'timestamp'>,
     keys: KeyPair,
   ): Promise<{ cid: string; meta: ContentMeta & { contentCid: string } }> {
+    const mb = (data.byteLength / 1_048_576).toFixed(2);
+    console.log(`[SmokeStore] storeWithMeta: "${meta.name ?? 'unnamed'}" ${mb} MB (${meta.mimeType}) — private`);
+    if (data.byteLength > 50 * 1_048_576) {
+      console.warn(`[SmokeStore] storeWithMeta: WARNING — ${mb} MB exceeds the ~50 MB single-object IDB limit. Store will likely fail or crash the tab.`);
+    }
+    const t0 = performance.now();
     const contentCid = await this.storeEncrypted(data, keys);
     const fullMeta: ContentMeta & { contentCid: string } = {
       ...meta, size: data.length, encrypted: true, timestamp: Date.now(), contentCid,
     };
     const metaCid = await this.storeJSON(fullMeta, keys);
+    console.log(`[SmokeStore] storeWithMeta: done in ${(performance.now() - t0).toFixed(0)} ms — metaCid=${metaCid.slice(0, 20)}… contentCid=${contentCid.slice(0, 20)}…`);
     return { cid: metaCid, meta: fullMeta };
   }
 
@@ -401,11 +442,18 @@ export class SmokeStore {
     data: Uint8Array,
     meta: Omit<ContentMeta, 'size' | 'encrypted' | 'timestamp'>,
   ): Promise<{ cid: string; meta: ContentMeta & { contentCid: string } }> {
+    const mb = (data.byteLength / 1_048_576).toFixed(2);
+    console.log(`[SmokeStore] storeWithMetaPublic: "${meta.name ?? 'unnamed'}" ${mb} MB (${meta.mimeType}) — public`);
+    if (data.byteLength > 50 * 1_048_576) {
+      console.warn(`[SmokeStore] storeWithMetaPublic: WARNING — ${mb} MB exceeds the ~50 MB single-object IDB limit. Store will likely fail or crash the tab.`);
+    }
+    const t0 = performance.now();
     const contentCid = await this.store(data);
     const fullMeta: ContentMeta & { contentCid: string } = {
       ...meta, size: data.length, encrypted: false, timestamp: Date.now(), contentCid,
     };
     const metaCid = await this.store(new TextEncoder().encode(JSON.stringify(fullMeta)));
+    console.log(`[SmokeStore] storeWithMetaPublic: done in ${(performance.now() - t0).toFixed(0)} ms — metaCid=${metaCid.slice(0, 20)}… contentCid=${contentCid.slice(0, 20)}…`);
     return { cid: metaCid, meta: fullMeta };
   }
 
@@ -464,14 +512,23 @@ export class SmokeStore {
 
       const fetchFromPeer = async (peer: string): Promise<Uint8Array> => {
         const url = `http://${peer}:${SMOKE_BLOCK_PORT}/block/${cidStr}`;
+        console.log(`[SmokeStore] cache: fetching ${cidStr.slice(0, 20)}… from ${peer.slice(0, 12)}`);
+        const t0 = performance.now();
         let resp: Response;
         try {
           resp = await this.network.Http.fetch(url);
         } catch (e) {
+          console.warn(`[SmokeStore] cache: fetch failed from ${peer.slice(0, 12)} —`, smokeErrStr(e));
           throw new Error(`peer ${peer.slice(0, 8)}: ${smokeErrStr(e)}`);
         }
-        if (!resp.ok) throw new Error(`peer ${peer.slice(0, 8)} returned ${resp.status}`);
-        return new Uint8Array(await resp.arrayBuffer());
+        if (!resp.ok) {
+          console.warn(`[SmokeStore] cache: peer ${peer.slice(0, 12)} returned HTTP ${resp.status}`);
+          throw new Error(`peer ${peer.slice(0, 8)} returned ${resp.status}`);
+        }
+        const data = new Uint8Array(await resp.arrayBuffer());
+        const mb = (data.byteLength / 1_048_576).toFixed(2);
+        console.log(`[SmokeStore] cache: received ${mb} MB from ${peer.slice(0, 12)} in ${(performance.now() - t0).toFixed(0)} ms`);
+        return data;
       };
 
       const data = await Promise.race([
@@ -558,6 +615,6 @@ export class SmokeStore {
   }
 
   private assertStarted(): void {
-    if (!this.started) throw new Error('SmokeStore not started — call start() first');
+    if (!this.started) throw new Error('SmokeStore not started - call start() first');
   }
 }

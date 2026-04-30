@@ -105,7 +105,7 @@ import { EventEmitter } from '../core/events';
 import { AccountBlock } from '../core/dag-block';
 import { Vote } from '../core/vote';
 import { verifySignature } from '../core/crypto';
-import { LockoutNotice } from '../core/pin-crypto';
+import { LockoutNotice, lockoutPayload } from '../core/pin-crypto';
 
 export const NUM_SYNAPSES = 4;
 
@@ -174,6 +174,9 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
   return null;
 }
 
+// Injected at build time via vite.config.ts define; empty array when not set.
+declare const __BOOTSTRAP_ADDRS__: string[] | undefined;
+
 /** Bootstrap relay multiaddresses - always includes /p2p/<peerId> suffix. */
 function buildBootstrapList(relayInfo: RelayInfo | null): string[] {
   if (typeof window !== 'undefined') {
@@ -185,27 +188,59 @@ function buildBootstrapList(relayInfo: RelayInfo | null): string[] {
       }
     } catch { /* ignore */ }
   }
-  if (relayInfo) return [relayInfo.bootstrapAddr];
+  // Build-time baked list (set via __BOOTSTRAP_ADDRS__ in vite.config.ts define)
+  if (typeof __BOOTSTRAP_ADDRS__ !== 'undefined' && Array.isArray(__BOOTSTRAP_ADDRS__) && __BOOTSTRAP_ADDRS__.length > 0) {
+    return relayInfo ? [relayInfo.bootstrapAddr, ...__BOOTSTRAP_ADDRS__] : __BOOTSTRAP_ADDRS__;
+  }
+  // Community relays cached from previous sessions
+  const communityRelays = lsLoadRelayAddrs().filter(a => !relayInfo || a !== relayInfo.bootstrapAddr);
+  if (relayInfo) return [relayInfo.bootstrapAddr, ...communityRelays];
+  if (communityRelays.length > 0) return communityRelays;
   if (typeof window === 'undefined') return [`/dns4/localhost/tcp/9090/ws`];
   return [];
 }
 
+// ── Protocol version ─────────────────────────────────────────────────────────
+// Nodes on a different PROTOCOL_VERSION will not share GossipSub topics and
+// will therefore never corrupt each other's ledger state, even if they connect
+// to the same relay and use the same network name.
+export const PROTOCOL_VERSION = 'v1';
+
 // ── GossipSub topic helpers ───────────────────────────────────────────────────
 
 function topicBlocks(network: string, synapse: number): string {
-  return `neuronchain/${network}/blocks/${synapse}`;
+  return `neuronchain/${PROTOCOL_VERSION}/${network}/blocks/${synapse}`;
 }
-function topicVotes(network: string): string { return `neuronchain/${network}/votes`; }
-function topicAccounts(network: string): string { return `neuronchain/${network}/accounts`; }
-function topicInbox(network: string, pubShort: string): string { return `neuronchain/${network}/inbox/${pubShort}`; }
-function topicGeneration(network: string): string { return `neuronchain/${network}/generation`; }
-function topicStorageReceipts(network: string): string { return `neuronchain/${network}/storage/receipts`; }
-function topicStorageCacheRequests(network: string): string { return `neuronchain/${network}/storage/cache-requests`; }
-function topicStorageDeleteRequests(network: string): string { return `neuronchain/${network}/storage/delete-requests`; }
-function topicLockouts(network: string): string { return `neuronchain/${network}/lockouts`; }
-function topicKeyBlobs(network: string): string { return `neuronchain/${network}/keyblobs`; }
-function topicBlobRequests(network: string): string { return `neuronchain/${network}/blob-requests`; }
-function topicPeerAddrs(network: string): string { return `neuronchain/${network}/peer-addrs`; }
+function topicVotes(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/votes`; }
+function topicAccounts(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/accounts`; }
+function topicInbox(network: string, pubShort: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/inbox/${pubShort}`; }
+function topicGeneration(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/generation`; }
+function topicStorageReceipts(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/storage/receipts`; }
+function topicStorageCacheRequests(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/storage/cache-requests`; }
+function topicStorageDeleteRequests(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/storage/delete-requests`; }
+function topicStorageReplaceRequests(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/storage/replace-requests`; }
+function topicLockouts(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/lockouts`; }
+function topicKeyBlobs(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/keyblobs`; }
+function topicBlobRequests(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/blob-requests`; }
+function topicPeerAddrs(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/peer-addrs`; }
+function topicRelays(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/relays`; }
+function topicSnapshots(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/snapshots`; }
+
+// localStorage bootstrap cache — addresses only, for buildBootstrapList (pre-DB)
+const KNOWN_RELAYS_KEY = 'neuronchain_known_relays';
+function lsLoadRelayAddrs(): string[] {
+  try { return JSON.parse(localStorage.getItem(KNOWN_RELAYS_KEY) || '[]') as string[]; } catch { return []; }
+}
+function lsSaveRelayAddrs(addrs: string[]): void {
+  try { localStorage.setItem(KNOWN_RELAYS_KEY, JSON.stringify(addrs.slice(-30))); } catch {}
+}
+function lsAddRelayAddr(addr: string): void {
+  const existing = lsLoadRelayAddrs();
+  if (!existing.includes(addr)) { existing.push(addr); lsSaveRelayAddrs(existing); }
+}
+
+const RELAY_FAIL_EVICT = 3; // consecutive failures before eviction
+const RELAY_STALE_MS = 48 * 60 * 60 * 1000; // 48 h without contact → evict
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -214,24 +249,86 @@ function decode<T>(data: Uint8Array): T { return JSON.parse(dec.decode(data)) as
 
 // ── IndexedDB schema ──────────────────────────────────────────────────────────
 
+export interface TrackedCidRecord {
+  cid: string;
+  ownerPub: string;
+  additionalCids: string[];
+  confirmedProviders: string[];
+  lastDistributed: number;
+}
+
+export interface KnownRelayRecord {
+  addr: string;         // full multiaddr — keyPath
+  peerId: string;       // extracted from /p2p/<id> suffix
+  lastSeen: number;     // Unix ms — last successful connection or fresh announcement
+  failCount: number;    // consecutive dial failures; evicted at RELAY_FAIL_EVICT
+  announcerPub: string; // account pub that signed the announcement
+}
+
 interface NeuronDB {
-  blocks: AccountBlock & { id?: string };
+  blocks: AccountBlock & { id?: string; _blockVersion?: number };
   accounts: Record<string, unknown> & { pub: string };
   keyblobs: Record<string, unknown> & { pub: string };
   contracts: Record<string, unknown> & { id: string };
   votes: Vote & { id?: string };
+  trackedCids: TrackedCidRecord;
+  knownRelays: KnownRelayRecord;
 }
 
 async function openNeuronDB(network: string): Promise<IDBPDatabase<NeuronDB>> {
-  return openDB<NeuronDB>(`neuronchain-${network}`, 2, {
-    upgrade(db) {
-      if (!db.objectStoreNames.contains('blocks'))    db.createObjectStore('blocks',    { keyPath: 'hash' });
-      if (!db.objectStoreNames.contains('accounts'))  db.createObjectStore('accounts',  { keyPath: 'pub' });
-      if (!db.objectStoreNames.contains('keyblobs'))  db.createObjectStore('keyblobs',  { keyPath: 'pub' });
-      if (!db.objectStoreNames.contains('contracts')) db.createObjectStore('contracts', { keyPath: 'id' });
-      if (!db.objectStoreNames.contains('votes')) {
-        const vs = db.createObjectStore('votes', { autoIncrement: true });
-        vs.createIndex('byBlock', 'blockHash');
+  return openDB<NeuronDB>(`neuronchain-${network}`, 7, {
+    upgrade(db, oldVersion, _newVersion, transaction) {
+      if (oldVersion < 2) {
+        const bs = db.createObjectStore('blocks', { keyPath: 'hash' });
+        bs.createIndex('byAccount', 'accountPub');       // P9: O(1) account chain lookup
+        bs.createIndex('byBlockVersion', '_blockVersion'); // A5: incremental block resync
+        const as = db.createObjectStore('accounts',  { keyPath: 'pub' });
+        as.createIndex('byVersion', '_version');      // P4: O(changed) incremental resync
+        if (!db.objectStoreNames.contains('keyblobs'))  db.createObjectStore('keyblobs',  { keyPath: 'pub' });
+        if (!db.objectStoreNames.contains('contracts')) db.createObjectStore('contracts', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('votes')) {
+          const vs = db.createObjectStore('votes', { autoIncrement: true });
+          vs.createIndex('byBlock', 'blockHash');
+        }
+      }
+      // v3: trackedCids for persistent storage redundancy tracking
+      if (oldVersion < 3) {
+        if (!db.objectStoreNames.contains('trackedCids')) {
+          db.createObjectStore('trackedCids', { keyPath: 'cid' });
+        }
+      }
+      // v4: byAccount index on blocks store for O(1) per-account chain queries
+      if (oldVersion >= 2 && oldVersion < 4) {
+        try {
+          const store = transaction.objectStore('blocks');
+          if (!store.indexNames.contains('byAccount')) {
+            store.createIndex('byAccount', 'accountPub');
+          }
+        } catch { /* store may not exist on very fresh databases */ }
+      }
+      // v5: byVersion index on accounts store for O(changed) incremental resync
+      if (oldVersion >= 2 && oldVersion < 5) {
+        try {
+          const store = transaction.objectStore('accounts');
+          if (!store.indexNames.contains('byVersion')) {
+            store.createIndex('byVersion', '_version');
+          }
+        } catch { /* store may not exist on very fresh databases */ }
+      }
+      // v6: byBlockVersion index on blocks store for A5 incremental block resync
+      if (oldVersion >= 2 && oldVersion < 6) {
+        try {
+          const store = transaction.objectStore('blocks');
+          if (!store.indexNames.contains('byBlockVersion')) {
+            store.createIndex('byBlockVersion', '_blockVersion');
+          }
+        } catch { /* store may not exist on very fresh databases */ }
+      }
+      // v7: knownRelays store — community relay registry with liveness tracking
+      if (oldVersion < 7) {
+        if (!db.objectStoreNames.contains('knownRelays')) {
+          db.createObjectStore('knownRelays', { keyPath: 'addr' });
+        }
       }
     },
   });
@@ -260,22 +357,116 @@ export class Libp2pNetwork extends EventEmitter {
   /** Decentralised lockout notices: accountPub → latest LockoutNotice */
   private lockoutNotices: Map<string, LockoutNotice> = new Map();
   private static readonly MAX_LOCKOUTS = 10_000;
-  /** circuit-relay multiaddrs received from other peers: peerId → addrs */
-  knownPeerAddrs: Map<string, string[]> = new Map();
+  /** L2: peer addrs with timestamp for TTL eviction */
+  knownPeerAddrs: Map<string, { addrs: string[]; updatedAt: number }> = new Map();
+  private static readonly PEER_ADDR_TTL_MS = 10 * 60 * 1000; // 10 minutes
+  /** H4: per-peer token bucket - peerId → { tokens, lastRefill } */
+  private peerBuckets: Map<string, { tokens: number; lastRefill: number }> = new Map();
+  private static readonly BUCKET_CAPACITY = 50;
+  private static readonly BUCKET_REFILL_PER_SEC = 10;
   private peerAddrTimer: ReturnType<typeof setInterval> | null = null;
   private peerAddrBroadcastDebounce: ReturnType<typeof setTimeout> | null = null;
-  /** Our own smoke Hub address — included in peer-addrs broadcasts for peer discovery */
+  /** Our own smoke Hub address - included in peer-addrs broadcasts for peer discovery */
   private smokeAddr = '';
+  /** P4: monotonic counter stamped on every IDB account write; enables range-query incremental resync */
+  private accountVersionCounter = 0;
+  /** A5: monotonic counter stamped on every IDB block write; enables range-query incremental block resync */
+  private blockVersionCounter = 0;
+  /** Community relay registry — addr → record (mirrors IDB knownRelays store) */
+  private knownRelayMap: Map<string, KnownRelayRecord> = new Map();
 
   constructor(network: string) {
     super();
     this.network = network;
     this.loadGeneration();
+    this.loadAccountVersion();
+    this.loadBlockVersion();
   }
 
   private get genKey(): string { return `neuronchain_generation_${this.network}`; }
   private loadGeneration(): void { try { this.generation = parseInt(localStorage.getItem(this.genKey) || '0', 10) || 0; } catch { this.generation = 0; } }
   private saveGeneration(): void { try { localStorage.setItem(this.genKey, String(this.generation)); } catch {} }
+
+  private get accVerKey(): string { return `neuronchain_acc_ver_${this.network}`; }
+  private loadAccountVersion(): void { try { this.accountVersionCounter = parseInt(localStorage.getItem(this.accVerKey) || '0', 10) || 0; } catch { this.accountVersionCounter = 0; } }
+  private saveAccountVersion(): void { try { localStorage.setItem(this.accVerKey, String(this.accountVersionCounter)); } catch {} }
+  /** Returns the current monotonic account version (highest version written to IDB this session). */
+  getAccountVersionCounter(): number { return this.accountVersionCounter; }
+
+  private get blkVerKey(): string { return `neuronchain_blk_ver_${this.network}`; }
+  private loadBlockVersion(): void { try { this.blockVersionCounter = parseInt(localStorage.getItem(this.blkVerKey) || '0', 10) || 0; } catch { this.blockVersionCounter = 0; } }
+  private saveBlockVersion(): void { try { localStorage.setItem(this.blkVerKey, String(this.blockVersionCounter)); } catch {} }
+  /** Returns the current monotonic block version (highest version written to IDB this session). */
+  getBlockVersionCounter(): number { return this.blockVersionCounter; }
+
+  // ── Community relay registry ──────────────────────────────────────────────
+
+  private static peerIdFromAddr(addr: string): string {
+    const m = addr.match(/\/p2p\/([^/]+)$/);
+    return m ? m[1] : '';
+  }
+
+  private async loadKnownRelaysFromDB(): Promise<void> {
+    try {
+      const records = await (this.db as IDBPDatabase<any>).getAll('knownRelays') as KnownRelayRecord[];
+      const now = Date.now();
+      for (const r of records) {
+        if (r.failCount >= RELAY_FAIL_EVICT || now - r.lastSeen > RELAY_STALE_MS) {
+          await (this.db as IDBPDatabase<any>).delete('knownRelays', r.addr);
+        } else {
+          this.knownRelayMap.set(r.addr, r);
+          lsAddRelayAddr(r.addr);
+        }
+      }
+    } catch { /* fresh DB */ }
+  }
+
+  async upsertKnownRelay(addr: string, announcerPub: string): Promise<void> {
+    const peerId = Libp2pNetwork.peerIdFromAddr(addr);
+    if (!peerId) return;
+    const existing = this.knownRelayMap.get(addr);
+    const record: KnownRelayRecord = {
+      addr, peerId,
+      lastSeen: Date.now(),
+      failCount: 0,
+      announcerPub: existing?.announcerPub || announcerPub,
+    };
+    this.knownRelayMap.set(addr, record);
+    lsAddRelayAddr(addr);
+    try { await (this.db as IDBPDatabase<any>).put('knownRelays', record); } catch { /* ignore */ }
+    this.emit('relays:updated');
+  }
+
+  async markRelayFailed(addr: string): Promise<void> {
+    const record = this.knownRelayMap.get(addr);
+    if (!record) return;
+    record.failCount++;
+    if (record.failCount >= RELAY_FAIL_EVICT || Date.now() - record.lastSeen > RELAY_STALE_MS) {
+      this.knownRelayMap.delete(addr);
+      try { await (this.db as IDBPDatabase<any>).delete('knownRelays', addr); } catch { /* ignore */ }
+      const addrs = lsLoadRelayAddrs().filter(a => a !== addr);
+      lsSaveRelayAddrs(addrs);
+      this.emit('relays:updated');
+    } else {
+      try { await (this.db as IDBPDatabase<any>).put('knownRelays', record); } catch { /* ignore */ }
+    }
+  }
+
+  getKnownRelays(): KnownRelayRecord[] {
+    return [...this.knownRelayMap.values()];
+  }
+
+  async publishRelayAnnouncement(addr: string, keys: { pub: string; priv: string; epub: string; epriv: string }): Promise<void> {
+    if (!this.running) return;
+    const peerId = Libp2pNetwork.peerIdFromAddr(addr);
+    if (!peerId) throw new Error('Address must include /p2p/<peerId> suffix');
+    const { signData } = await import('../core/crypto');
+    const timestamp = Date.now();
+    const payload = `relay-announce:${addr}:${timestamp}`;
+    const signature = await signData(payload, keys);
+    this.publish(topicRelays(this.network), { addr, peerId, timestamp, pub: keys.pub, signature });
+    await this.upsertKnownRelay(addr, keys.pub);
+  }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -283,6 +474,7 @@ export class Libp2pNetwork extends EventEmitter {
     if (this.running) return;
 
     this.db = await openNeuronDB(this.network);
+    await this.loadKnownRelaysFromDB();
 
     const relayInfo = await fetchRelayInfo();
     if (!relayInfo) console.warn('[Libp2p] Could not fetch relay info - bootstrap will be skipped');
@@ -301,7 +493,7 @@ export class Libp2pNetwork extends EventEmitter {
         // '/p2p-circuit' triggers the circuit-relay transport's listen() path,
         // which calls reservationStore.reserveRelay(). Without this entry the
         // pendingReservations array stays empty, the store considers "enough relays
-        // found" (zero needed = zero required), and never makes a relay reservation —
+        // found" (zero needed = zero required), and never makes a relay reservation -
         // leaving getMultiaddrs() empty and the node with no reachable address.
         listen: ['/p2p-circuit'],
       },
@@ -361,21 +553,25 @@ export class Libp2pNetwork extends EventEmitter {
     pubsub.subscribe(topicStorageReceipts(this.network));
     pubsub.subscribe(topicStorageCacheRequests(this.network));
     pubsub.subscribe(topicStorageDeleteRequests(this.network));
+    pubsub.subscribe(topicStorageReplaceRequests(this.network));
     pubsub.subscribe(topicLockouts(this.network));
     pubsub.subscribe(topicKeyBlobs(this.network));
     pubsub.subscribe(topicBlobRequests(this.network));
     pubsub.subscribe(topicPeerAddrs(this.network));
+    pubsub.subscribe(topicRelays(this.network));
+    pubsub.subscribe(topicSnapshots(this.network));
 
     pubsub.addEventListener('message', (evt) => {
-      const msg = evt.detail;
-      this.handleMessage(msg.topic, msg.data).catch(console.error);
+      const msg = evt.detail as { topic: string; data: Uint8Array; from?: { toString(): string } };
+      const fromPeer: string = msg.from?.toString() ?? '';
+      this.handleMessage(msg.topic, msg.data, fromPeer).catch(console.error);
     });
 
     // When a remote peer subscribes to the peer-addrs topic it means a new node
     // is joining and wants to discover peer addresses. Re-broadcast immediately so
     // they don't have to wait for the next heartbeat. This is the most reliable
     // trigger because it fires on the publisher's side exactly when a new subscriber
-    // appears in the GossipSub mesh — regardless of whether there's a direct libp2p
+    // appears in the GossipSub mesh - regardless of whether there's a direct libp2p
     // connection between the two browser peers.
     pubsub.addEventListener('subscription-change', (evt: Event) => {
       const detail = (evt as CustomEvent<{ subscriptions: Array<{ topic: string; subscribe: boolean }> }>).detail;
@@ -417,10 +613,38 @@ export class Libp2pNetwork extends EventEmitter {
         if (info) {
           try {
             await this.libp2p.dial(multiaddr(info.bootstrapAddr));
+            lsAddRelayAddr(info.bootstrapAddr);
           } catch { /* ignore - bootstrap will retry automatically */ }
         }
       }, 3000);
+    } else {
+      lsAddRelayAddr(relayInfo.bootstrapAddr);
     }
+
+    // Dial all community relays from IDB and gossip known relays to new peers
+    setTimeout(async () => {
+      if (!this.running) return;
+      const primaryAddr = relayInfo?.bootstrapAddr;
+      for (const r of this.knownRelayMap.values()) {
+        if (r.addr === primaryAddr) continue;
+        try { await this.libp2p.dial(multiaddr(r.addr)); } catch { /* unreachable at startup */ }
+      }
+      // Announce own relay + all known community relays so new peers can learn them
+      if (relayInfo) {
+        this.publish(topicRelays(this.network), { addr: relayInfo.bootstrapAddr, peerId: relayInfo.peerId, timestamp: Date.now(), pub: '', signature: '' });
+      }
+      for (const r of this.knownRelayMap.values()) {
+        this.publish(topicRelays(this.network), { addr: r.addr, peerId: r.peerId, timestamp: r.lastSeen, pub: r.announcerPub, signature: '' });
+      }
+    }, 5000);
+
+    // Re-gossip community relays every 20 min so new nodes that join later learn about them
+    setInterval(() => {
+      if (!this.running) return;
+      for (const r of this.knownRelayMap.values()) {
+        this.publish(topicRelays(this.network), { addr: r.addr, peerId: r.peerId, timestamp: r.lastSeen, pub: r.announcerPub, signature: '' });
+      }
+    }, 20 * 60 * 1000);
   }
 
   async stop(): Promise<void> {
@@ -452,7 +676,7 @@ export class Libp2pNetwork extends EventEmitter {
     if (!this.running) return;
     const all = (this.libp2p?.getMultiaddrs?.() ?? []).map(ma => ma.toString());
     const addrs = all.filter(a => a.includes('p2p-circuit'));
-    if (addrs.length === 0) { console.warn('[Libp2p] No circuit-relay addrs yet — relay reservation may not have completed'); return; }
+    if (addrs.length === 0) { console.warn('[Libp2p] No circuit-relay addrs yet - relay reservation may not have completed'); return; }
     const msg: Record<string, unknown> = { peerId: this.peerId, addrs };
     if (this.smokeAddr) msg.smokeAddr = this.smokeAddr;
     this.publish(topicPeerAddrs(this.network), msg);
@@ -460,7 +684,9 @@ export class Libp2pNetwork extends EventEmitter {
 
   // ── Message handler ───────────────────────────────────────────────────────
 
-  private async handleMessage(topic: string, data: Uint8Array): Promise<void> {
+  private async handleMessage(topic: string, data: Uint8Array, fromPeer = ''): Promise<void> {
+    // H4: per-peer token bucket rate limiting - drop if peer exceeds burst capacity
+    if (fromPeer && !this.consumePeerToken(fromPeer)) return;
     if (topic === topicGeneration(this.network)) {
       const msg = decode<{ generation?: number; signature?: string; operatorPub?: string; resetAt?: number }>(data);
       if (typeof msg.generation !== 'number' || msg.generation <= this.generation) return;
@@ -471,7 +697,7 @@ export class Libp2pNetwork extends EventEmitter {
       }
       this.generation = msg.generation;
       this.saveGeneration();
-      // isReset = true only when clearAll() triggered this — it stamps resetAt.
+      // isReset = true only when clearAll() triggered this - it stamps resetAt.
       // publishLocalData() re-broadcasts without resetAt, so peers syncing their
       // generation counter don't have their data wiped.
       const isReset = typeof msg.resetAt === 'number' && (Date.now() - msg.resetAt < 10 * 60 * 1000);
@@ -482,6 +708,7 @@ export class Libp2pNetwork extends EventEmitter {
           await this.db.clear('accounts');
           await this.db.clear('votes');
           await this.db.clear('contracts');
+          await this.db.clear('trackedCids');
         } catch { /* ignore */ }
         this.processedBlocks.clear();
         this.processedVotes.clear();
@@ -507,11 +734,13 @@ export class Libp2pNetwork extends EventEmitter {
           // Enforce decentralised lockout: drop blocks from accounts under active lockout
           const lockout = this.lockoutNotices.get(block.accountPub);
           if (lockout && lockout.lockedUntil > Date.now()) {
-            return; // Silently drop — account is locked out by peer consensus
+            return; // Silently drop - account is locked out by peer consensus
           }
           this.processedBlocks.add(block.hash);
           this.capSet(this.processedBlocks);
-          await this.db.put('blocks', block as NeuronDB['blocks']);
+          this.blockVersionCounter++;
+          this.saveBlockVersion();
+          await this.db.put('blocks', { ...block, _blockVersion: this.blockVersionCounter } as NeuronDB['blocks']);
           this.emit('block:received', block);
         }
         return;
@@ -536,6 +765,11 @@ export class Libp2pNetwork extends EventEmitter {
       if (acc.pub === null || acc.username === null) return;
       if (typeof acc._gen === 'number' && acc._gen < this.generation) return;
       if (acc.pub && acc.username) {
+        // S5: unsigned gossip must not overwrite an existing account's verified data
+        if (!acc._sig) {
+          const existing = await this.db.get('accounts', String(acc.pub));
+          if (existing && (existing as Record<string, unknown>)._sig) return;
+        }
         await this.db.put('accounts', acc as NeuronDB['accounts']);
         this.emit('account:synced', acc);
       }
@@ -575,6 +809,14 @@ export class Libp2pNetwork extends EventEmitter {
       return;
     }
 
+    if (topic === topicStorageReplaceRequests(this.network)) {
+      const req = decode<Record<string, unknown>>(data);
+      if (req.oldCid && req.newCid && req.ownerPub && req.signature) {
+        this.emit('storage:replace-request', req);
+      }
+      return;
+    }
+
     if (topic === topicLockouts(this.network)) {
       const notice = decode<LockoutNotice>(data);
       if (
@@ -584,6 +826,11 @@ export class Libp2pNetwork extends EventEmitter {
         typeof notice.timestamp === 'number' &&
         Date.now() - notice.timestamp < 5 * 60 * 1000 // reject stale notices >5min old
       ) {
+        // Require valid ECDSA signature from the account holder - prevents peers faking lockouts
+        if (!notice.signature) return;
+        const verified = await verifySignature(notice.signature, notice.accountPub);
+        if (verified !== lockoutPayload(notice)) return;
+
         const existing = this.lockoutNotices.get(notice.accountPub);
         // Only update if this notice has a higher attempt count or later lockout
         if (!existing || notice.failedAttempts >= existing.failedAttempts) {
@@ -602,7 +849,23 @@ export class Libp2pNetwork extends EventEmitter {
     if (topic === topicKeyBlobs(this.network)) {
       const blob = decode<Record<string, unknown>>(data);
       if (blob.pub && blob.encryptedKeys && blob.username) {
-        // Only overwrite if the incoming blob is newer — prevents a stale gossip
+        // Verify linkedAnchor against on-chain account to reject tampered blobs.
+        // Anchor = SHA-256(encryptedKeys + ":" + faceMapHash + ":" + pub).
+        // Skip if account not yet synced locally (can't verify yet - accept optimistically).
+        if (blob.linkedAnchor && blob.faceMapHash) {
+          const onChain = await this.db.get('accounts', blob.pub as string).catch(() => null);
+          if (onChain) {
+            const onChainAnchor = (onChain as Record<string, unknown>).linkedAnchor;
+            if (onChainAnchor && typeof onChainAnchor === 'string') {
+              const input = `${blob.encryptedKeys}:${blob.faceMapHash}:${blob.pub}`;
+              const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+              const computed = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+              if (computed !== onChainAnchor) return; // anchor mismatch - discard
+            }
+          }
+        }
+
+        // Only overwrite if the incoming blob is newer - prevents a stale gossip
         // from another node from silently reverting a locally-updated blob.
         const existing = await this.db.get('keyblobs', blob.pub as string).catch(() => null);
         const incomingTs = typeof blob.updatedAt === 'number' ? blob.updatedAt : 0;
@@ -632,8 +895,39 @@ export class Libp2pNetwork extends EventEmitter {
     if (topic === topicPeerAddrs(this.network)) {
       const msg = decode<{ peerId?: string; addrs?: string[]; smokeAddr?: string }>(data);
       if (msg.peerId && msg.peerId !== this.peerId && Array.isArray(msg.addrs) && msg.addrs.length > 0) {
-        this.knownPeerAddrs.set(msg.peerId, msg.addrs);
+        // L2: evict stale entries before inserting
+        const now = Date.now();
+        for (const [pid, entry] of this.knownPeerAddrs) {
+          if (now - entry.updatedAt > Libp2pNetwork.PEER_ADDR_TTL_MS) this.knownPeerAddrs.delete(pid);
+        }
+        this.knownPeerAddrs.set(msg.peerId, { addrs: msg.addrs, updatedAt: now });
         this.emit('peer:addrs', { peerId: msg.peerId, addrs: msg.addrs, smokeAddr: msg.smokeAddr });
+      }
+      return;
+    }
+
+    // Community relay announcements — verify signature when present, upsert and dial
+    if (topic === topicRelays(this.network)) {
+      const msg = decode<{ addr?: string; peerId?: string; timestamp?: number; pub?: string; signature?: string }>(data);
+      if (!msg.addr || typeof msg.addr !== 'string') return;
+      if (!Libp2pNetwork.peerIdFromAddr(msg.addr)) return;
+      // Verify signature when the message was explicitly signed by an account holder
+      if (msg.signature && msg.pub && msg.timestamp) {
+        const payload = `relay-announce:${msg.addr}:${msg.timestamp}`;
+        const result = await verifySignature(msg.signature, msg.pub);
+        if (result !== payload) return;
+      }
+      await this.upsertKnownRelay(msg.addr, msg.pub || '');
+      this.emit('relay:discovered', msg.addr);
+      try { await this.libp2p.dial(multiaddr(msg.addr)); } catch { /* unreachable, skip */ }
+      return;
+    }
+
+    // A8: snapshot announcements - emit so node.ts can decide whether to fetch and apply
+    if (topic === topicSnapshots(this.network)) {
+      const msg = decode<{ cid?: string; sizeBytes?: number; epochBlock?: string; timestamp?: number }>(data);
+      if (msg.cid && typeof msg.cid === 'string' && msg.epochBlock) {
+        this.emit('snapshot:announced', { cid: msg.cid, sizeBytes: msg.sizeBytes ?? 0, epochBlock: msg.epochBlock });
       }
       return;
     }
@@ -648,7 +942,9 @@ export class Libp2pNetwork extends EventEmitter {
     data._gen = this.generation;
     const topic = topicBlocks(this.network, getSynapseIndex(block.accountPub));
     this.publish(topic, data);
-    this.db.put('blocks', block as NeuronDB['blocks']).catch(() => {});
+    this.blockVersionCounter++;
+    this.saveBlockVersion();
+    this.db.put('blocks', { ...block, _blockVersion: this.blockVersionCounter } as NeuronDB['blocks']).catch(() => {});
   }
 
   publishVote(vote: Vote): void {
@@ -676,6 +972,12 @@ export class Libp2pNetwork extends EventEmitter {
     return !!notice && notice.lockedUntil > Date.now();
   }
 
+  /** A8: broadcast a snapshot announcement - peers can fetch the CID from SmokeStore. */
+  publishSnapshot(cid: string, sizeBytes: number, epochBlock: string): void {
+    if (!this.running) return;
+    this.publish(topicSnapshots(this.network), { cid, sizeBytes, epochBlock, timestamp: Date.now() });
+  }
+
   publishInboxSignal(recipientPub: string, senderPub: string, blockHash: string, amount: number, signature?: string): void {
     if (!this.running) return;
     const pubShort = recipientPub.slice(0, 16);
@@ -700,7 +1002,12 @@ export class Libp2pNetwork extends EventEmitter {
 
   saveAccount(pub: string, account: Record<string, unknown>): void {
     if (!this.running) return;
-    const data = { ...account, _gen: this.generation };
+    // P8: never persist or gossip the plaintext face descriptor
+    const { faceDescriptor: _fd, ...clean } = account as Record<string, unknown> & { faceDescriptor?: unknown };
+    // P4: stamp monotonic version so loadChangedAccounts can do a bounded range query
+    this.accountVersionCounter++;
+    this.saveAccountVersion();
+    const data = { ...clean, _gen: this.generation, _version: this.accountVersionCounter };
     this.db.put('accounts', data as unknown as NeuronDB['accounts']).catch(() => {});
     this.publish(topicAccounts(this.network), data);
   }
@@ -711,12 +1018,13 @@ export class Libp2pNetwork extends EventEmitter {
   }
 
   saveKeyBlob(pub: string, blob: Record<string, unknown>): Promise<void> {
-    if (!this.running) return Promise.resolve();
     const entry = { ...blob, pub };
-    const writePromise = this.db.put('keyblobs', entry as NeuronDB['keyblobs']).then(() => {}).catch(() => {});
-    // Gossip so other devices can recover without being online at enrollment time
-    this.publish(topicKeyBlobs(this.network), entry);
-    return writePromise;
+    const stored = this.db.put('keyblobs', entry as NeuronDB['keyblobs']).then(() => {}).catch(() => {});
+    // Gossip the updated blob so other nodes can serve it during recovery.
+    // With the combined-key scheme the blob no longer grants standalone access to private keys
+    // (face + PIN are both required), so network-wide availability is safe.
+    if (this.running) this.publish(topicKeyBlobs(this.network), entry);
+    return stored;
   }
 
   async loadKeyBlob(pub: string): Promise<Record<string, unknown> | null> {
@@ -768,11 +1076,44 @@ export class Libp2pNetwork extends EventEmitter {
     try {
       const all = await this.db.getAll('accounts');
       for (const acc of all) {
-        const a = acc as Record<string, unknown>;
+        // P8: strip plaintext face descriptor on load so old IDB records don't re-gossip it
+        const { faceDescriptor: _fd, ...a } = acc as Record<string, unknown> & { faceDescriptor?: unknown };
         if (a.pub && a.username) map.set(String(a.pub), a);
       }
     } catch { /* empty db is fine */ }
     return map;
+  }
+
+  /**
+   * P4: Return only accounts written to IDB after `sinceVersion` (exclusive).
+   * Uses the byVersion index so the IDB read is O(changed) instead of O(total accounts).
+   */
+  async loadChangedAccounts(sinceVersion: number): Promise<Map<string, Record<string, unknown>>> {
+    const map = new Map<string, Record<string, unknown>>();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const all = await (this.db as IDBPDatabase<any>).getAllFromIndex(
+        'accounts', 'byVersion', IDBKeyRange.lowerBound(sinceVersion, true),
+      );
+      for (const acc of all as Record<string, unknown>[]) {
+        const { faceDescriptor: _fd, ...a } = acc as Record<string, unknown> & { faceDescriptor?: unknown };
+        if (a.pub && a.username) map.set(String(a.pub), a);
+      }
+    } catch { /* index may not exist on old databases - caller falls back to loadAccounts */ }
+    return map;
+  }
+
+  /**
+   * A5: Return only blocks written to IDB after `sinceVersion` (exclusive).
+   * Uses the byBlockVersion index - O(new blocks) instead of O(all blocks).
+   */
+  async loadBlocksSince(sinceVersion: number): Promise<AccountBlock[]> {
+    try {
+      const all = await (this.db as IDBPDatabase<any>).getAllFromIndex( // eslint-disable-line @typescript-eslint/no-explicit-any
+        'blocks', 'byBlockVersion', IDBKeyRange.lowerBound(sinceVersion, true),
+      );
+      return (all as AccountBlock[]);
+    } catch { return []; }
   }
 
   async loadAccountChains(): Promise<Map<string, AccountBlock[]>> {
@@ -794,9 +1135,17 @@ export class Libp2pNetwork extends EventEmitter {
 
   async loadAccountChain(accountPub: string): Promise<AccountBlock[]> {
     try {
-      const all = await this.db.getAll('blocks');
-      return (all as AccountBlock[]).filter(b => b.accountPub === accountPub).sort((a, b) => a.index - b.index);
-    } catch { return []; }
+      // P9: use byAccount index for O(account-chain-length) instead of O(total-blocks) full scan
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const all = await (this.db as IDBPDatabase<any>).getAllFromIndex('blocks', 'byAccount', accountPub);
+      return (all as AccountBlock[]).sort((a, b) => a.index - b.index);
+    } catch {
+      // Fall back to full scan for databases that haven't completed the v4 upgrade yet
+      try {
+        const all = await this.db.getAll('blocks');
+        return (all as AccountBlock[]).filter(b => b.accountPub === accountPub).sort((a, b) => a.index - b.index);
+      } catch { return []; }
+    }
   }
 
   async loadContracts(): Promise<Map<string, Record<string, unknown>>> {
@@ -809,6 +1158,20 @@ export class Libp2pNetwork extends EventEmitter {
       }
     } catch { /* empty */ }
     return map;
+  }
+
+  // ── P5: trackedCids persistence ───────────────────────────────────────────
+
+  async saveTrackedCid(record: TrackedCidRecord): Promise<void> {
+    try { await this.db.put('trackedCids', record); } catch { /* ignore */ }
+  }
+
+  async loadTrackedCids(): Promise<TrackedCidRecord[]> {
+    try { return await this.db.getAll('trackedCids'); } catch { return []; }
+  }
+
+  async deleteTrackedCid(cid: string): Promise<void> {
+    try { await this.db.delete('trackedCids', cid); } catch { /* ignore */ }
   }
 
   // ── Reset ─────────────────────────────────────────────────────────────────
@@ -850,6 +1213,22 @@ export class Libp2pNetwork extends EventEmitter {
   }
 
   // ── Internal helpers ──────────────────────────────────────────────────────
+
+  /** H4: consume one token from the peer's bucket; returns false if bucket is empty (rate-limited). */
+  private consumePeerToken(peerId: string): boolean {
+    const now = Date.now();
+    let bucket = this.peerBuckets.get(peerId);
+    if (!bucket) {
+      bucket = { tokens: Libp2pNetwork.BUCKET_CAPACITY, lastRefill: now };
+      this.peerBuckets.set(peerId, bucket);
+    }
+    const elapsed = (now - bucket.lastRefill) / 1000;
+    bucket.tokens = Math.min(Libp2pNetwork.BUCKET_CAPACITY, bucket.tokens + elapsed * Libp2pNetwork.BUCKET_REFILL_PER_SEC);
+    bucket.lastRefill = now;
+    if (bucket.tokens < 1) return false;
+    bucket.tokens--;
+    return true;
+  }
 
   private publish(topic: string, obj: unknown): void {
     if (!this.running) return;
@@ -946,6 +1325,15 @@ export class Libp2pNetwork extends EventEmitter {
 
   watchDeleteRequests(callback: (request: Record<string, unknown>) => void): void {
     this.on('storage:delete-request', callback as (data: unknown) => void);
+  }
+
+  publishReplaceRequest(request: Record<string, unknown>): void {
+    if (!this.running) return;
+    this.publish(topicStorageReplaceRequests(this.network), request);
+  }
+
+  watchReplaceRequests(callback: (request: Record<string, unknown>) => void): void {
+    this.on('storage:replace-request', callback as (data: unknown) => void);
   }
 
   getStats(): NetworkStats {

@@ -99,6 +99,12 @@ GossipSub.prototype.onIncomingStream = function(streamOrObj, connection) {
 
 const PORT = parseInt(process.env.PORT || '9090', 10);
 const PEER_ID_FILE = process.env.PEER_ID_FILE || '.relay-peer-id.json';
+// Comma-separated list of peer relay multiaddrs (must include /p2p/<peerId> suffix).
+// Example: PEER_RELAYS=/dns4/relay2.example.com/tcp/9090/ws/p2p/<peerId2>
+const PEER_RELAYS = (process.env.PEER_RELAYS || '').split(',').filter(Boolean);
+
+// Must match PROTOCOL_VERSION in src/network/libp2p-network.ts
+const PROTOCOL_VERSION = 'v1';
 
 // ── Persistent peer ID ────────────────────────────────────────────────────────
 
@@ -145,10 +151,10 @@ async function main() {
         reservations: {
           maxReservations: 1024,
           reservationTtl: 2 * 60 * 60 * 1000, // 2h
-          // Default data limit is 128 KB per circuit — raise it so large content
+          // Default data limit is 128 KB per circuit - raise it so large content
           // transfers (signaling, libp2p protocol messages) can complete freely.
           defaultDataLimit: BigInt(1 << 30), // 1 GB per circuit
-          // Default duration limit is 2 minutes — raise it for long-running sessions.
+          // Default duration limit is 2 minutes - raise it for long-running sessions.
           // Set to 1 hour so smoke WebRTC sessions don't get cut off mid-transfer.
           defaultDurationLimit: 60 * 60 * 1000, // 1 hour in ms
         },
@@ -162,6 +168,34 @@ async function main() {
   });
 
   await node.start();
+
+  // ── Relay-to-relay mesh ───────────────────────────────────────────────────
+  // Dial each peer relay from PEER_RELAYS so their GossipSub meshes merge.
+  // Without this, browsers on relay-A and browsers on relay-B are in separate
+  // GossipSub islands and cannot see each other's messages.
+  if (PEER_RELAYS.length > 0) {
+    const { multiaddr } = await import('@multiformats/multiaddr');
+
+    async function dialPeerRelays() {
+      const connected = new Set(node.getConnections().map(c => c.remotePeer.toString()));
+      for (const addr of PEER_RELAYS) {
+        // Extract peer ID from the /p2p/<id> suffix to check active connections
+        const peerIdMatch = addr.match(/\/p2p\/([^/]+)$/);
+        const peerId = peerIdMatch?.[1];
+        if (peerId && connected.has(peerId)) continue;
+        try {
+          await node.dial(multiaddr(addr));
+          console.log(`[Relay] Connected to peer relay: ${addr}`);
+        } catch (e) {
+          console.warn(`[Relay] Could not reach peer relay ${addr}: ${e.message}`);
+        }
+      }
+    }
+
+    await dialPeerRelays();
+    // Reconnect loop: re-dial dropped peer relays every 60s
+    setInterval(dialPeerRelays, 60_000);
+  }
 
   // ── GossipSub routing ─────────────────────────────────────────────────────
   // The relay participates in GossipSub so it can route messages between
@@ -177,16 +211,20 @@ async function main() {
   // treats every stream as a duplex and gossipsub outbound streams form correctly.
 
   for (const network of ['testnet', 'mainnet']) {
-    for (let i = 0; i < NUM_SYNAPSES; i++) pubsub.subscribe(`neuronchain/${network}/blocks/${i}`);
-    pubsub.subscribe(`neuronchain/${network}/votes`);
-    pubsub.subscribe(`neuronchain/${network}/accounts`);
-    pubsub.subscribe(`neuronchain/${network}/generation`);
-    pubsub.subscribe(`neuronchain/${network}/storage/pin-requests`);
-    pubsub.subscribe(`neuronchain/${network}/storage/receipts`);
-    pubsub.subscribe(`neuronchain/${network}/lockouts`);
-    pubsub.subscribe(`neuronchain/${network}/keyblobs`);
-    pubsub.subscribe(`neuronchain/${network}/blob-requests`);
-    pubsub.subscribe(`neuronchain/${network}/peer-addrs`);
+    const pfx = `neuronchain/${PROTOCOL_VERSION}/${network}`;
+    for (let i = 0; i < NUM_SYNAPSES; i++) pubsub.subscribe(`${pfx}/blocks/${i}`);
+    pubsub.subscribe(`${pfx}/votes`);
+    pubsub.subscribe(`${pfx}/accounts`);
+    pubsub.subscribe(`${pfx}/generation`);
+    pubsub.subscribe(`${pfx}/storage/cache-requests`);
+    pubsub.subscribe(`${pfx}/storage/receipts`);
+    pubsub.subscribe(`${pfx}/storage/delete-requests`);
+    pubsub.subscribe(`${pfx}/lockouts`);
+    pubsub.subscribe(`${pfx}/keyblobs`);
+    pubsub.subscribe(`${pfx}/blob-requests`);
+    pubsub.subscribe(`${pfx}/peer-addrs`);
+    pubsub.subscribe(`${pfx}/relays`);
+    pubsub.subscribe(`${pfx}/snapshots`);
   }
 
   // ── Peer-addr cache and replay ────────────────────────────────────────────
@@ -249,15 +287,15 @@ async function main() {
   });
 
   // Dynamically mirror any neuronchain topic a browser peer subscribes to
-  // (covers dynamic inbox topics like neuronchain/{network}/inbox/{pubShort}).
+  // (covers dynamic inbox topics like neuronchain/v1/{network}/inbox/{pubShort}).
   // Also replays cached peer-addrs when a new peer subscribes to a peer-addrs topic.
   pubsub.addEventListener('subscription-change', (evt) => {
     for (const { topic, subscribe } of evt.detail.subscriptions) {
-      if (subscribe && topic.startsWith('neuronchain/')) {
+      if (subscribe && topic.startsWith(`neuronchain/${PROTOCOL_VERSION}/`)) {
         try { pubsub.subscribe(topic); } catch { /* already subscribed */ }
       }
       if (subscribe && topic.endsWith('/peer-addrs')) {
-        // New subscriber — replay cached peer-addrs (for currently-connected peers only)
+        // New subscriber - replay cached peer-addrs (for currently-connected peers only)
         // after a delay so the GossipSub stream and mesh have time to fully form.
         setTimeout(() => {
           const connected = connectedPeerIds();
@@ -357,22 +395,6 @@ async function main() {
 
   process.on('SIGINT',  shutdown);
   process.on('SIGTERM', shutdown);
-
-  // Stats logging every 10s
-  // setInterval(() => {
-  //   const peers = node.getPeers().length;
-  //   const conns = node.getConnections().length;
-  //   const pubsubPeers = pubsub.getPeers().length;
-  //   const subscribers = pubsub.getSubscribers('neuronchain/testnet/accounts');
-  //   console.log(`[Relay] libp2p peers=${peers} conns=${conns} | gossipsub peers=${pubsubPeers} subscribers(accounts)=${subscribers.length}`);
-  //   if (peers > 0) {
-  //     const p = pubsub.peers ? [...pubsub.peers.keys()].map(id => id.slice(0,16)) : [];
-  //     const out = pubsub.streamsOutbound ? [...pubsub.streamsOutbound.keys()].map(id => id.slice(0,16)) : [];
-  //     const inp = pubsub.streamsInbound ? [...pubsub.streamsInbound.keys()].map(id => id.slice(0,16)) : [];
-  //     console.log(`[Relay] gossip peers=${JSON.stringify(p)} outbound=${JSON.stringify(out)} inbound=${JSON.stringify(inp)}`);
-  //     console.log(`[Relay] topics subscribed by peers:`, JSON.stringify([...( pubsub.topics?.entries?.() ?? [])]));
-  //   }
-  // }, 10_000);
 }
 
 main().catch(err => {

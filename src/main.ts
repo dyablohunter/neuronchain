@@ -4,13 +4,13 @@ import { NetworkType } from './core/dag-ledger';
 import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
 import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, deriveFaceKey, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
-import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash } from './core/face-store';
+import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
+import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import {
-  derivePinKey, encryptWithPinKey, decryptWithPinKey,
+  derivePinRawBits, encryptWithPinKey, decryptWithPinKey,
   checkPinLockout, recordPinFailure, recordPinSuccess,
-  getBackoffMs, generatePinSalt, LockoutNotice,
+  getBackoffMs, generatePinSalt, LockoutNotice, lockoutPayload,
 } from './core/pin-crypto';
 
 // ──── Single-tab lock ────
@@ -37,9 +37,10 @@ let pendingGenerationReset = false;
 const WALLET_KEY = 'neuronchain_wallet';
 
 // ──── PIN Session Cache ────
-// Holds the derived CryptoKey per account for 5 minutes to avoid re-prompting on quick sequences.
+// Holds the derived CryptoKey and raw PBKDF2 bits per account for 5 minutes.
+// rawBits are needed for combined-key face+PIN operations (face update, PIN change).
 const PIN_CACHE_TTL_MS = 5 * 60 * 1000;
-const pinSessionCache = new Map<string, { key: CryptoKey; expiry: number }>();
+const pinSessionCache = new Map<string, { key: CryptoKey; rawBits?: Uint8Array; expiry: number }>();
 
 function getCachedPinKey(accountPub: string): CryptoKey | null {
   const entry = pinSessionCache.get(accountPub);
@@ -47,8 +48,14 @@ function getCachedPinKey(accountPub: string): CryptoKey | null {
   return entry.key;
 }
 
-function cachePinKey(accountPub: string, key: CryptoKey): void {
-  pinSessionCache.set(accountPub, { key, expiry: Date.now() + PIN_CACHE_TTL_MS });
+function getCachedPinRawBits(accountPub: string): Uint8Array | null {
+  const entry = pinSessionCache.get(accountPub);
+  if (!entry || entry.expiry < Date.now()) { pinSessionCache.delete(accountPub); return null; }
+  return entry.rawBits ?? null;
+}
+
+function cachePinKey(accountPub: string, key: CryptoKey, rawBits?: Uint8Array): void {
+  pinSessionCache.set(accountPub, { key, rawBits, expiry: Date.now() + PIN_CACHE_TTL_MS });
 }
 
 function clearPinCache(accountPub?: string): void {
@@ -258,10 +265,10 @@ async function requirePin(account: AccountWithKeys): Promise<boolean> {
     }
   }
 
-  // No PIN configured on this account — allow without PIN
+  // No PIN configured on this account - allow without PIN
   if (!pinSalt || !pinVerifier) return true;
 
-  // Check session cache — PIN already verified recently
+  // Check session cache - PIN already verified recently
   if (getCachedPinKey(pub)) return true;
 
   // Check lockout
@@ -271,7 +278,7 @@ async function requirePin(account: AccountWithKeys): Promise<boolean> {
     const mins = Math.floor(remaining / 60);
     const secs = remaining % 60;
     const msg = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-    toast(`PIN locked — try again in ${msg}`, 'error');
+    toast(`PIN locked - try again in ${msg}`, 'error');
     return false;
   }
 
@@ -279,13 +286,15 @@ async function requirePin(account: AccountWithKeys): Promise<boolean> {
   const storedVerifier = pinVerifier;
 
   const pin = await promptPin('Enter your PIN', '', async (enteredPin) => {
-    const pinKey = await derivePinKey(enteredPin, saltBytes);
+    // derivePinRawBits + importKey = one PBKDF2 call; produces identical key to derivePinKey
+    const rawBits = await derivePinRawBits(enteredPin, saltBytes);
+    const pinKey = await crypto.subtle.importKey('raw', rawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 
-    // Verify against stored verifier (fast — no full blob decryption needed)
+    // Verify against stored verifier (fast - no full blob decryption needed)
     const result = await decryptWithPinKey(storedVerifier, pinKey);
     if (result === 'PINOK') {
       await recordPinSuccess(pub);
-      cachePinKey(pub, pinKey);
+      cachePinKey(pub, pinKey, rawBits);
       return 'ok';
     }
 
@@ -301,6 +310,8 @@ async function requirePin(account: AccountWithKeys): Promise<boolean> {
         lockedUntil: state.lockedUntil,
         timestamp: Date.now(),
       };
+      const keys = node.localKeys.get(pub);
+      if (keys) notice.signature = await signData(lockoutPayload(notice), keys);
       node.net.publishLockout(notice);
     }
 
@@ -308,11 +319,11 @@ async function requirePin(account: AccountWithKeys): Promise<boolean> {
       const remaining = Math.ceil((state.lockedUntil - Date.now()) / 1000);
       const mins = Math.floor(remaining / 60);
       const secs = remaining % 60;
-      toast(`Wrong PIN — locked for ${mins > 0 ? `${mins}m ${secs}s` : `${secs}s`}`, 'error');
+      toast(`Wrong PIN - locked for ${mins > 0 ? `${mins}m ${secs}s` : `${secs}s`}`, 'error');
       return 'cancel';
     }
 
-    return `Wrong PIN (attempt ${state.failedAttempts}) — try again`;
+    return `Wrong PIN (attempt ${state.failedAttempts}) - try again`;
   });
 
   return pin !== null;
@@ -326,7 +337,7 @@ async function promptSetPin(): Promise<string | null> {
     const pin2 = await promptPin('Confirm your PIN', 'Enter the same PIN again to confirm');
     if (pin2 === null) return null;
     if (pin1 === pin2) return pin1;
-    toast('PINs do not match — try again', 'error');
+    toast('PINs do not match - try again', 'error');
   }
 }
 
@@ -404,7 +415,7 @@ async function decodeBackupKey(code: string): Promise<Pick<KeyPair, 'pub' | 'pri
     // Re-derive canonical public keys via Web Crypto (ensures pub matches on-chain format)
     const sigKey  = await crypto.subtle.importKey('jwk', privJwk,  { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
     const encKey  = await crypto.subtle.importKey('jwk', eprivJwk, { name: 'ECDH',  namedCurve: 'P-256' }, true, ['deriveKey']);
-    // exportKey for private key returns JWK with x,y,d — strip d to get public JWK
+    // exportKey for private key returns JWK with x,y,d - strip d to get public JWK
     const sigJwk  = await crypto.subtle.exportKey('jwk', sigKey)  as Record<string, unknown>;
     const encJwk  = await crypto.subtle.exportKey('jwk', encKey)  as Record<string, unknown>;
     const toPub   = (jwk: Record<string, unknown>, ops: string[]) => { const { d: _, ...pub } = jwk; return btoa(JSON.stringify({ ...pub, key_ops: ops })); };
@@ -533,6 +544,13 @@ document.addEventListener('DOMContentLoaded', () => {
       setTimeout(() => { copyBtn.innerHTML = orig; }, 1200);
     } catch { /* clipboard denied */ }
   });
+
+  // P6: start loading face models as soon as the user begins typing a username,
+  // so models are ready by the time they click Create Account.
+  const newUsernameInput = document.getElementById('newUsername');
+  if (newUsernameInput) {
+    newUsernameInput.addEventListener('input', () => { loadModels().catch(() => {}); }, { once: true });
+  }
 });
 
 function resolveNamePlain(pub: string): string {
@@ -838,8 +856,15 @@ function refreshTab() {
 
 function refreshChain() {
   const s = node.ledger.getStats();
+  const ns = node.getStats();
+  const chainBytes = node.ledger.estimateBlockchainSizeBytes();
+  const chainSize = chainBytes >= 1_073_741_824
+    ? `${(chainBytes / 1_073_741_824).toFixed(2)} GB`
+    : `${(chainBytes / 1_048_576).toFixed(2)} MB`;
   $('#chainStats').innerHTML = `
     <div class="stat-item"><div class="stat-label">Network</div><div class="stat-value">${s.network}</div></div>
+    <div class="stat-item"><div class="stat-label">Peers</div><div class="stat-value">${ns.peerCount}</div></div>
+    <div class="stat-item"><div class="stat-label">Chain Size</div><div class="stat-value">${chainSize}</div></div>
     <div class="stat-item"><div class="stat-label">Accounts</div><div class="stat-value">${s.totalAccounts}</div></div>
     <div class="stat-item"><div class="stat-label">Total Blocks</div><div class="stat-value">${s.totalBlocks}</div></div>
     <div class="stat-item"><div class="stat-label">Confirmed</div><div class="stat-value">${s.confirmedBlocks}</div></div>
@@ -878,11 +903,61 @@ function refreshNode() {
   $('#nodeStats').innerHTML = `
     <div class="stat-item"><div class="stat-label">Status</div><div class="stat-value small" style="color:${s.status === 'stopped' ? 'var(--danger)' : s.status === 'validating' ? 'var(--success)' : 'var(--accent)'}">${s.status.toUpperCase()}</div></div>
     <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${uptime}</div></div>
-    <div class="stat-item"><div class="stat-label">Peers</div><div class="stat-value">${s.peerCount}</div></div>
     <div class="stat-item"><div class="stat-label">Synapses</div><div class="stat-value">${s.synapses}</div></div>
     <div class="stat-item"><div class="stat-label">Peer ID</div><div class="stat-value small">${trunc(s.peerId, 16)}</div></div>
     <div class="stat-item"><div class="stat-label">Network</div><div class="stat-value small">${s.network}</div></div>
   `;
+  refreshRelays();
+}
+
+function refreshRelays() {
+  const relays = node.getKnownRelays();
+  const connected = new Set(
+    (node.net.libp2p?.getConnections?.() ?? []).map((c: { remotePeer: { toString(): string } }) => c.remotePeer.toString())
+  );
+  const sel = document.getElementById('relayAccountSelect') as HTMLSelectElement | null;
+  if (sel) {
+    const prev = sel.value;
+    sel.innerHTML = localAccounts.length === 0
+      ? '<option value="">No accounts</option>'
+      : localAccounts.map(a => `<option value="${escHtml(a.pub)}">${escHtml(a.username)}</option>`).join('');
+    if (prev) sel.value = prev;
+  }
+  const list = document.getElementById('knownRelaysList');
+  if (!list) return;
+  if (relays.length === 0) {
+    list.innerHTML = '<p style="font-size:12px;color:var(--text-dim);margin:0;">No community relays known yet.</p>';
+    return;
+  }
+  list.innerHTML = `<table style="width:100%;font-size:12px;border-collapse:collapse;">
+    <thead><tr style="color:var(--text-dim);text-align:left;">
+      <th style="padding:4px 8px;">Status</th>
+      <th style="padding:4px 8px;">Address</th>
+      <th style="padding:4px 8px;">Last seen</th>
+      <th style="padding:4px 8px;">Failures</th>
+      <th style="padding:4px 8px;"></th>
+    </tr></thead>
+    <tbody>${relays.map(r => {
+      const live = connected.has(r.peerId);
+      const ago = Math.floor((Date.now() - r.lastSeen) / 1000);
+      const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.floor(ago / 60)}m ago` : `${Math.floor(ago / 3600)}h ago`;
+      return `<tr>
+        <td style="padding:4px 8px;"><span style="color:${live ? 'var(--success)' : 'var(--danger)'}">&#9679;</span> ${live ? 'Live' : 'Offline'}</td>
+        <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim);" title="${escHtml(r.addr)}">${escHtml(trunc(r.addr, 40))}</td>
+        <td style="padding:4px 8px;">${agoStr}</td>
+        <td style="padding:4px 8px;">${r.failCount}</td>
+        <td style="padding:4px 8px;"><button class="btn btn-outline" style="padding:2px 8px;font-size:11px;" data-remove-relay="${escHtml(r.addr)}">Remove</button></td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+  list.querySelectorAll('[data-remove-relay]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const addr = btn.getAttribute('data-remove-relay')!;
+      await node.net.markRelayFailed(addr);
+      await node.net.markRelayFailed(addr);
+      await node.net.markRelayFailed(addr);
+      refreshRelays();
+    });
+  });
 }
 
 function refreshAccount() {
@@ -1298,6 +1373,36 @@ $('#btnStopNode').addEventListener('click', async () => {
   refreshNode();
 });
 
+$('#btnAnnounceRelay').addEventListener('click', async () => {
+  const btn = $('#btnAnnounceRelay') as HTMLButtonElement;
+  const addrInput = $('#relayAddrInput') as HTMLInputElement;
+  const sel = $('#relayAccountSelect') as HTMLSelectElement;
+  const addr = addrInput.value.trim();
+  const pub = sel.value;
+  if (!addr) { toast('Enter a relay multiaddr', 'error'); return; }
+  if (!addr.includes('/p2p/')) { toast('Address must include /p2p/<peerId> suffix', 'error'); return; }
+  if (!pub) { toast('Select an account to sign with', 'error'); return; }
+  const acc = localAccounts.find(a => a.pub === pub);
+  if (!acc) { toast('Account not found', 'error'); return; }
+  if (node.getStats().status === 'stopped') { toast('Start the node first', 'error'); return; }
+  const origText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner"></span>';
+  btn.setAttribute('disabled', '');
+  try {
+    await node.announceRelay(addr, acc.keys);
+    addrInput.value = '';
+    toast('Relay announced to the network', 'success');
+    refreshRelays();
+  } catch (e: unknown) {
+    toast((e as Error).message || 'Failed to announce relay', 'error');
+  } finally {
+    btn.innerHTML = origText;
+    btn.removeAttribute('disabled');
+  }
+});
+
+node.net.on('relays:updated', () => { if (document.getElementById('tab-node')?.classList.contains('active')) refreshRelays(); });
+
 
 // ══════════════════════════════════════════════════════════
 // ──── Account Creation (FaceID mandatory) ────
@@ -1363,13 +1468,13 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // Generate ECDSA + PQ key pair
     const keys = await generateAccountKeys();
 
-    // Double-encrypt keys with face key (inner) + PIN key (outer)
     const keyBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, faceMap.hash, pin);
 
     // Encrypt face descriptor with PIN key for local privacy
     const pinSalt = keyBlob.pinSalt!;
     const saltBytes = Uint8Array.from(atob(pinSalt), c => c.charCodeAt(0));
-    const pinKey = await derivePinKey(pin, saltBytes);
+    const pinRawBits = await derivePinRawBits(pin, saltBytes);
+    const pinKey = await crypto.subtle.importKey('raw', pinRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
     const encryptedFaceDescriptor = await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey);
 
     // Register account
@@ -1400,8 +1505,8 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     });
     await node.net.saveKeyBlob(keys.pub, keyBlob as unknown as Record<string, unknown>);
 
-    // Cache PIN for this session
-    cachePinKey(keys.pub, pinKey);
+    // Cache PIN for this session (rawBits needed for combined-key face update later)
+    cachePinKey(keys.pub, pinKey, pinRawBits);
 
     // Store locally
     const fullAcc: AccountWithKeys = { ...account, keys, balance: 1000000 };
@@ -1416,12 +1521,12 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Public Key</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(keys.pub)}" onclick="this.select()"/></div>
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Face Map Hash</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(faceMap.hash)}" onclick="this.select()"/></div>
       <div class="secret-box" style="margin-top:12px;">
-        <div class="warn-text">&#9888; BACKUP KEY — save this secret key as a secondary recovery method.</div>
+        <div class="warn-text">&#9888; BACKUP KEY - save this secret key as a secondary recovery method.</div>
         <input readonly class="form-input secret-value" style="font-size:12px;font-family:monospace;user-select:all;letter-spacing:1px;" value="${escHtml(backupCode)}" onclick="this.select()"/>
         <p style="color:var(--text-muted);font-size:11px;margin-top:6px;">Contains your two private keys encoded as Base58. Import via "Recover with Key Pair" on any device.</p>
       </div>
       <p style="font-size:12px;margin-top:10px;line-height:1.7;">Primary recovery: <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(99,102,241,0.15);color:var(--primary-hover);border:1px solid rgba(99,102,241,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F4F7; Face</span> + <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(34,211,238,0.12);color:var(--accent);border:1px solid rgba(34,211,238,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F511; PIN</span> on any device.</p>
-      <p style="font-size:12px;margin-top:4px;line-height:1.7;">Backup: <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.12);color:var(--success);border:1px solid rgba(16,185,129,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F4CB; Secret Key</span> — paste in the recovery field.</p>
+      <p style="font-size:12px;margin-top:4px;line-height:1.7;">Backup: <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.12);color:var(--success);border:1px solid rgba(16,185,129,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F4CB; Secret Key</span> - paste in the recovery field.</p>
     </div>`;
 
     toast(`${username} created - ${formatUNIT(VERIFICATION_MINT_AMOUNT)} UNIT`, 'success');
@@ -1505,7 +1610,7 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     if (onChainAccount && onChainAccount.linkedAnchor && blob.linkedAnchor) {
       const hashValid = await verifyKeyBlobHash(blob, String(onChainAccount.linkedAnchor));
       if (!hashValid) {
-        toast('Key blob integrity check failed — blob may be tampered', 'error');
+        toast('Key blob integrity check failed - blob may be tampered', 'error');
         hideCameraModal();
         statusEl.innerHTML = '<span style="color:var(--danger)">Key blob integrity check failed. The relay may have served a tampered blob.</span>';
         finishRecovery(); $('#btnRecoverFace').removeAttribute('disabled');
@@ -1513,9 +1618,9 @@ $('#btnRecoverFace').addEventListener('click', async () => {
       }
     }
 
-    // If PIN-protected, ask for PIN before camera (needed for outer decryption)
+    // If PIN-protected, ask for PIN before camera (needed for decryption)
     let pin: string | undefined;
-    if (blob.pinVersion === 1) {
+    if (blob.pinVersion && blob.pinVersion >= 1) {
       hideCameraModal();
       const enteredPin = await promptPin('Enter your account PIN', 'Required to recover your keys');
       if (!enteredPin) {
@@ -1545,14 +1650,17 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     const recoveryResult = await recoverKeysWithFace(blob, faceMap.canonical, pin);
 
     if (!recoveryResult) {
-      const msg = blob.pinVersion === 1
+      const msg = (blob.pinVersion && blob.pinVersion >= 1)
         ? 'Face or PIN did not match. Decryption failed.'
         : 'Face did not match. Decryption failed. Try again with better lighting.';
-      if (blob.pinVersion === 1 && pin) {
+      if (blob.pinVersion && blob.pinVersion >= 1 && pin) {
         const state = await recordPinFailure(blob.pub);
         const backoffMs = getBackoffMs(state.failedAttempts);
         if (backoffMs > 0 && node.net.running) {
-          node.net.publishLockout({ accountPub: blob.pub, failedAttempts: state.failedAttempts, lockedUntil: state.lockedUntil, timestamp: Date.now() });
+          const notice: LockoutNotice = { accountPub: blob.pub, failedAttempts: state.failedAttempts, lockedUntil: state.lockedUntil, timestamp: Date.now() };
+          const keys = node.localKeys.get(blob.pub);
+          if (keys) notice.signature = await signData(lockoutPayload(notice), keys);
+          node.net.publishLockout(notice);
         }
         // Update attempt state in blob and re-save
         if (recoveryResult === null) { /* face key unknown, skip blob update */ }
@@ -1570,11 +1678,12 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     const updatedBlob = await updateAttemptStateInBlob(blob, faceKey, { failedAttempts: 0, lockedUntil: 0 });
     await node.net.saveKeyBlob(keys.pub, updatedBlob as unknown as Record<string, unknown>);
 
-    // Cache PIN key for this session
+    // Cache PIN key + raw bits for this session (raw bits needed for combined-key face update)
     if (pin && blob.pinSalt) {
       const saltBytes = Uint8Array.from(atob(blob.pinSalt), c => c.charCodeAt(0));
-      const pinKey = await derivePinKey(pin, saltBytes);
-      cachePinKey(keys.pub, pinKey);
+      const pinRawBits = await derivePinRawBits(pin, saltBytes);
+      const pinKey = await crypto.subtle.importKey('raw', pinRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      cachePinKey(keys.pub, pinKey, pinRawBits);
     }
 
     // Recovery successful!
@@ -1595,6 +1704,27 @@ $('#btnRecoverFace').addEventListener('click', async () => {
     toast(`Recovered: ${username}`, 'success');
     addLog(`Account recovered via face + PIN: ${username}`, 'success');
     refreshAccount(); refreshTransfer(); refreshContracts();
+
+    // P6: prompt legacy face-only accounts to upgrade to PIN protection
+    if (!blob.pinVersion || blob.pinVersion < 1) {
+      const upgrade = confirm('This account uses legacy face-only security.\n\nAdd a PIN for stronger protection? (Recommended)');
+      if (upgrade) {
+        const newPin = await promptSetPin();
+        if (newPin) {
+          try {
+            const newBlob = await createEncryptedKeyBlob(keys, username, faceMap.canonical, blob.faceMapHash, newPin);
+            await node.net.saveKeyBlob(keys.pub, newBlob as unknown as Record<string, unknown>);
+            const saltBytes = Uint8Array.from(atob(newBlob.pinSalt!), c => c.charCodeAt(0));
+            const newRawBits = await derivePinRawBits(newPin, saltBytes);
+            const newPinKey = await crypto.subtle.importKey('raw', newRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+            cachePinKey(keys.pub, newPinKey, newRawBits);
+            toast('PIN added - account upgraded to face + PIN security', 'success');
+          } catch {
+            toast('PIN setup failed - account still accessible via face', 'error');
+          }
+        }
+      }
+    }
   } catch (err) {
     toast(`Recovery error: ${err}`, 'error');
     hideCameraModal();
@@ -1631,7 +1761,7 @@ $('#btnRecoverKeys').addEventListener('click', async () => {
     const existing = node.ledger.getAccountByUsername(username);
     if (existing && existing.pub !== keys.pub) { toast('Key does not match this username', 'error'); return; }
 
-    // Fetch the key blob to reliably get pinSalt/pinVerifier — don't rely on sync timing
+    // Fetch the key blob to reliably get pinSalt/pinVerifier - don't rely on sync timing
     const blobData = await node.net.findKeyBlobByUsername(username);
     const blobPinSalt = blobData?.pinSalt ? String(blobData.pinSalt) : (existing as Account & { pinSalt?: string } | undefined)?.pinSalt;
     const blobPinVerifier = blobData?.pinVerifier ? String(blobData.pinVerifier) : (existing as Account & { pinVerifier?: string } | undefined)?.pinVerifier;
@@ -1689,28 +1819,51 @@ $('#btnUpdatePin').addEventListener('click', async () => {
       pinVerifier: blobRaw.pinVerifier ? String(blobRaw.pinVerifier) : undefined,
       encryptedCanonical: blobRaw.encryptedCanonical ? String(blobRaw.encryptedCanonical) : undefined,
     };
-    if (blob.pinVersion !== 1) { toast('Legacy account — no PIN to update', 'error'); statusEl.innerHTML = ''; return; }
+    if (!blob.pinVersion || blob.pinVersion < 1) { toast('Legacy account - no PIN to update', 'error'); statusEl.innerHTML = ''; return; }
 
-    // Derive new PIN key
+    // Derive new PIN key (rawBits used for combined key on v2 blobs)
     const newSaltBytes = generatePinSalt();
     const newPinSalt = btoa(String.fromCharCode(...newSaltBytes));
-    const newPinKey = await derivePinKey(newPin, newSaltBytes);
+    const newPinRawBits = await derivePinRawBits(newPin, newSaltBytes);
+    const newPinKey = await crypto.subtle.importKey('raw', newPinRawBits as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 
-    // Re-encrypt: we need the face-encrypted inner layer. Get it via the cached key.
     const oldPinKey = getCachedPinKey(pub);
-    if (!oldPinKey) { toast('Session expired — please retry', 'error'); statusEl.innerHTML = ''; return; }
+    if (!oldPinKey) { toast('Session expired - please retry', 'error'); statusEl.innerHTML = ''; return; }
 
-    const innerCiphertext = await decryptWithPinKey(blob.encryptedKeys, oldPinKey);
-    if (!innerCiphertext) {
-      // The stored blob was not updated when the PIN was last changed (older app version).
-      // Re-enrolling the face will repair the blob and unblock PIN changes.
-      toast('Security data is out of sync — please use Update Face first to repair it, then change your PIN', 'error');
-      statusEl.innerHTML = '<span style="color:var(--danger)">Security data out of sync. Go to <strong>Update Face</strong> to repair, then retry PIN change.</span>';
-      return;
+    let newEncryptedKeys: string;
+    let newPinVersion: number;
+
+    if (blob.pinVersion === 2) {
+      // Combined-key blob: recover face bytes from stored canonical, form new combined key
+      if (!blob.encryptedCanonical) {
+        toast('Security data missing - use Update Face first to repair it, then change your PIN', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">Security data missing. Go to <strong>Update Face</strong> to repair, then retry PIN change.</span>';
+        return;
+      }
+      const canonicalJson = await decryptWithPinKey(blob.encryptedCanonical, oldPinKey);
+      if (!canonicalJson) {
+        toast('Security data is out of sync - please use Update Face first to repair it, then change your PIN', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">Security data out of sync. Go to <strong>Update Face</strong> to repair, then retry PIN change.</span>';
+        return;
+      }
+      const storedQuantized = quantizeDescriptor(JSON.parse(canonicalJson) as number[]);
+      const faceBytes = await deriveFaceRawBits(storedQuantized, pub);
+      const newSharedKey = await deriveCombinedKey(faceBytes, newPinRawBits);
+      // Re-encrypt directly from in-memory keys - identity already proved by requirePin
+      newEncryptedKeys = await encryptWithPinKey(JSON.stringify(acc.keys), newSharedKey);
+      newPinVersion = 2;
+    } else {
+      // v1 two-layer blob: strip PIN outer layer and re-wrap with new PIN key
+      const innerCiphertext = await decryptWithPinKey(blob.encryptedKeys, oldPinKey);
+      if (!innerCiphertext) {
+        toast('Security data is out of sync - please use Update Face first to repair it, then change your PIN', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">Security data out of sync. Go to <strong>Update Face</strong> to repair, then retry PIN change.</span>';
+        return;
+      }
+      newEncryptedKeys = await encryptWithPinKey(innerCiphertext, newPinKey);
+      newPinVersion = 1;
     }
 
-    // Re-wrap inner with new PIN key
-    const newEncryptedKeys = await encryptWithPinKey(innerCiphertext, newPinKey);
     const newPinVerifier = await encryptWithPinKey('PINOK', newPinKey);
 
     // Re-encrypt face descriptor with new PIN key if present
@@ -1720,9 +1873,7 @@ $('#btnUpdatePin').addEventListener('click', async () => {
       if (oldDesc) newEncryptedFaceDescriptor = await encryptWithPinKey(oldDesc, newPinKey);
     }
 
-    // Re-encrypt encryptedCanonical (canonical face descriptor used for face re-enrollment)
-    // with new PIN key. Without this, face re-enrollment and account recovery will fail
-    // after a PIN change because they try to decrypt it with the new key.
+    // Re-encrypt encryptedCanonical with new PIN key
     let newEncryptedCanonical: string | undefined;
     if (blob.encryptedCanonical) {
       const oldCanonical = await decryptWithPinKey(blob.encryptedCanonical, oldPinKey);
@@ -1742,13 +1893,13 @@ $('#btnUpdatePin').addEventListener('click', async () => {
     const sub = await node.submitBlock(updateResult.block!);
     if (!sub.success) { toast(`Update block failed: ${sub.error}`, 'error'); statusEl.innerHTML = ''; return; }
 
-    // Publish the full updated blob to the P2P network so face re-enrollment and
-    // recovery work correctly with the new PIN key on all nodes.
+    // Publish the full updated blob to the P2P network
     const updatedBlob: EncryptedKeyBlob = {
       ...blob,
       updatedAt: Date.now(),
       encryptedKeys: newEncryptedKeys,
       pinSalt: newPinSalt,
+      pinVersion: newPinVersion,
       pinVerifier: newPinVerifier,
       linkedAnchor: newLinkedAnchor,
       encryptedCanonical: newEncryptedCanonical ?? blob.encryptedCanonical,
@@ -1757,7 +1908,7 @@ $('#btnUpdatePin').addEventListener('click', async () => {
 
     // Update local account
     Object.assign(acc, { pinSalt: newPinSalt, pinVerifier: newPinVerifier, linkedAnchor: newLinkedAnchor, encryptedFaceDescriptor: newEncryptedFaceDescriptor, encryptedCanonical: newEncryptedCanonical });
-    cachePinKey(pub, newPinKey);
+    cachePinKey(pub, newPinKey, newPinRawBits);
     saveWallet();
     statusEl.innerHTML = '<span style="color:var(--success)">PIN updated successfully.</span>';
     toast('PIN updated', 'success');
@@ -1800,8 +1951,8 @@ $('#btnUpdateFace').addEventListener('click', async () => {
   // If the blob requires a PIN but we don't have the key cached, requirePin returned via
   // an early path (no pinSalt/pinVerifier on the in-memory account at the time it ran).
   // Abort here so the user isn't stuck re-doing the face scan only to hit "Session expired".
-  if (blobPre.pinVersion === 1 && !pinKey) {
-    toast('Session expired — please close and re-open Security Settings to authenticate again', 'error');
+  if ((blobPre.pinVersion === 1 || blobPre.pinVersion === 2) && !pinKey) {
+    toast('Session expired - please close and re-open Security Settings to authenticate again', 'error');
     statusEl.innerHTML = '';
     return;
   }
@@ -1842,24 +1993,35 @@ $('#btnUpdateFace').addEventListener('click', async () => {
 
   try {
     const newQuantized = quantizeDescriptor(faceMap.canonical);
-    const newFaceKey = await deriveFaceKey(newQuantized);
+    const newFaceKey = await deriveFaceKey(newQuantized, pub);  // for pinAttemptState
 
     // Reuse blob fetched before camera (already validated above)
     const blob: EncryptedKeyBlob = blobPre;
 
-    // Use the in-memory keys directly — identity was already proved by requirePin + liveness.
-    // This avoids any dependency on encryptedCanonical (which may be stale after a PIN change)
-    // and is always reliable since the live wallet always holds the authoritative key pair.
+    // Use the in-memory keys directly - identity was already proved by requirePin + liveness.
     const keysJson: string = JSON.stringify(acc.keys);
 
-    // Re-encrypt from raw keys JSON → new face layer → new PIN layer
-    const newInner = await encryptWithFaceKey(keysJson, newFaceKey);
-    let newEncryptedKeys = newInner;
+    // Build new encryptedKeys using combined key (pinVersion=2) or face-only (no PIN)
+    let newEncryptedKeys: string;
+    let newPinVersion: number;
     if (pinKey) {
-      newEncryptedKeys = await encryptWithPinKey(newInner, pinKey);
+      const pinRawBits = getCachedPinRawBits(pub);
+      if (!pinRawBits) {
+        hideCameraModal();
+        toast('Session expired - please close and re-open Security Settings to authenticate again', 'error');
+        statusEl.innerHTML = '';
+        return;
+      }
+      const newFaceBytes = await deriveFaceRawBits(newQuantized, pub);
+      const newSharedKey = await deriveCombinedKey(newFaceBytes, pinRawBits);
+      newEncryptedKeys = await encryptWithPinKey(keysJson, newSharedKey);
+      newPinVersion = 2;
+    } else {
+      newEncryptedKeys = await encryptWithFaceKey(keysJson, newFaceKey);
+      newPinVersion = 0;
     }
 
-    // Update encryptedCanonical with new canonical descriptor
+    // Update encryptedCanonical with new canonical descriptor (still encrypted with PIN key for deterministic recovery)
     const newEncryptedCanonical = pinKey
       ? await encryptWithPinKey(JSON.stringify(faceMap.canonical), pinKey)
       : undefined;
@@ -1874,12 +2036,13 @@ $('#btnUpdateFace').addEventListener('click', async () => {
     const newLinkedAnchor = Array.from(new Uint8Array(anchorBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
 
     // Build and save updated blob.
-    // Use acc.pinSalt (authoritative in-memory value) — the blob fetched from IDB may have a
+    // Use acc.pinSalt (authoritative in-memory value) - the blob fetched from IDB may have a
     // stale pinSalt from before a previous PIN change that didn't publish an updated blob.
     const newPinVerifier = pinKey ? await encryptWithPinKey('PINOK', pinKey) : blob.pinVerifier;
     const newBlob: EncryptedKeyBlob = {
       ...blob,
       pinSalt: acc.pinSalt ?? blob.pinSalt,
+      pinVersion: newPinVersion,
       updatedAt: Date.now(),
       encryptedKeys: newEncryptedKeys,
       faceMapHash: newFaceMapHash,
@@ -2263,7 +2426,7 @@ function removeFromContentLibrary(cid: string): void {
     if (keys) {
       await node.deleteContent(cids, record.ownerPub, keys).catch(() => {});
     } else {
-      // Keys not loaded (e.g. wallet locked) — delete locally only
+      // Keys not loaded (e.g. wallet locked) - delete locally only
       for (const c of cids) await node.store.deleteBlock(c).catch(() => {});
     }
   }
@@ -2274,6 +2437,92 @@ function removeFromContentLibrary(cid: string): void {
   el.value = cid;
   el.scrollIntoView({ behavior: 'smooth', block: 'center' });
 };
+
+(window as unknown as Record<string, unknown>)['distributeFromLibrary'] = async (cid: string) => {
+  const record = loadContentLibrary().find(r => r.cid === cid);
+  if (!record) { toast('Record not found in library', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Node not started', 'error'); return; }
+  const acc = localAccounts.find(a => a.pub === record.ownerPub);
+  if (!acc) { toast('Owner account not loaded in wallet', 'error'); return; }
+  toast('Distributing…', 'info');
+  const cids = [cid, ...(record.contentCid ? [record.contentCid] : [])];
+  const result = await node.distributeContent(cids, record.ownerPub, acc.keys);
+  if (result.error) toast(`Distribution: ${result.error}`, 'error');
+  else toast(`Distributed to ${result.providers.length} provider(s)`, 'success');
+  refreshStorage();
+};
+
+(window as unknown as Record<string, unknown>)['openReplaceModal'] = (cid: string) => {
+  const record = loadContentLibrary().find(r => r.cid === cid);
+  if (!record) { toast('Record not found in library', 'error'); return; }
+  const modal = $('#replaceContentModal');
+  ($('#replaceContentName') as HTMLElement).textContent = record.name || cid.slice(0, 16) + '…';
+  ($('#replaceVisibilityLabel') as HTMLElement).textContent = record.encrypted ? 'Private' : 'Public';
+  ($('#replaceContentFile') as HTMLInputElement).value = '';
+  const status = $('#replaceContentStatus') as HTMLElement;
+  status.style.display = 'none';
+  status.textContent = '';
+  modal.dataset.cid = cid;
+  modal.classList.add('active');
+};
+
+$('#btnReplaceCancel')?.addEventListener('click', () => {
+  $('#replaceContentModal').classList.remove('active');
+});
+
+$('#btnReplaceConfirm')?.addEventListener('click', async () => {
+  const modal = $('#replaceContentModal');
+  const cid = modal.dataset.cid ?? '';
+  const record = loadContentLibrary().find(r => r.cid === cid);
+  if (!record) { toast('Record not found', 'error'); return; }
+
+  const file = $<HTMLInputElement>('#replaceContentFile').files?.[0];
+  if (!file) { toast('Select a replacement file', 'error'); return; }
+
+  const acc = localAccounts.find(a => a.pub === record.ownerPub);
+  if (!acc) { toast('Wallet not loaded for owner account', 'error'); return; }
+  if (!node.store.isStarted()) { toast('Node not started', 'error'); return; }
+
+  const statusEl = $('#replaceContentStatus') as HTMLElement;
+  statusEl.textContent = 'Storing new content…';
+  statusEl.style.display = 'block';
+  const confirmBtn = $<HTMLButtonElement>('#btnReplaceConfirm');
+  confirmBtn.disabled = true;
+
+  try {
+    const data = new Uint8Array(await file.arrayBuffer());
+    const mimeType = file.type || record.mimeType || 'application/octet-stream';
+    const name = record.name;
+
+    const storeResult = record.encrypted
+      ? await node.store.storeWithMeta(data, { mimeType, name }, acc.keys)
+      : await node.store.storeWithMetaPublic(data, { mimeType, name });
+
+    const newCid = storeResult.cid;
+    const newContentCid = (storeResult.meta as { contentCid?: string }).contentCid;
+
+    const oldCids = [cid, ...(record.contentCid ? [record.contentCid] : [])];
+    const newCids = [newCid, ...(newContentCid ? [newContentCid] : [])];
+
+    statusEl.textContent = 'Broadcasting replace request…';
+    const result = await node.replaceContent(oldCids, newCids, record.ownerPub, acc.keys);
+    if (result.error) addLog(`Replace: ${result.error}`, 'warn');
+    else addLog(`Content replaced, distributed to ${result.providers.length} provider(s)`, 'success');
+
+    // Update library record
+    removeFromContentLibrary(cid);
+    addToContentLibrary({ ...record, cid: newCid, contentCid: newContentCid, sizeBytes: data.length, mimeType, timestamp: Date.now() });
+
+    toast('Content replaced successfully', 'success');
+    modal.classList.remove('active');
+    refreshStorage();
+  } catch (err) {
+    statusEl.textContent = `Error: ${err}`;
+    toast(`Replace failed: ${err}`, 'error');
+  } finally {
+    confirmBtn.disabled = false;
+  }
+});
 
 function setStorageTypeFields(type: string): void {
   document.querySelectorAll<HTMLElement>('.storage-type-fields').forEach(el => { el.style.display = 'none'; });
@@ -2286,7 +2535,7 @@ function refreshStorage() {
   const noAcct = '<option value="">No accounts</option>';
   const newHtml = options || noAcct;
 
-  // Populate account selectors — preserve selection and skip if unchanged (prevents mobile picker flicker)
+  // Populate account selectors - preserve selection and skip if unchanged (prevents mobile picker flicker)
   for (const id of ['#storageProviderAccount', '#storageContentFrom', '#retrieveContentFrom'] as const) {
     const sel = $<HTMLSelectElement>(id);
     if (sel.innerHTML !== newHtml) {
@@ -2330,9 +2579,41 @@ function refreshStorage() {
     stopArea.style.display = 'none';
   }
 
+  // Render storage network stat bar
+  const statBar = $('#storageNetworkStatBar') as HTMLElement | null;
+  const providers = node.ledger.getStorageProviders();
+  if (statBar) {
+    const ACTIVE_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const active = providers.filter(p => p.lastHeartbeat > now - ACTIVE_MS);
+    const totalCapGB = providers.reduce((s, p) => s + p.capacityGB, 0);
+    const storedBytes = active.reduce((s, p) => s + p.lastActualStoredBytes, 0);
+    const freeGB = Math.max(0, totalCapGB - storedBytes / 1_073_741_824);
+    const avgUptime = active.length
+      ? active.reduce((s, p) => s + (p.heartbeatsLast24h / 6), 0) / active.length
+      : 0;
+    const avgScore = active.length
+      ? active.reduce((s, p) => s + p.score, 0) / active.length
+      : 0;
+    const totalEarned = providers.reduce((s, p) => s + p.totalEarned, 0);
+    const fmtGB = (gb: number) => gb >= 1024 ? `${(gb / 1024).toFixed(2)} TB` : `${gb.toFixed(1)} GB`;
+    const chip = (label: string, value: string, color = 'var(--accent)') =>
+      `<div style="background:var(--surface2);border-radius:8px;padding:8px 14px;min-width:110px;text-align:center;">
+        <div style="font-size:10px;color:var(--text-muted);margin-bottom:2px;letter-spacing:.5px;text-transform:uppercase;">${label}</div>
+        <div style="font-size:15px;font-weight:700;color:${color};">${value}</div>
+      </div>`;
+    statBar.innerHTML = [
+      chip('Providers', `${active.length} / ${providers.length}`, active.length > 0 ? 'var(--success)' : 'var(--danger)'),
+      chip('Total Capacity', fmtGB(totalCapGB)),
+      chip('Free Space', fmtGB(freeGB), freeGB > 1 ? 'var(--success)' : 'var(--warning)'),
+      chip('Avg Uptime', `${Math.round(avgUptime * 100)}%`, avgUptime >= 0.8 ? 'var(--success)' : avgUptime >= 0.4 ? 'var(--warning)' : 'var(--danger)'),
+      chip('Avg Score', avgScore.toFixed(3), avgScore >= 0.8 ? 'var(--success)' : avgScore >= 0.4 ? 'var(--warning)' : 'var(--danger)'),
+      chip('Total Earned', formatUNIT(totalEarned)),
+    ].join('');
+  }
+
   // Render storage network table
   const providersList = $('#storageProvidersList');
-  const providers = node.ledger.getStorageProviders();
   if (providers.length === 0) {
     providersList.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No storage providers registered yet</td></tr>';
   } else {
@@ -2359,12 +2640,13 @@ function refreshStorage() {
   // Render content library
   const libraryList = $('#contentLibraryList');
   const records = loadContentLibrary();
+  const trackedCids = node.storage.getTrackedCids();
   const typeIcons: Record<string, string> = {
     image: '🖼️', video: '🎬', audio: '🎵', html: '🌐', css: '🎨',
     js: '⚙️', json: '📋', other: '📁',
   };
   if (records.length === 0) {
-    libraryList.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-muted)">No content stored yet</td></tr>';
+    libraryList.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No content stored yet</td></tr>';
   } else {
     libraryList.innerHTML = records.map(r => {
       const date = new Date(r.timestamp).toLocaleDateString();
@@ -2375,6 +2657,11 @@ function refreshStorage() {
       const visCell = r.encrypted
         ? `<span style="color:var(--warning);font-size:11px;font-weight:600;">Private</span>`
         : `<span style="color:var(--accent);font-size:11px;font-weight:600;">Public</span>`;
+      const tracked = trackedCids.get(r.cid);
+      const providerCount = tracked ? tracked.confirmedProviders.size : 0;
+      const providerCell = providerCount > 0
+        ? `<span style="color:var(--success);font-size:11px;font-weight:600;">${providerCount}</span>`
+        : `<span style="color:var(--text-muted);font-size:11px;">Local only</span>`;
       return `<tr>
         <td>${escHtml(r.name)}</td>
         <td>${icon} ${escHtml(r.contentType)}</td>
@@ -2382,9 +2669,14 @@ function refreshStorage() {
         <td>${sizeStr}</td>
         <td>${date}</td>
         <td>${copyBtn(r.cid)}</td>
+        <td>${providerCell}</td>
         <td style="white-space:nowrap;">
           <button class="btn btn-outline" style="font-size:11px;padding:2px 8px;"
             onclick="fillRetrieveCid('${escHtml(r.cid)}')">Use CID</button>
+          <button class="btn btn-outline" style="font-size:11px;padding:2px 8px;"
+            onclick="distributeFromLibrary('${escHtml(r.cid)}')">Distribute</button>
+          <button class="btn btn-outline" style="font-size:11px;padding:2px 8px;color:var(--accent);border-color:var(--accent);"
+            onclick="openReplaceModal('${escHtml(r.cid)}')">Replace</button>
           <button class="btn btn-outline" style="font-size:11px;padding:2px 8px;color:var(--danger);border-color:var(--danger);"
             onclick="removeFromLibraryAndRefresh('${escHtml(r.cid)}')">Remove</button>
         </td>
@@ -2525,7 +2817,21 @@ $('#btnClaimReward')?.addEventListener('click', async () => {
   refreshStorage();
 });
 
-$('#btnRefreshProviders')?.addEventListener('click', () => refreshStorage());
+$('#btnRefreshProviders')?.addEventListener('click', async () => {
+  const btn = $<HTMLButtonElement>('#btnRefreshProviders');
+  const orig = btn.textContent;
+  btn.textContent = 'Refreshing…';
+  btn.disabled = true;
+  // Re-publish our full local chain so peers respond with theirs.
+  // This is the only reliable way to pull storage-register / heartbeat blocks
+  // that were published before we joined the GossipSub mesh.
+  await node.broadcastLocalState();
+  // Give peers time to receive our broadcast and reply with their blocks.
+  await new Promise(r => setTimeout(r, 3000));
+  refreshStorage();
+  btn.textContent = orig;
+  btn.disabled = false;
+});
 
 $('#btnStoreContent')?.addEventListener('click', async () => {
   const pub = $<HTMLSelectElement>('#storageContentFrom').value;
@@ -2607,6 +2913,13 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     const visibility = $<HTMLSelectElement>('#storageVisibility').value;
     const isEncrypted = visibility === 'private';
 
+    // D6: warn if the network lacks enough free capacity for 2-node redundancy
+    const feasibility = node.ledger.checkPublishFeasibility(data.length);
+    if (!feasibility.feasible) {
+      addLog(feasibility.warning!, 'warn');
+      toast(feasibility.warning!, 'info');
+    }
+
     const storeResult = isEncrypted
       ? await node.store.storeWithMeta(data, { mimeType, name: finalName }, acc.keys)
       : await node.store.storeWithMetaPublic(data, { mimeType, name: finalName });
@@ -2619,12 +2932,15 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     // CID so providers pin both blobs (they are separate UnixFS blocks).
     const cidsToDistribute = contentCid ? [cid, contentCid] : [cid];
     const distResult = await node.distributeContent(cidsToDistribute, pub, acc.keys);
+    const distInfo = distResult.error
+      ? `<span style="color:var(--warning);font-size:11px;">⚠ ${escHtml(distResult.error)}</span>`
+      : `<span style="color:var(--success);font-size:11px;">✓ Sent to ${distResult.providers.length} provider(s)</span>`;
     if (distResult.error) addLog(`Storage distribution: ${distResult.error}`, 'warn');
     else addLog(`Content distributed to ${distResult.providers.length} provider(s)`, 'success');
 
     const resultEl = $('#storageCidResult');
     resultEl.style.display = 'block';
-    resultEl.innerHTML = `<strong>Stored!</strong> (${visLabel})&nbsp; CID: <span>${escHtml(cid)}</span> ${cpBtn(cid)}`;
+    resultEl.innerHTML = `<strong>Stored!</strong> (${visLabel})&nbsp; CID: <span>${escHtml(cid)}</span> ${cpBtn(cid)}<br>${distInfo}`;
 
     addToContentLibrary({ cid, contentCid, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
     toast(`Content stored (${visLabel})`, 'success');

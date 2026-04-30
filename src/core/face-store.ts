@@ -1,12 +1,15 @@
 /**
- * Face+PIN double-encrypted key storage.
+ * Face+PIN combined-key encrypted key storage (pinVersion=2).
  *
- * Encryption layers (inner → outer):
- *   1. AES-256-GCM keyed by face-derived PBKDF2 key  (face factor)
- *   2. AES-256-GCM keyed by PIN-derived PBKDF2 key   (PIN factor)
+ * Encryption scheme:
+ *   faceBytes  = PBKDF2-SHA256(quantizedDescriptor, "neuronchain-face-v1", 100k)   32 bytes
+ *   pinBytes   = PBKDF2-SHA512(pin, pinSalt, 600k)                                 32 bytes
+ *   sharedKey  = AES-GCM key derived from XOR(faceBytes, pinBytes)
+ *   encryptedKeys = AES-GCM(sharedKey, KeyPairJSON)   ← single layer
  *
- * Both factors are required to recover keys. The PIN salt is public
- * (stored in the blob), the face descriptor is never stored in plaintext.
+ * Both factors are required to derive sharedKey; neither alone can decrypt.
+ * The PIN salt and pinVerifier are stored in the blob (enabling UX PIN
+ * verification), but the main payload requires the combined key.
  *
  * The blob also carries a face-key-encrypted attempt counter so that
  * exponential backoff state transfers to new devices when the blob is
@@ -16,13 +19,16 @@
 import { KeyPair } from './crypto';
 import {
   deriveFaceKey,
+  deriveFaceRawBits,
   encryptWithFaceKey,
   decryptWithFaceKey,
   quantizeDescriptor,
   compareFaces,
 } from './face-verify';
+import { bytesToHex } from './dag-block';
 import {
   derivePinKey,
+  derivePinRawBits,
   encryptWithPinKey,
   decryptWithPinKey,
   generatePinSalt,
@@ -30,7 +36,7 @@ import {
 } from './pin-crypto';
 
 export interface EncryptedKeyBlob {
-  /** Double-encrypted key pair: AES-GCM(PIN key, AES-GCM(face key, KeyPair JSON)) */
+  /** pinVersion=2: AES-GCM(XOR(faceBytes,pinBytes), KeyPairJSON); pinVersion=0/1: legacy layers */
   encryptedKeys: string;
   /** SHA-256 hash of quantized face descriptor (public reference) */
   faceMapHash: string;
@@ -40,18 +46,18 @@ export interface EncryptedKeyBlob {
   pub: string;
   /** Timestamp */
   createdAt: number;
-  /** SHA-256(encryptedKeys:faceMapHash:pub) — ties blob to account on-chain */
+  /** SHA-256(encryptedKeys:faceMapHash:pub) - ties blob to account on-chain */
   linkedAnchor?: string;
   /** base64 32-byte PBKDF2 salt for PIN key derivation */
   pinSalt?: string;
-  /** 0 = legacy face-only, 1 = face+PIN double-encrypted */
+  /** 0 = legacy face-only, 1 = face+PIN two-layer, 2 = face+PIN combined key (current) */
   pinVersion?: number;
-  /** face-key-encrypted JSON {failedAttempts, lockedUntil} — tamper-resistant attempt state */
+  /** face-key-encrypted JSON {failedAttempts, lockedUntil} - tamper-resistant attempt state */
   pinAttemptState?: string;
-  /** AES-GCM(pinKey, "PINOK") — allows verifying PIN without decrypting full key blob */
+  /** AES-GCM(pinKey, "PINOK") - allows verifying PIN without decrypting full key blob */
   pinVerifier?: string;
   /**
-   * AES-GCM(pinKey, JSON(canonical descriptor)) — the pre-quantization averaged
+   * AES-GCM(pinKey, JSON(canonical descriptor)) - the pre-quantization averaged
    * face descriptor, encrypted with the PIN key so recovery is deterministic.
    * Decrypted with PIN → quantize → derive face key (same key as enrollment).
    * Without this field the face key must be derived from the live scan, which
@@ -60,10 +66,24 @@ export interface EncryptedKeyBlob {
   encryptedCanonical?: string;
   /**
    * Unix ms timestamp of the last blob modification.
-   * Used to resolve conflicts when multiple nodes gossip the same blob —
+   * Used to resolve conflicts when multiple nodes gossip the same blob -
    * only the newest version is kept in local IDB.
    */
   updatedAt?: number;
+}
+
+// ── Combined key derivation ───────────────────────────────────────────────────
+
+/**
+ * Derive an AES-256-GCM key from XOR(faceBytes, pinBytes).
+ * Used by both createEncryptedKeyBlob and recoverKeysWithFace for pinVersion=2.
+ * Also exported so that main.ts can re-derive the combined key for blob updates
+ * (face update, PIN change) without re-running the full recovery flow.
+ */
+export async function deriveCombinedKey(faceBytes: Uint8Array, pinBytes: Uint8Array): Promise<CryptoKey> {
+  const xored = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) xored[i] = faceBytes[i] ^ pinBytes[i];
+  return crypto.subtle.importKey('raw', xored as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
 
 // ── linkedAnchor computation ──────────────────────────────────────────────────
@@ -71,7 +91,7 @@ export interface EncryptedKeyBlob {
 async function computeLinkedAnchor(encryptedKeys: string, faceMapHash: string, pub: string): Promise<string> {
   const input = `${encryptedKeys}:${faceMapHash}:${pub}`;
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return bytesToHex(new Uint8Array(buf));
 }
 
 // ── Attempt state (stored inside blob, face-key-encrypted) ────────────────────
@@ -93,12 +113,13 @@ async function decryptAttemptState(encrypted: string, faceKey: CryptoKey): Promi
 // ── Blob creation ─────────────────────────────────────────────────────────────
 
 /**
- * Create a double-encrypted key blob.
+ * Create a combined-key encrypted key blob (pinVersion=2).
  *
- * If `pin` is provided (required for new accounts):
- *   encryptedKeys = AES-GCM(PIN key, AES-GCM(face key, KeyPair JSON))
+ * If `pin` is provided:
+ *   sharedKey     = AES-GCM(XOR(faceBytes, pinBytes))
+ *   encryptedKeys = AES-GCM(sharedKey, KeyPair JSON)   ← single layer, both factors required
  *
- * If `pin` is omitted (legacy path only):
+ * If `pin` is omitted (legacy face-only path):
  *   encryptedKeys = AES-GCM(face key, KeyPair JSON)
  */
 export async function createEncryptedKeyBlob(
@@ -109,11 +130,10 @@ export async function createEncryptedKeyBlob(
   pin?: string,
 ): Promise<EncryptedKeyBlob> {
   const quantized = quantizeDescriptor(canonicalDescriptor);
-  const faceKey = await deriveFaceKey(quantized);
+  const faceKey = await deriveFaceKey(quantized, keys.pub);  // used for pinAttemptState
   const keysJson = JSON.stringify(keys);
-  const innerEncrypted = await encryptWithFaceKey(keysJson, faceKey);
 
-  let encryptedKeys = innerEncrypted;
+  let encryptedKeys: string;
   let pinSalt: string | undefined;
   let pinVersion = 0;
   let pinVerifier: string | undefined;
@@ -121,14 +141,24 @@ export async function createEncryptedKeyBlob(
 
   if (pin !== undefined) {
     const saltBytes = generatePinSalt();
-    pinSalt = btoa(String.fromCharCode(...saltBytes));
-    const pinKey = await derivePinKey(pin, saltBytes);
-    encryptedKeys = await encryptWithPinKey(innerEncrypted, pinKey);
+    let binary = '';
+    for (let i = 0; i < saltBytes.length; i++) binary += String.fromCharCode(saltBytes[i]);
+    pinSalt = btoa(binary);
+
+    // One PBKDF2 call for the PIN - reuse pinBytes for both pinKey and combined key
+    const pinBytes = await derivePinRawBits(pin, saltBytes);
+    const pinKey = await crypto.subtle.importKey('raw', pinBytes as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+
+    // Combined key: XOR(faceBytes, pinBytes) - both factors required to decrypt
+    const faceBytes = await deriveFaceRawBits(quantized, keys.pub);
+    const sharedKey = await deriveCombinedKey(faceBytes, pinBytes);
+    encryptedKeys = await encryptWithPinKey(keysJson, sharedKey);  // single layer
+
     pinVerifier = await encryptWithPinKey('PINOK', pinKey);
-    // Store canonical encrypted with PIN key so recovery is deterministic
-    // (face key is derived from stored canonical, not from live scan)
     encryptedCanonical = await encryptWithPinKey(JSON.stringify(canonicalDescriptor), pinKey);
-    pinVersion = 1;
+    pinVersion = 2;
+  } else {
+    encryptedKeys = await encryptWithFaceKey(keysJson, faceKey);
   }
 
   const linkedAnchor = await computeLinkedAnchor(encryptedKeys, faceMapHash, keys.pub);
@@ -186,13 +216,14 @@ export interface RecoveryResult {
 }
 
 /**
- * Recover keys from a blob using a face scan (and PIN if blob.pinVersion === 1).
+ * Recover keys from a blob using a face scan and PIN.
  *
- * Returns the recovered key pair along with the derived face key (for subsequent
- * blob updates) and the current attempt state.
+ * Supports:
+ *   pinVersion=2 (combined key): derives sharedKey = AES(XOR(faceBytes, pinBytes))
+ *   pinVersion=1 (two-layer legacy): decrypts PIN outer then face inner
+ *   pinVersion=0 (face-only legacy): decrypts with face key only
  *
  * Returns null if decryption fails (wrong face or wrong PIN).
- * On wrong PIN the caller should call updateAttemptStateInBlob and re-publish the blob.
  */
 export async function recoverKeysWithFace(
   blob: EncryptedKeyBlob,
@@ -200,16 +231,59 @@ export async function recoverKeysWithFace(
   pin?: string,
 ): Promise<RecoveryResult | null> {
   const quantized = quantizeDescriptor(newDescriptor);
-  const faceKey = await deriveFaceKey(quantized);
+  const faceKey = await deriveFaceKey(quantized, blob.pub);
 
-  // Read embedded attempt state (non-blocking — ignore if missing/corrupted)
+  // Read embedded attempt state (non-blocking - ignore if missing/corrupted)
   const embeddedState = blob.pinAttemptState
     ? await decryptAttemptState(blob.pinAttemptState, faceKey)
     : null;
 
   const attemptState = embeddedState ?? { failedAttempts: 0, lockedUntil: 0 };
 
-  // ── PIN-protected blob (pinVersion === 1) ──────────────────────────────────
+  // ── Combined-key blob (pinVersion === 2) ───────────────────────────────────
+  if (blob.pinVersion === 2) {
+    if (!pin || !blob.pinSalt || !blob.encryptedCanonical) return null;
+
+    const saltBytes = Uint8Array.from(atob(blob.pinSalt), c => c.charCodeAt(0));
+    // Single PBKDF2 for PIN - reuse bits for both pinVerifier check and combined key
+    const pinBytes = await derivePinRawBits(pin, saltBytes);
+    const pinKey = await crypto.subtle.importKey('raw', pinBytes as unknown as BufferSource, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+
+    // Quick PIN check via pinVerifier
+    if (blob.pinVerifier) {
+      const pv = await decryptWithPinKey(blob.pinVerifier, pinKey);
+      if (pv !== 'PINOK') return null;
+    }
+
+    // Recover stored canonical descriptor (deterministic face key source)
+    const canonicalJson = await decryptWithPinKey(blob.encryptedCanonical, pinKey);
+    if (!canonicalJson) return null;
+
+    let storedCanonical: number[];
+    try { storedCanonical = JSON.parse(canonicalJson) as number[]; } catch { return null; }
+
+    const storedQuantized = quantizeDescriptor(storedCanonical);
+
+    // Biometric verification: live scan must match stored canonical
+    if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor))) return null;
+
+    // Derive combined key and decrypt
+    const faceBytes = await deriveFaceRawBits(storedQuantized, blob.pub);
+    const sharedKey = await deriveCombinedKey(faceBytes, pinBytes);
+    const decrypted = await decryptWithPinKey(blob.encryptedKeys, sharedKey);
+    if (!decrypted) return null;
+
+    let keys: KeyPair;
+    try {
+      keys = JSON.parse(decrypted) as KeyPair;
+      if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) return null;
+    } catch { return null; }
+
+    const resolvedFaceKey = await deriveFaceKey(storedQuantized, blob.pub);
+    return { keys, faceKey: resolvedFaceKey, attemptState };
+  }
+
+  // ── Two-layer blob (pinVersion === 1) ─────────────────────────────────────
   if (blob.pinVersion === 1) {
     if (!pin || !blob.pinSalt) return null;
 
@@ -218,13 +292,8 @@ export async function recoverKeysWithFace(
 
     // Decrypt outer (PIN) layer → intermediate (face-encrypted) ciphertext
     const intermediate = await decryptWithPinKey(blob.encryptedKeys, pinKey);
-    if (!intermediate) return null; // Wrong PIN
+    if (!intermediate) return null;
 
-    // Determine the face key to use for inner decryption.
-    // If encryptedCanonical is present (new blobs), decrypt it with the PIN key to
-    // get the original enrollment canonical descriptor, then derive the face key from
-    // that stored canonical — this is deterministic regardless of live-scan variance.
-    // Fall back to the live-scan-derived key for legacy blobs.
     let resolvedFaceKey = faceKey;
     if (blob.encryptedCanonical) {
       const canonicalJson = await decryptWithPinKey(blob.encryptedCanonical, pinKey);
@@ -232,28 +301,21 @@ export async function recoverKeysWithFace(
         try {
           const storedCanonical = JSON.parse(canonicalJson) as number[];
           const storedQuantized = quantizeDescriptor(storedCanonical);
-          resolvedFaceKey = await deriveFaceKey(storedQuantized);
-
-          // Biometric verification: live scan must be close to stored canonical
-          const liveQuantized = quantizeDescriptor(newDescriptor);
-          if (!compareFaces(storedQuantized, liveQuantized)) return null;
-        } catch {
-          // Corrupted canonical — fall back to live-scan key
-        }
+          resolvedFaceKey = await deriveFaceKey(storedQuantized, blob.pub);
+          if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor))) return null;
+        } catch { /* fall back to live-scan key */ }
       }
     }
 
     // Decrypt inner (face) layer → KeyPair JSON
     const decrypted = await decryptWithFaceKey(intermediate, resolvedFaceKey);
-    if (!decrypted) return null; // Wrong face
+    if (!decrypted) return null;
 
     let keys: KeyPair;
     try {
       keys = JSON.parse(decrypted) as KeyPair;
       if (!keys.pub || !keys.priv || !keys.epub || !keys.epriv) return null;
-    } catch {
-      return null;
-    }
+    } catch { return null; }
 
     return { keys, faceKey: resolvedFaceKey, attemptState };
   }

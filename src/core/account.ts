@@ -13,13 +13,13 @@ export interface Account {
   encryptedFaceDescriptor?: string;
   /** base64 32-byte PBKDF2 salt for PIN key derivation (per-account, public) */
   pinSalt?: string;
-  /** SHA-256(encryptedKeys:faceMapHash:pub) — ties the face+PIN blob to this account on-chain */
+  /** SHA-256(encryptedKeys:faceMapHash:pub) - ties the face+PIN blob to this account on-chain */
   linkedAnchor?: string;
-  /** ML-DSA-65 public key (base64) — quantum-safe signature verification */
+  /** ML-DSA-65 public key (base64) - quantum-safe signature verification */
   pqPub?: string;
-  /** ML-KEM-768 public key (base64) — quantum-safe key encapsulation */
+  /** ML-KEM-768 public key (base64) - quantum-safe key encapsulation */
   pqKemPub?: string;
-  /** AES-GCM(pinKey, "PINOK") — used to verify PIN without decrypting the full key blob */
+  /** AES-GCM(pinKey, "PINOK") - used to verify PIN without decrypting the full key blob */
   pinVerifier?: string;
 }
 

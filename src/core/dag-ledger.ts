@@ -10,9 +10,11 @@ import {
   MAX_HEARTBEATS_PER_DAY,
   HEARTBEAT_INTERVAL_MS,
   REWARD_EPOCH_MS,
+  GB_BYTES,
   createAccountBlock,
   validateBlockStructure,
   verifyBlockSignature,
+  hashAccountBlock,
 } from './dag-block';
 import { Account } from './account';
 import { KeyPair } from './crypto';
@@ -41,8 +43,10 @@ export interface StorageProvider {
   /** Stable device ID of the registering machine - only that device serves content */
   deviceId: string;
   registeredAt: number;
-  /** Offered capacity in GB from latest storage-register block */
+  /** Offered capacity in GB from latest storage-register block (upper bound / declared limit) */
   capacityGB: number;
+  /** Actual bytes stored as reported in the latest heartbeat (0 = no heartbeat with this field yet) */
+  lastActualStoredBytes: number;
   /** Timestamp of most recent storage-heartbeat block */
   lastHeartbeat: number;
   /** Heartbeat blocks in the last 24h window (recomputed on each new block) */
@@ -51,7 +55,7 @@ export interface StorageProvider {
   lastRewardEpoch: number;
   /** Cumulative milli-UNIT minted via storage-reward blocks */
   totalEarned: number;
-  /** Current smoke Hub address — set from heartbeat contractData, used for targeted retrieval */
+  /** Current smoke Hub address - set from heartbeat contractData, used for targeted retrieval */
   smokeAddr?: string;
   // ── Off-chain metrics (updated by StorageManager, informational only) ────
   /** Rolling average retrieval latency from peer-signed receipts (0 = no data) */
@@ -78,9 +82,19 @@ export class DAGLedger extends EventEmitter {
 
   /** Decentralised storage ledger: provider pub → live profile */
   storageProviders: Map<string, StorageProvider> = new Map();
+  /** P3: heartbeat epoch index - pub → epochDay → count */
+  private heartbeatsByEpoch: Map<string, Map<number, number>> = new Map();
 
   network: NetworkType;
   private txTimestamps: number[] = [];
+  /** A2: running counters, maintained incrementally to avoid O(n) scan in getStats() */
+  private _confirmedCount = 0;
+  private _pendingCount = 0;
+  /** P5: insertion-order hash list; getAllBlocks() returns the last MAX_BLOCKS_DISPLAY */
+  private blockInsertionOrder: string[] = [];
+  private static readonly MAX_BLOCKS_DISPLAY = 500;
+  /** H5: hard cap on in-memory chain length per account */
+  private static readonly MAX_CHAIN_MEMORY = 5000;
 
   constructor(network: NetworkType = 'testnet') {
     super();
@@ -92,18 +106,14 @@ export class DAGLedger extends EventEmitter {
   registerAccount(account: Account): boolean {
     const existing = this.accounts.get(account.pub);
     if (existing) {
-      // Merge remote data into the existing in-memory account.
-      // Use the higher balance/nonce (authoritative chain state wins, but remote
-      // may know about blocks we haven't seen yet).
-      if (account.balance > existing.balance) existing.balance = account.balance;
-      if (account.nonce > existing.nonce) existing.nonce = account.nonce;
+      // C1: balance/nonce are authoritative from on-chain blocks only - never merge from gossip.
+      // H1: raw faceDescriptor is not propagated - faceMapHash (public hash) is sufficient.
       if (account.username && account.username !== existing.username && account.username !== account.pub) {
         this.usernameToPublicKey.delete(existing.username);
         existing.username = account.username;
         this.usernameToPublicKey.set(account.username, account.pub);
       }
       if (account.faceMapHash && !existing.faceMapHash) existing.faceMapHash = account.faceMapHash;
-      if (account.faceDescriptor && !existing.faceDescriptor) existing.faceDescriptor = account.faceDescriptor;
       if (account.encryptedFaceDescriptor && !existing.encryptedFaceDescriptor) existing.encryptedFaceDescriptor = account.encryptedFaceDescriptor;
       if (account.linkedAnchor && !existing.linkedAnchor) existing.linkedAnchor = account.linkedAnchor;
       if (account.pqPub && !existing.pqPub) existing.pqPub = account.pqPub;
@@ -243,7 +253,7 @@ export class DAGLedger extends EventEmitter {
 
   /**
    * Create an account update block to change face hash, linked anchor, and/or PQ keys on-chain.
-   * Must be signed with the account's existing private key — proves ownership.
+   * Must be signed with the account's existing private key - proves ownership.
    */
   async createUpdate(
     pub: string,
@@ -301,7 +311,7 @@ export class DAGLedger extends EventEmitter {
    * smokeAddr is included in contractData so peers can discover the provider's
    * current WebRTC address from the chain without waiting for a live peer-addrs broadcast.
    */
-  async createStorageHeartbeat(pub: string, keys: KeyPair, smokeAddr?: string): Promise<{ block?: AccountBlock; error?: string }> {
+  async createStorageHeartbeat(pub: string, keys: KeyPair, smokeAddr?: string, actualStoredBytes?: number): Promise<{ block?: AccountBlock; error?: string }> {
     const provider = this.storageProviders.get(pub);
     if (!provider || provider.capacityGB === 0) return { error: 'Not a registered storage provider' };
 
@@ -312,7 +322,7 @@ export class DAGLedger extends EventEmitter {
 
     const head = this.getAccountHead(pub);
     if (!head) return { error: 'Account not opened' };
-    const heartbeatData: StorageHeartbeatData = { type: 'storage-heartbeat', smokeAddr };
+    const heartbeatData: StorageHeartbeatData = { type: 'storage-heartbeat', smokeAddr, actualStoredBytes };
     const block = await createAccountBlock({
       accountPub: pub, index: head.index + 1, type: 'storage-heartbeat',
       previousHash: head.hash, balance: head.balance,
@@ -349,7 +359,13 @@ export class DAGLedger extends EventEmitter {
     if (heartbeatCount === 0) return { error: 'No heartbeat blocks recorded today - cannot claim reward' };
 
     const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1.0);
-    const amount = Math.floor(BASE_STORAGE_RATE_MILLI * capacityAtEpochStart * uptimeFactor);
+    // Use actual stored GB from heartbeat data; fall back to declared capacity when
+    // heartbeats predate the actualStoredBytes field (backward compatibility).
+    const actualStoredGB = this.getActualStoredGBInEpoch(pub, epochDay);
+    const effectiveGB = actualStoredGB > 0
+      ? Math.min(actualStoredGB, capacityAtEpochStart)
+      : capacityAtEpochStart;
+    const amount = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
     if (amount <= 0) return { error: 'Calculated reward is zero' };
 
     const head = this.getAccountHead(pub);
@@ -358,7 +374,7 @@ export class DAGLedger extends EventEmitter {
     const rewardData: StorageRewardData = {
       type: 'storage-reward',
       epochDay,
-      storedGB: capacityAtEpochStart,
+      storedGB: effectiveGB,
       heartbeatCount,
       amount,
     };
@@ -384,13 +400,21 @@ export class DAGLedger extends EventEmitter {
     const spotFactor = Math.max(0.1, Math.min(1.0, provider.spotCheckPassRate));
 
     provider.score = uptimeFactor * latencyFactor * spotFactor;
-    provider.earningRate = Math.floor(BASE_STORAGE_RATE_MILLI * provider.capacityGB * provider.score);
+    // Earning rate reflects actual stored GB (capped at declared capacity), not just declared capacity
+    const effectiveGB = provider.lastActualStoredBytes > 0
+      ? Math.min(provider.lastActualStoredBytes / GB_BYTES, provider.capacityGB)
+      : provider.capacityGB;
+    provider.earningRate = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * provider.score);
   }
 
   // ── Block submission ──────────────────────────────────────────────────────
 
   async addBlock(block: AccountBlock): Promise<{ success: boolean; error?: string }> {
     if (this.allBlocks.has(block.hash)) return { success: true };
+
+    // G2: verify the stored hash matches the actual block data before trusting it
+    const expectedHash = await hashAccountBlock(block);
+    if (expectedHash !== block.hash) return { success: false, error: 'Block hash mismatch' };
 
     const account = this.accounts.get(block.accountPub);
     const sigValid = await verifyBlockSignature(block, account?.pqPub);
@@ -422,6 +446,10 @@ export class DAGLedger extends EventEmitter {
       }
       if (provider.lastHeartbeat > 0 && block.timestamp - provider.lastHeartbeat < HEARTBEAT_INTERVAL_MS - 60_000) {
         return { success: false, error: 'storage-heartbeat interval not reached' };
+      }
+      // D4: reject heartbeats with timestamps far from the accepting node's wall clock
+      if (Math.abs(block.timestamp - Date.now()) > 10 * 60 * 1000) {
+        return { success: false, error: 'storage-heartbeat: timestamp too far from current time' };
       }
     }
 
@@ -468,6 +496,7 @@ export class DAGLedger extends EventEmitter {
           deviceId: data.deviceId ?? existing?.deviceId ?? '',
           registeredAt: existing?.registeredAt ?? block.timestamp,
           capacityGB: data.capacityGB,
+          lastActualStoredBytes: existing?.lastActualStoredBytes ?? 0,
           lastHeartbeat: existing?.lastHeartbeat ?? 0,
           heartbeatsLast24h: existing?.heartbeatsLast24h ?? 0,
           lastRewardEpoch: existing?.lastRewardEpoch ?? 0,
@@ -489,6 +518,12 @@ export class DAGLedger extends EventEmitter {
     }
 
     if (block.type === 'storage-heartbeat') {
+      // P3: maintain epoch index for O(1) heartbeat count queries
+      const epochDay = Math.floor(block.timestamp / REWARD_EPOCH_MS);
+      const byEpoch = this.heartbeatsByEpoch.get(block.accountPub) ?? new Map<number, number>();
+      byEpoch.set(epochDay, (byEpoch.get(epochDay) ?? 0) + 1);
+      this.heartbeatsByEpoch.set(block.accountPub, byEpoch);
+
       const provider = this.storageProviders.get(block.accountPub);
       if (provider) {
         provider.lastHeartbeat = block.timestamp;
@@ -497,6 +532,9 @@ export class DAGLedger extends EventEmitter {
           try {
             const hbData = JSON.parse(block.contractData) as StorageHeartbeatData;
             if (hbData.smokeAddr) provider.smokeAddr = hbData.smokeAddr;
+            if (typeof hbData.actualStoredBytes === 'number') {
+              provider.lastActualStoredBytes = hbData.actualStoredBytes;
+            }
           } catch { /* ignore malformed */ }
         }
         this.updateProviderScore(provider);
@@ -552,10 +590,33 @@ export class DAGLedger extends EventEmitter {
     const acc = this.accounts.get(block.accountPub);
     if (acc) { acc.balance = block.balance; acc.nonce = block.index; }
 
+    // P5: maintain insertion-order list for getAllBlocks()
+    this.blockInsertionOrder.push(block.hash);
+    // Trim to 2× display budget so GC can collect the oldest pointers
+    if (this.blockInsertionOrder.length > DAGLedger.MAX_BLOCKS_DISPLAY * 2) {
+      this.blockInsertionOrder = this.blockInsertionOrder.slice(-DAGLedger.MAX_BLOCKS_DISPLAY);
+    }
+
+    // H5: cap in-memory chain length per account
+    this.pruneAccountChain(block.accountPub);
+
     this.txTimestamps.push(Date.now());
+
+    // A2: maintain running counters
+    if (voteResult === 'confirmed') this._confirmedCount++;
+    else this._pendingCount++;
+
     this.emit(voteResult === 'confirmed' ? 'block:confirmed' : 'block:conflict', block);
     this.emit('block:added', block);
     return { success: true };
+  }
+
+  // H5: drop blocks that have rolled off the in-memory window
+  private pruneAccountChain(pub: string): void {
+    const chain = this.accountChains.get(pub);
+    if (!chain || chain.length <= DAGLedger.MAX_CHAIN_MEMORY) return;
+    const pruned = chain.splice(0, chain.length - DAGLedger.MAX_CHAIN_MEMORY);
+    for (const b of pruned) this.allBlocks.delete(b.hash);
   }
 
   // ── Storage reward validation (semantic, requires chain state) ────────────
@@ -575,18 +636,22 @@ export class DAGLedger extends EventEmitter {
       if (capacityAtEpochStart === 0) {
         return 'storage-reward: not registered at epoch start';
       }
-      if (data.storedGB !== capacityAtEpochStart) {
-        return `storage-reward: declared storedGB (${data.storedGB}) does not match epoch-start capacity (${capacityAtEpochStart})`;
-      }
       const heartbeatCount = this.countHeartbeatsInEpoch(block.accountPub, data.epochDay);
       if (heartbeatCount === 0) {
         return 'storage-reward: no heartbeat blocks found for this epoch';
       }
+      // Compute the effective GB the same way createStorageReward does
+      const actualStoredGB = this.getActualStoredGBInEpoch(block.accountPub, data.epochDay);
+      const effectiveGB = actualStoredGB > 0
+        ? Math.min(actualStoredGB, capacityAtEpochStart)
+        : capacityAtEpochStart;
+      if (data.storedGB > effectiveGB + 1e-9) {
+        return `storage-reward: storedGB (${data.storedGB.toFixed(3)}) exceeds effective allowed GB (${effectiveGB.toFixed(3)})`;
+      }
       const uptimeFactor = Math.min(heartbeatCount / MAX_HEARTBEATS_PER_DAY, 1.0);
-      const maxAllowed = Math.floor(BASE_STORAGE_RATE_MILLI * capacityAtEpochStart * uptimeFactor);
-      // Allow 10% tolerance for timing edge cases
-      if (data.amount > Math.ceil(maxAllowed * 1.1)) {
-        return `storage-reward: amount ${data.amount} exceeds maximum ${maxAllowed} (${capacityAtEpochStart}GB × ${uptimeFactor.toFixed(2)} uptime)`;
+      const maxAllowed = Math.floor(BASE_STORAGE_RATE_MILLI * effectiveGB * uptimeFactor);
+      if (data.amount > maxAllowed) {
+        return `storage-reward: amount ${data.amount} exceeds maximum ${maxAllowed} (${effectiveGB.toFixed(3)}GB × ${uptimeFactor.toFixed(2)} uptime)`;
       }
       return null;
     } catch {
@@ -596,6 +661,31 @@ export class DAGLedger extends EventEmitter {
 
   // ── Heartbeat helpers ─────────────────────────────────────────────────────
 
+  /**
+   * Return the actual stored GB for a provider in a given epoch, derived from
+   * the latest heartbeat block that includes `actualStoredBytes`.
+   * Returns 0 if no heartbeat in the epoch reported actual bytes.
+   */
+  private getActualStoredGBInEpoch(pub: string, epochDay: number): number {
+    const chain = this.accountChains.get(pub) || [];
+    const epochStart = epochDay * REWARD_EPOCH_MS;
+    const epochEnd = epochStart + REWARD_EPOCH_MS;
+    let latestBytes = 0;
+    let latestTimestamp = 0;
+    for (const b of chain) {
+      if (b.type !== 'storage-heartbeat' || b.timestamp < epochStart || b.timestamp >= epochEnd) continue;
+      if (!b.contractData) continue;
+      try {
+        const hbData = JSON.parse(b.contractData) as StorageHeartbeatData;
+        if (typeof hbData.actualStoredBytes === 'number' && b.timestamp > latestTimestamp) {
+          latestBytes = hbData.actualStoredBytes;
+          latestTimestamp = b.timestamp;
+        }
+      } catch { /* skip */ }
+    }
+    return latestBytes / GB_BYTES;
+  }
+
   /** Count heartbeat blocks in the 24h window ending at refTime */
   private countHeartbeatsLast24h(pub: string, refTime: number): number {
     const chain = this.accountChains.get(pub) || [];
@@ -603,12 +693,9 @@ export class DAGLedger extends EventEmitter {
     return chain.filter(b => b.type === 'storage-heartbeat' && b.timestamp >= cutoff).length;
   }
 
-  /** Count heartbeat blocks in the 24h window for a given epoch day */
+  /** Count heartbeat blocks in the 24h window for a given epoch day (P3: O(1) via index). */
   countHeartbeatsInEpoch(pub: string, epochDay: number): number {
-    const chain = this.accountChains.get(pub) || [];
-    const epochStart = epochDay * REWARD_EPOCH_MS;
-    const epochEnd = epochStart + REWARD_EPOCH_MS;
-    return chain.filter(b => b.type === 'storage-heartbeat' && b.timestamp >= epochStart && b.timestamp < epochEnd).length;
+    return this.heartbeatsByEpoch.get(pub)?.get(epochDay) ?? 0;
   }
 
   /**
@@ -650,7 +737,8 @@ export class DAGLedger extends EventEmitter {
         verifiedStake = headBlock.balance;
       }
     } else {
-      verifiedStake = this.getAccountBalance(vote.voterPub);
+      // H3: no chain head provided - cannot verify stake, treat as zero (vote is rejected)
+      verifiedStake = 0;
     }
     if (verifiedStake <= 0) return;
     this.votes.addVote({ ...vote, stake: verifiedStake });
@@ -658,13 +746,20 @@ export class DAGLedger extends EventEmitter {
 
   processConflicts(): void {
     const { confirmed, rejected } = this.votes.resolveConflicts();
-    for (const hash of confirmed) this.emit('block:confirmed', this.allBlocks.get(hash));
+    for (const hash of confirmed) {
+      // A2: block transitions from pending to confirmed
+      this._confirmedCount++;
+      this._pendingCount--;
+      this.emit('block:confirmed', this.allBlocks.get(hash));
+    }
     for (const hash of rejected) this.handleRejectedBlock(hash);
   }
 
   private handleRejectedBlock(blockHash: string): void {
     const block = this.allBlocks.get(blockHash);
     if (!block) return;
+    // A2: rejected blocks leave the pending pool
+    this._pendingCount = Math.max(0, this._pendingCount - 1);
     const chain = this.accountChains.get(block.accountPub);
     if (chain) {
       const idx = chain.findIndex(b => b.hash === blockHash);
@@ -682,67 +777,101 @@ export class DAGLedger extends EventEmitter {
 
   getBlockStatus(blockHash: string): string { return this.votes.getStatus(blockHash); }
 
-  // ── Smart Contracts (Web Worker sandbox) ─────────────────────────────────
+  // ── Smart Contracts (sandboxed null-origin iframe) ────────────────────────
+  //
+  // S2: Uses sandbox="allow-scripts" (no allow-same-origin) to give contracts a
+  // null origin, blocking localStorage, cookies, IndexedDB, and cross-origin reads.
+  // Blocked network globals (fetch, WebSocket, etc.) are further shadowed by named
+  // function parameters so they resolve to undefined inside contract code.
+  // The 3-second timeout kills runaway loops at the parent level.
 
   private static readonly CONTRACT_TIMEOUT_MS = 3000;
 
+  // G3: globals shadowed as undefined-valued named params inside the contract function
+  private static readonly BLOCKED_GLOBALS = [
+    'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'SharedWorker',
+    'indexedDB', 'caches', 'navigator', 'location',
+    'open', 'close', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+    'queueMicrotask', 'performance', 'eval', 'Function',
+    'Request', 'Response', 'Headers',
+    'URL', 'URLSearchParams', 'Blob', 'File', 'FileReader',
+    'globalThis', 'self', 'global',
+  ] as const;
+
   private enqueueContractExecution(contractId: string, method: string, args: unknown[], caller: string): void {
     const prev = this.contractQueues.get(contractId) ?? Promise.resolve();
-    const next = prev.then(() => this.executeContractWorker(contractId, method, args, caller));
+    // A4: defer execution to idle time so contract calls don't block block validation
+    const next = prev.then(() => new Promise<void>(resolve => {
+      const run = () => this.executeContractSandbox(contractId, method, args, caller).then(resolve);
+      if (typeof requestIdleCallback !== 'undefined') {
+        requestIdleCallback(() => run(), { timeout: 2000 });
+      } else {
+        setTimeout(run, 0);
+      }
+    }));
     this.contractQueues.set(contractId, next.catch(() => { /* keep queue alive on error */ }));
   }
 
-  private executeContractWorker(contractId: string, method: string, args: unknown[], caller: string): Promise<void> {
+  private executeContractSandbox(contractId: string, method: string, args: unknown[], caller: string): Promise<void> {
     const contract = this.contracts.get(contractId);
     if (!contract) return Promise.resolve();
     if (!/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(method)) return Promise.resolve();
+    if (typeof document === 'undefined') return Promise.resolve();
 
-    const workerCode = `
-      "use strict";
-      const importScripts = undefined;
-      const XMLHttpRequest = undefined;
-      const WebSocket = undefined;
-      const EventSource = undefined;
-      const indexedDB = undefined;
-      const caches = undefined;
-      const navigator = undefined;
-      const location = undefined;
+    const blockedNames = DAGLedger.BLOCKED_GLOBALS.join(', ');
 
-      self.onmessage = function(e) {
-        const { state, caller, args, method } = e.data;
-        try {
-          const contractFn = new Function('state', 'caller', 'args',
-            ${JSON.stringify(contract.code)} +
-            "\\nif (typeof " + method + " === 'function') return " + method + "(...args);\\nreturn null;"
-          );
-          const result = contractFn(state, caller, args);
-          self.postMessage({ ok: true, result, state });
-        } catch (err) {
-          self.postMessage({ ok: false, error: String(err) });
-        }
-      };
-    `;
+    // Build the iframe srcdoc. The script runs in a null-origin context (no same-origin
+    // storage/cookie access). Blocked globals are shadowed both via top-level var
+    // declarations AND as named function parameters for defence-in-depth.
+    // H2: iframe uses e.ports[0] to reply - only our MessageChannel port can receive the result,
+    // eliminating the window.addEventListener('message') attack surface.
+    const iframeScript = `(function(){
+"use strict";
+${DAGLedger.BLOCKED_GLOBALS.map(g => `try{Object.defineProperty(window,'${g}',{value:void 0,writable:false,configurable:false})}catch(_){window['${g}']=void 0;}`).join('\n')}
+window.addEventListener('message',function(e){
+  if(!e.data||e.data.type!=='execute'||!e.ports[0])return;
+  var port=e.ports[0];
+  var state=e.data.state,caller=e.data.caller,args=e.data.args,method=e.data.method,code=e.data.code;
+  try{
+    var fn=new Function('state','caller','args',${JSON.stringify(blockedNames)},
+      code+'\\nif(typeof '+method+"==='function')return "+method+'(...args);return null;');
+    var result=fn(state,caller,args);
+    port.postMessage({type:'result',ok:true,result:result,state:state});
+  }catch(err){
+    port.postMessage({type:'result',ok:false,error:String(err)});
+  }
+});
+})();`;
 
     return new Promise((resolve) => {
       try {
-        const blob = new Blob([workerCode], { type: 'application/javascript' });
-        const url = URL.createObjectURL(blob);
-        const worker = new Worker(url);
+        const iframe = document.createElement('iframe');
+        iframe.setAttribute('sandbox', 'allow-scripts');
+        iframe.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden;pointer-events:none;';
+
+        const channel = new MessageChannel();
+
+        const cleanup = () => {
+          channel.port1.close();
+          if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+        };
 
         const timeout = setTimeout(() => {
-          worker.terminate();
-          URL.revokeObjectURL(url);
+          cleanup();
           this.emit('contract:error', { contractId, method, error: 'Execution timed out' });
           resolve();
         }, DAGLedger.CONTRACT_TIMEOUT_MS);
 
-        worker.onmessage = (e: MessageEvent) => {
+        channel.port1.onmessage = (e: MessageEvent) => {
+          if (!e.data || e.data.type !== 'result') return;
           clearTimeout(timeout);
-          worker.terminate();
-          URL.revokeObjectURL(url);
+          cleanup();
           const data = e.data as { ok: boolean; result?: unknown; state?: Record<string, unknown>; error?: string };
           if (data.ok) {
-            if (data.state) contract.state = data.state;
+            if (data.state) {
+              contract.state = data.state;
+              this.emit('contract:state-changed', { contractId, state: data.state });
+            }
             this.emit('contract:executed', { contractId, method, result: data.result });
           } else {
             this.emit('contract:error', { contractId, method, error: data.error });
@@ -750,15 +879,21 @@ export class DAGLedger extends EventEmitter {
           resolve();
         };
 
-        worker.onerror = (err: ErrorEvent) => {
-          clearTimeout(timeout);
-          worker.terminate();
-          URL.revokeObjectURL(url);
-          this.emit('contract:error', { contractId, method, error: err.message });
-          resolve();
-        };
+        iframe.srcdoc = `<!DOCTYPE html><html><head><script>${iframeScript.replace(/<\//g, '<\\/')}</script></head><body></body></html>`;
+        document.body.appendChild(iframe);
 
-        worker.postMessage({ state: { ...contract.state }, caller, args, method });
+        // Transfer port2 to the iframe so it can reply over the private channel
+        iframe.addEventListener('load', () => {
+          iframe.contentWindow?.postMessage({
+            type: 'execute',
+            state: { ...contract.state },
+            caller,
+            args,
+            method,
+            code: contract.code,
+          }, '*', [channel.port2]);
+        }, { once: true });
+
       } catch (err) {
         this.emit('contract:error', { contractId, method, error: String(err) });
         resolve();
@@ -771,21 +906,44 @@ export class DAGLedger extends EventEmitter {
   getStats(): DAGStats {
     const now = Date.now();
     this.txTimestamps = this.txTimestamps.filter(t => now - t < 10000);
-    let confirmedCount = 0, pendingCount = 0;
-    for (const [hash] of this.allBlocks) {
-      if (this.votes.isConfirmed(hash)) confirmedCount++;
-      else pendingCount++;
-    }
     return {
       network: this.network, totalAccounts: this.accounts.size,
-      totalBlocks: this.allBlocks.size, pendingBlocks: pendingCount,
-      confirmedBlocks: confirmedCount, tps: (this.txTimestamps.length / 10).toFixed(1),
+      totalBlocks: this.allBlocks.size, pendingBlocks: this._pendingCount,
+      confirmedBlocks: this._confirmedCount, tps: (this.txTimestamps.length / 10).toFixed(1),
     };
   }
 
+  /** A2: Estimate total blockchain size based on block count × average encoded size. */
+  estimateBlockchainSizeBytes(): number {
+    return this.allBlocks.size * 600;
+  }
+
   getAccountChain(pub: string): AccountBlock[] { return this.accountChains.get(pub) || []; }
-  getAllBlocks(): AccountBlock[] { return Array.from(this.allBlocks.values()).sort((a, b) => b.timestamp - a.timestamp); }
+
+  /** P5: Returns the most recent MAX_BLOCKS_DISPLAY blocks without a full sort. */
+  getAllBlocks(): AccountBlock[] {
+    const start = Math.max(0, this.blockInsertionOrder.length - DAGLedger.MAX_BLOCKS_DISPLAY);
+    const result: AccountBlock[] = [];
+    for (let i = this.blockInsertionOrder.length - 1; i >= start; i--) {
+      const b = this.allBlocks.get(this.blockInsertionOrder[i]);
+      if (b) result.push(b);
+    }
+    return result;
+  }
+
   getBlock(hash: string): AccountBlock | undefined { return this.allBlocks.get(hash); }
+
+  /** A3: Return blocks with timestamp >= cutoff without iterating the entire allBlocks map. */
+  getBlocksSince(cutoff: number): AccountBlock[] {
+    const result: AccountBlock[] = [];
+    for (let i = this.blockInsertionOrder.length - 1; i >= 0; i--) {
+      const b = this.allBlocks.get(this.blockInsertionOrder[i]);
+      if (!b) continue;
+      if (b.timestamp < cutoff) break;
+      result.push(b);
+    }
+    return result;
+  }
 
   getUnclaimedForAccount(pub: string): { sendBlockHash: string; fromPub: string; amount: number }[] {
     const result: { sendBlockHash: string; fromPub: string; amount: number }[] = [];
@@ -802,11 +960,44 @@ export class DAGLedger extends EventEmitter {
       .sort((a, b) => b.score - a.score);
   }
 
+  /**
+   * D6: Check whether the network has at least `minCopies` active providers
+   * with enough free space to store `fileSizeBytes`.
+   * "Active" = heartbeat within the last 24 h.
+   * "Free space" = registeredCapacityGB * GB_BYTES − lastActualStoredBytes.
+   */
+  checkPublishFeasibility(fileSizeBytes: number, minCopies = 2): {
+    feasible: boolean;
+    providersWithCapacity: number;
+    activeProviders: number;
+    warning?: string;
+  } {
+    const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const active = Array.from(this.storageProviders.values()).filter(
+      p => p.capacityGB > 0 && p.lastHeartbeat > now - ACTIVE_WINDOW_MS,
+    );
+    const withSpace = active.filter(p => {
+      const freeBytes = p.capacityGB * GB_BYTES - p.lastActualStoredBytes;
+      return freeBytes >= fileSizeBytes;
+    });
+    const feasible = withSpace.length >= minCopies;
+    return {
+      feasible,
+      providersWithCapacity: withSpace.length,
+      activeProviders: active.length,
+      warning: feasible ? undefined
+        : `Only ${withSpace.length} active provider(s) have enough free space (need ≥ ${minCopies} for redundancy). Upload may not be fully replicated.`,
+    };
+  }
+
   reset(): void {
     this.accountChains.clear(); this.allBlocks.clear(); this.accounts.clear();
     this.usernameToPublicKey.clear(); this.votes.clear(); this.contracts.clear(); this.contractQueues.clear();
     this.unclaimedSends.clear(); this.faceAccountCount.clear();
-    this.storageProviders.clear();
+    this.storageProviders.clear(); this.heartbeatsByEpoch.clear();
+    this.blockInsertionOrder = [];
+    this._confirmedCount = 0; this._pendingCount = 0;
     this.txTimestamps = [];
   }
 }

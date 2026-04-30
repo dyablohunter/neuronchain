@@ -37,6 +37,13 @@ export interface LockoutNotice {
   failedAttempts: number;
   lockedUntil: number;
   timestamp: number;
+  /** ECDSA signature by accountPub over `lockout:{accountPub}:{failedAttempts}:{lockedUntil}:{timestamp}` */
+  signature?: string;
+}
+
+/** Canonical payload signed inside a LockoutNotice. */
+export function lockoutPayload(n: LockoutNotice): string {
+  return `lockout:${n.accountPub}:${n.failedAttempts}:${n.lockedUntil}:${n.timestamp}`;
 }
 
 // ── Database ───────────────────────────────────────────────────────────────────
@@ -109,7 +116,23 @@ export function generatePinSalt(): Uint8Array {
 }
 
 /**
- * Derive an AES-256-GCM key from a 4-digit PIN using PBKDF2-SHA-512.
+ * Derive 32 raw bytes from a PIN using PBKDF2-SHA-512 (600k iterations).
+ * Used to construct combined face+PIN keys via XOR. Same KDF parameters as
+ * derivePinKey so the two derivations are cryptographically equivalent.
+ */
+export async function derivePinRawBits(pin: string, salt: Uint8Array): Promise<Uint8Array> {
+  const encoded = new TextEncoder().encode(pin);
+  const keyMaterial = await crypto.subtle.importKey('raw', encoded, 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: salt as unknown as BufferSource, iterations: KDF_ITERATIONS, hash: 'SHA-512' },
+    keyMaterial,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+/**
+ * Derive an AES-256-GCM key from a PIN using PBKDF2-SHA-512.
  * 600,000 iterations per OWASP 2024 recommendation for PBKDF2-SHA-512.
  * Each guess takes ~300ms in browser, making offline brute force over 10,000 PINs
  * take ~50 minutes minimum without hardware acceleration.
@@ -139,7 +162,9 @@ export async function encryptWithPinKey(data: string, key: CryptoKey): Promise<s
   const combined = new Uint8Array(12 + ct.byteLength);
   combined.set(iv);
   combined.set(new Uint8Array(ct), 12);
-  return btoa(String.fromCharCode(...combined));
+  let binary = '';
+  for (let i = 0; i < combined.length; i++) binary += String.fromCharCode(combined[i]);
+  return btoa(binary);
 }
 
 /**

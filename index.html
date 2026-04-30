@@ -877,6 +877,8 @@
         font-size: 12px;
       }
       .help-nav-sub.active { border-left-color: var(--accent); background: rgba(34,211,238,0.05); }
+      /* main header (~86px) + sticky help-mobile-header (~46px) */
+      .help-section { scroll-margin-top: 140px; }
     }
   </style>
 </head>
@@ -899,6 +901,24 @@
       <div class="btn-group">
         <button class="btn btn-outline" id="btnResetCancel">Cancel</button>
         <button class="btn btn-danger" id="btnResetConfirm">Reset Testnet</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Replace Content Modal -->
+  <div class="dialog-overlay" id="replaceContentModal">
+    <div class="dialog" style="max-width:460px;width:100%;">
+      <h3>Replace Content</h3>
+      <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">
+        Select a new file to replace <strong id="replaceContentName"></strong>.
+        The old content will be removed from all providers and the new content distributed in its place.
+        Visibility (<span id="replaceVisibilityLabel"></span>) is preserved.
+      </p>
+      <input type="file" id="replaceContentFile" style="width:100%;margin-bottom:12px;" />
+      <div id="replaceContentStatus" style="display:none;font-size:13px;margin-bottom:10px;color:var(--accent);"></div>
+      <div class="btn-group">
+        <button class="btn btn-outline" id="btnReplaceCancel">Cancel</button>
+        <button class="btn btn-primary" id="btnReplaceConfirm">Replace</button>
       </div>
     </div>
   </div>
@@ -964,6 +984,22 @@
         <div class="stats-grid" id="nodeStats"></div>
       </div>
       <div class="card">
+        <div class="card-title">Relay Network</div>
+        <p style="font-size:13px;color:var(--text-dim);margin-bottom:12px;">Community relays extend the network. Announce a relay you operate so other nodes can discover and connect to it automatically.</p>
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px;">
+          <div style="flex:1;min-width:220px;">
+            <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px;">Relay multiaddr (must include /p2p/&lt;peerId&gt;)</label>
+            <input id="relayAddrInput" class="form-input" placeholder="/dns4/relay.example.com/tcp/443/wss/http-path/relay-ws/p2p/12D3KooW..." style="width:100%;font-size:12px;font-family:monospace;" />
+          </div>
+          <div style="min-width:140px;">
+            <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px;">Sign with account</label>
+            <select id="relayAccountSelect" class="form-input" style="width:100%;"></select>
+          </div>
+          <button class="btn btn-primary" id="btnAnnounceRelay" style="white-space:nowrap;">Announce Relay</button>
+        </div>
+        <div id="knownRelaysList"></div>
+      </div>
+      <div class="card">
         <div class="card-title">Node Log</div>
         <div class="log-console" id="nodeLog"></div>
       </div>
@@ -975,7 +1011,7 @@
         <div class="card">
           <div class="card-title">Create Account with FaceID + PIN</div>
           <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-            Choose a username, then verify with FaceID and set a <strong>4-digit PIN</strong>. Your private key is generated and <strong>double-encrypted</strong> — both your face and PIN are required to unlock it. You receive <strong>1,000,000 UNIT</strong> upon creation.
+            Choose a username, then verify with FaceID and set a <strong>4-digit PIN</strong>. Your private key is generated and <strong>double-encrypted</strong> - both your face and PIN are required to unlock it. You receive <strong>1,000,000 UNIT</strong> upon creation.
           </p>
           <div class="form-group">
             <label class="form-label">Choose Username</label>
@@ -990,7 +1026,7 @@
         <div class="card">
           <div class="card-title">Recover Account</div>
           <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-            <strong>Option A:</strong> Enter your PIN then scan your face — your encrypted keys are on-chain.<br>
+            <strong>Option A:</strong> Enter your PIN then scan your face - your encrypted keys are on-chain.<br>
             <strong>Option B:</strong> Paste your backup key pair JSON.
           </p>
           <div class="form-group">
@@ -1240,6 +1276,10 @@ function getCount() { return state.counter; }"></textarea>
           <button class="btn btn-outline" style="font-size:11px;padding:3px 10px;" id="btnRefreshProviders">Refresh</button>
         </div>
         <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">All registered storage providers on NeuronChain, ranked by score.</p>
+
+        <!-- Network-wide storage stats chips -->
+        <div id="storageNetworkStatBar" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;"></div>
+
         <div class="table-wrap">
           <table>
             <thead><tr><th>Provider</th><th>Capacity</th><th>Uptime</th><th>Latency</th><th>Spot Check</th><th>Score</th><th>Rate/day</th><th>Total Earned</th></tr></thead>
@@ -1420,7 +1460,7 @@ function getCount() { return state.counter; }"></textarea>
         <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">Your locally tracked CIDs. Content remains on the NeuronChain network regardless of this list.</p>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Name</th><th>Type</th><th>Visibility</th><th>Size</th><th>Stored</th><th>CID</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Name</th><th>Type</th><th>Visibility</th><th>Size</th><th>Stored</th><th>CID</th><th>Providers</th><th>Actions</th></tr></thead>
             <tbody id="contentLibraryList"></tbody>
           </table>
         </div>
@@ -1462,6 +1502,8 @@ function getCount() { return state.counter; }"></textarea>
             <div class="help-nav-group-label">Network</div>
             <a class="help-nav-link" href="#help-consensus">Consensus</a>
             <a class="help-nav-link" href="#help-p2p">P2P Networking</a>
+            <a class="help-nav-sub" href="#help-p2p-multi-relay">Multiple Relays</a>
+            <a class="help-nav-sub" href="#help-p2p-multiaddr">Multiaddr Format</a>
           </div>
           <div class="help-nav-group">
             <div class="help-nav-group-label">Storage</div>
@@ -1479,6 +1521,7 @@ function getCount() { return state.counter; }"></textarea>
             <a class="help-nav-sub" href="#help-api-store">Storing Content</a>
             <a class="help-nav-sub" href="#help-api-retrieve">Retrieving Content</a>
             <a class="help-nav-sub" href="#help-api-distribute">Distributing &amp; Deleting</a>
+            <a class="help-nav-sub" href="#help-api-replace">Replacing Content</a>
             <a class="help-nav-sub" href="#help-api-ref">API Reference</a>
           </div>
           <div class="help-nav-group">
@@ -1497,19 +1540,19 @@ function getCount() { return state.counter; }"></textarea>
           <!-- OVERVIEW -->
           <div class="help-section" id="help-overview">
             <h2>Overview</h2>
-            <p>NeuronChain is a browser-based blockchain using a <strong>block-lattice DAG</strong> with <strong>stake-weighted voting</strong> and <strong>two-factor face + PIN locked keys</strong>. Every account has its own chain; transfers, contracts, and storage actions all land as signed blocks on those chains. No seed phrases — your private key is double-encrypted by your face and a 4-digit PIN.</p>
-            <p>The native currency is the <strong>Neuron Unit (UNIT)</strong>. The network runs peer-to-peer in the browser via <strong>libp2p</strong> (WebRTC + GossipSub + Kademlia DHT) and <strong>@sinclair/smoke</strong> (HTTP-over-WebRTC + IndexedDB) for content storage — no central server on the data path.</p>
+            <p>NeuronChain is a browser-based blockchain using a <strong>block-lattice DAG</strong> with <strong>stake-weighted voting</strong> and <strong>two-factor face + PIN locked keys</strong>. Every account has its own chain; transfers, contracts, and storage actions all land as signed blocks on those chains. No seed phrases - your private key is double-encrypted by your face and a 4-digit PIN.</p>
+            <p>The native currency is the <strong>Neuron Unit (UNIT)</strong>. The network runs peer-to-peer in the browser via <strong>libp2p</strong> (WebRTC + GossipSub + Kademlia DHT) and <strong>@sinclair/smoke</strong> (HTTP-over-WebRTC + IndexedDB) for content storage - no central server on the data path.</p>
           </div>
 
           <!-- QUICK START -->
           <div class="help-section" id="help-quickstart">
             <h2>Quick Start</h2>
             <ol>
-              <li><strong>Start Node</strong> — Node tab &#8594; Start Node. The node connects to the relay, joins GossipSub, and begins syncing. Transfer and Contracts tabs are disabled until this step.</li>
-              <li><strong>Create Account</strong> — Accounts tab &#8594; choose username (3–24 chars, lowercase alphanumeric + dot) &#8594; liveness check (turn head slowly) &#8594; face enrollment (3 captures) &#8594; set 4-digit PIN &#8594; <strong>1,000,000 UNIT</strong> minted.</li>
-              <li><strong>Save Backup Key</strong> — copy the Base58 secret key shown after creation. This is your secondary recovery method without camera or PIN.</li>
-              <li><strong>Send UNIT</strong> — Transfer tab &#8594; recipient username &#8594; amount &#8594; confirm with PIN.</li>
-              <li><strong>Explore</strong> — Explorer tab shows your transaction history syncing across the network in real time.</li>
+              <li><strong>Start Node</strong> - Node tab &#8594; Start Node. The node connects to the relay, joins GossipSub, and begins syncing. Transfer, Contracts and Storage tabs are disabled until this step.</li>
+              <li><strong>Create Account</strong> - Accounts tab &#8594; choose username (3–24 chars, lowercase alphanumeric and you can also use dot ".") &#8594; liveness check (turn head slowly) &#8594; face enrollment (3 captures) &#8594; set 4-digit PIN &#8594; <strong>1,000,000 UNIT</strong> minted.</li>
+              <li><strong>Save Backup Key</strong> - copy the Base58 secret key shown after creation. This is your secondary recovery method without camera or PIN.</li>
+              <li><strong>Send UNIT</strong> - Transfer tab &#8594; recipient username &#8594; amount &#8594; confirm with PIN.</li>
+              <li><strong>Explore</strong> - Explorer tab shows your transaction history syncing across the network in real time.</li>
             </ol>
             <div class="help-callout ok">
               <strong>Multi-device:</strong> run <code>npm run tunnel</code> in a second terminal to get an HTTPS tunnel URL. Open it on your phone to test cross-device sync.
@@ -1521,13 +1564,13 @@ function getCount() { return state.counter; }"></textarea>
             <h2>UNIT Currency</h2>
             <ul>
               <li><strong>1,000,000 UNIT</strong> minted per new account at creation (FaceID mandatory)</li>
-              <li><strong>3 decimal precision</strong> — smallest unit is 0.001 UNIT (1 milli-UNIT)</li>
-              <li><strong>Zero fees</strong> — transfers, contracts, storage, everything</li>
-              <li><strong>Inflationary</strong> — supply grows with each new account, capped by the number of living humans</li>
+              <li><strong>3 decimal precision</strong> - smallest unit is 0.001 UNIT (1 milli-UNIT)</li>
+              <li><strong>Zero fees</strong> - transfers, contracts, storage, everything</li>
+              <li><strong>Inflationary</strong> - supply grows with each new account, capped by the number of living humans</li>
               <li><strong>Mainnet:</strong> 1 account per face &nbsp;|&nbsp; <strong>Testnet:</strong> up to 3 per face</li>
               <li>Usernames are always lowercase (auto-converted)</li>
             </ul>
-            <p style="margin-top:12px;">Storage providers also earn UNIT via daily <code>storage-reward</code> blocks — new UNIT minted proportional to stored GB &#215; uptime factor.</p>
+            <p style="margin-top:12px;">Storage providers also earn UNIT via daily <code>storage-reward</code> blocks - new UNIT minted proportional to stored GB &#215; uptime factor.</p>
           </div>
 
           <!-- BLOCK TYPES -->
@@ -1538,11 +1581,11 @@ function getCount() { return state.counter; }"></textarea>
             <table class="help-table">
               <thead><tr><th>Type</th><th>Description</th><th>PIN?</th></tr></thead>
               <tbody>
-                <tr><td class="mono">open</td><td>First block — FaceID verified, mints 1,000,000 UNIT. Carries <code>faceMapHash</code> and <code>linkedAnchor</code> on-chain.</td><td>Yes</td></tr>
+                <tr><td class="mono">open</td><td>First block - FaceID verified, mints 1,000,000 UNIT. Carries <code>faceMapHash</code> and <code>linkedAnchor</code> on-chain.</td><td>Yes</td></tr>
                 <tr><td class="mono">send</td><td>Deducts <code>amount</code> from sender balance and records <code>recipient</code>. Receiver must claim with a <code>receive</code> block.</td><td>Yes</td></tr>
                 <tr><td class="mono">receive</td><td>Credits <code>receiveAmount</code> to recipient. References the matching <code>sendBlockHash</code>. Auto-claimed when node is online.</td><td>No</td></tr>
                 <tr><td class="mono">deploy</td><td>Publishes a smart contract. <code>contractData</code> carries the JS source.</td><td>Yes</td></tr>
-                <tr><td class="mono">call</td><td>Calls a contract method. <code>contractData</code> carries <code>{ contractId, method, args }</code>. No PIN — may originate from other accounts or external inputs.</td><td>No</td></tr>
+                <tr><td class="mono">call</td><td>Calls a contract method. <code>contractData</code> carries <code>{ contractId, method, args }</code>. No PIN - may originate from other accounts or external inputs.</td><td>No</td></tr>
                 <tr><td class="mono">update</td><td>Changes PIN or re-enrolls face. Updates <code>linkedAnchor</code>, <code>newFaceMapHash</code>, and optionally PQ keys on-chain.</td><td>Yes</td></tr>
               </tbody>
             </table>
@@ -1552,10 +1595,12 @@ function getCount() { return state.counter; }"></textarea>
               <tbody>
                 <tr><td class="mono">storage-register</td><td>Announces capacity in GB. Starts the provider's on-chain profile. Send again to update capacity.</td></tr>
                 <tr><td class="mono">storage-heartbeat</td><td>Proof-of-uptime issued every ~4 hours. Carries the provider's smoke Hub address in <code>contractData</code> so peers can reach it over WebRTC after a restart.</td></tr>
-                <tr><td class="mono">storage-reward</td><td>Self-issued once per 24 h. Mints new UNIT into the provider's balance. Amount = <code>1 UNIT &#215; GB &#215; uptime &#215; latency &#215; spotcheck</code>. Other nodes verify against on-chain heartbeat count — over-claiming rejected.</td></tr>
+                <tr><td class="mono">storage-reward</td><td>Self-issued once per 24 h. Mints new UNIT into the provider's balance. Amount = <code>1 UNIT &#215; GB &#215; uptime &#215; latency &#215; spotcheck</code>. Other nodes verify against on-chain heartbeat count - over-claiming rejected.</td></tr>
                 <tr><td class="mono">storage-deregister</td><td>Removes the provider from the storage ledger entirely.</td></tr>
               </tbody>
             </table>
+            <br>
+            <h2>Transfers</h2>
             <p>Transfers require two blocks: a <code>send</code> on the sender's chain and a <code>receive</code> on the recipient's chain. Receives are auto-claimed when the recipient's node is online. The sender re-broadcasts every 20 seconds so receives are claimed on reconnect if the node was temporarily offline.</p>
           </div>
 
@@ -1570,37 +1615,32 @@ function getCount() { return state.counter; }"></textarea>
             </ol>
             <h3>Face enrollment</h3>
             <ul>
-              <li><strong>Liveness check:</strong> slowly turn head left and right — requires &#8805; 30 px nose travel and 2 direction reversals to prevent photo/video replay</li>
+              <li><strong>Liveness check:</strong> slowly turn head left and right - requires &#8805; 30 px nose travel and 2 direction reversals to prevent photo/video replay</li>
               <li><strong>3-sample average:</strong> 3 captures averaged into a stable 128-dimensional canonical descriptor (face-api.js, 99.38% accuracy on LFW)</li>
               <li><strong>Stored canonical:</strong> the averaged descriptor is PIN-encrypted and saved in the blob as <code>encryptedCanonical</code></li>
             </ul>
             <h3>Why recovery is reliable across devices</h3>
-            <p>Face descriptors vary between sessions (lighting, angle). Key derivation uses the stored canonical — not the live scan — so the face key is always identical to the one used at enrollment.</p>
-            <ol>
-              <li>At enrollment: averaged canonical is PIN-encrypted &#8594; stored as <code>encryptedCanonical</code></li>
-              <li>At recovery: PIN entered first &#8594; PIN key decrypts <code>encryptedCanonical</code> &#8594; stored canonical recovered &#8594; face key derived deterministically</li>
-              <li>Live scan used only as a <em>biometric identity check</em> (tolerance-based distance comparison), not for key derivation</li>
-            </ol>
+            <p>Face descriptors vary between sessions due to lighting, angle, and distance. NeuronChain uses a stable canonical representation established at enrollment so the face key is consistent across devices and sessions. Both factors are always required for decryption.</p>
             <h3>PIN</h3>
             <ul>
               <li>Set once at creation; independent per account</li>
               <li><strong>Required for:</strong> send, deploy, open, recovery, update PIN/face</li>
               <li><strong>Not required for:</strong> contract calls (may originate from other accounts)</li>
-              <li><strong>5-minute session cache</strong> — no re-prompt for quick consecutive actions; cleared on page close</li>
+              <li><strong>5-minute session cache</strong> - no re-prompt for quick consecutive actions; cleared on page close</li>
             </ul>
             <h3>On-chain binding</h3>
-            <p><code>linkedAnchor = SHA-256(encryptedKeys + ":" + faceMapHash + ":" + pub)</code> — stored in the <code>open</code> block, updated on every <code>update</code> block. Verified on recovery to detect blob tampering.</p>
+            <p><code>linkedAnchor = SHA-256(encryptedKeys + ":" + faceMapHash + ":" + pub)</code> - stored in the <code>open</code> block, updated on every <code>update</code> block. Verified on recovery to detect blob tampering.</p>
           </div>
 
           <!-- ACCOUNT RECOVERY -->
           <div class="help-section" id="help-recovery">
             <h2>Account Recovery</h2>
             <h3>FaceID + PIN (primary)</h3>
-            <p>Enter username &#8594; PIN prompt &#8594; face scan (3-sample capture) &#8594; keys decrypted with both factors. Works from any device. The <code>linkedAnchor</code> is verified against on-chain data before decryption. Face key is derived from the stored canonical — not the live scan — so recovery is reliable regardless of lighting or angle changes.</p>
+            <p>Enter username &#8594; PIN prompt &#8594; face scan (3-sample capture) &#8594; keys decrypted with both factors. Works from any device. The <code>linkedAnchor</code> is verified against on-chain data before decryption. Recovery is reliable regardless of lighting or angle changes.</p>
             <h3>Backup secret key</h3>
             <p>Click <strong>Recover with Key Pair</strong> and paste the Base58 code saved at creation (~263 characters). Restores signing and encryption keys without a camera or PIN. The account's PIN requirement is restored from the blob automatically.</p>
             <h3>Re-enrolling your face</h3>
-            <p>Account tab &#8594; Update PIN / Face &#8594; Update Face. Identity is verified by PIN + liveness check before the camera opens. The keys already loaded in the active session are re-encrypted under the new face key — no blob decryption required. Works correctly after a PIN change with no extra steps.</p>
+            <p>Account tab &#8594; Update PIN / Face &#8594; Update Face. Identity is verified by PIN + liveness check before the camera opens. The keys already loaded in the active session are re-encrypted under the new face key - no blob decryption required. Works correctly after a PIN change with no extra steps.</p>
             <div class="help-callout warn">
               <strong>Save your backup key.</strong> It is shown only once at account creation. If you forget your PIN and lose the backup key, account recovery is not possible.
             </div>
@@ -1609,21 +1649,23 @@ function getCount() { return state.counter; }"></textarea>
           <!-- CONSENSUS -->
           <div class="help-section" id="help-consensus">
             <h2>Optimistic Consensus</h2>
-            <p>Blocks are <strong>confirmed instantly</strong> — no voting needed for normal transactions. Voting only triggers when a fork is detected (two blocks sharing the same parent = double-spend attempt).</p>
+            <p>Blocks are <strong>confirmed instantly</strong> - no voting needed for normal transactions. Voting only triggers when a fork is detected (two blocks sharing the same parent = double-spend attempt).</p>
             <h3>Normal path (&gt; 99.9% of blocks)</h3>
             <ol>
               <li>Block passes local validation: valid SHA-256 hash, ECDSA + ML-DSA-65 signature, sufficient balance, no fork</li>
-              <li>Block confirmed immediately — &lt; 1 ms latency</li>
+              <li>Block confirmed immediately - &lt; 1 ms latency</li>
             </ol>
             <h3>Conflict path (fork detected)</h3>
             <ol>
               <li>Network detects two blocks with the same <code>previousHash</code></li>
               <li>Nodes broadcast ECDSA-signed votes including <code>chainHeadHash</code> as a balance proof</li>
               <li>Each node verifies the voter's stake from its own ledger (no trust in self-reported values)</li>
-              <li>First side to reach &gt; 2/3 of total stake wins (10-second timeout)</li>
+              <li>The block with the <strong>earliest timestamp</strong> is preferred; hash lexicographic order breaks ties - a deterministic rule that removes first-mover advantage</li>
+              <li>Nodes that have not yet loaded the conflicting block's parent chain send a signed <strong>abstain</strong> vote - counted for participation but excluded from the approve/reject threshold, pushing the conflict toward the timestamp tie-break</li>
+              <li>First side to reach &gt; 2/3 of non-abstain stake wins; 10-second timeout falls back to the timestamp winner</li>
               <li>Rejected chain rolled back; unclaimed sends restored</li>
             </ol>
-            <div class="help-callout">Vote replay protection: duplicate signatures are rejected; votes older than 60 seconds are ignored. All vote signatures are verified client-side — a malicious relay cannot fabricate or alter votes.</div>
+            <div class="help-callout">Vote replay protection: duplicate signatures are rejected; votes older than 60 seconds are ignored. Abstain and approve/reject are both signed - neither can be stripped without invalidating the signature.</div>
           </div>
 
           <!-- P2P NETWORKING -->
@@ -1635,47 +1677,112 @@ function getCount() { return state.counter; }"></textarea>
                 <tr><td>Transport</td><td>WebRTC</td><td>Browser-to-browser direct connections</td></tr>
                 <tr><td>Transport</td><td>WebSocket</td><td>Browser-to-relay (bootstrap only)</td></tr>
                 <tr><td>NAT traversal</td><td>Circuit Relay v2</td><td>Relayed connections when WebRTC fails</td></tr>
-                <tr><td>Peer discovery</td><td>Kademlia DHT</td><td>Decentralised — no central peer registry</td></tr>
+                <tr><td>Peer discovery</td><td>Kademlia DHT</td><td>Decentralised - no central peer registry</td></tr>
                 <tr><td>Pubsub</td><td>GossipSub</td><td>Blocks, votes, accounts, inbox, storage requests</td></tr>
-                <tr><td>Persistence</td><td>IndexedDB</td><td>Full chain stored locally — no relay dependency</td></tr>
-                <tr><td>Content</td><td>smoke FileSystem + Http</td><td>Large content — HTTP-over-WebRTC block transfer</td></tr>
+                <tr><td>Persistence</td><td>IndexedDB</td><td>Full chain stored locally - no relay dependency</td></tr>
+                <tr><td>Content</td><td>smoke FileSystem + Http</td><td>Large content - HTTP-over-WebRTC block transfer</td></tr>
               </tbody>
             </table>
             <h3>GossipSub topics</h3>
             <ul>
               <li>Blocks sharded across <strong>4 synapse topics</strong> by <code>hash(accountPub) % 4</code></li>
               <li>Votes, accounts, inbox signals, and storage requests each have dedicated topics</li>
-              <li>WebRTC ICE candidates for smoke are routed via GossipSub (<code>neuronchain/&lt;net&gt;/ws/&lt;peerId&gt;</code>) — relay WebSocket is fallback only</li>
+              <li>WebRTC ICE candidates for smoke are routed via GossipSub (<code>neuronchain/&lt;net&gt;/ws/&lt;peerId&gt;</code>) - relay WebSocket is fallback only</li>
             </ul>
             <h3>Relay roles</h3>
             <ul>
-              <li><strong>GossipSub router</strong> — while browsers are on circuit-relay connections, the relay routes messages between them. Off the data path once browsers upgrade to direct WebRTC.</li>
-              <li><strong>Circuit relay v2</strong> — NAT traversal when direct WebRTC fails</li>
-              <li><strong>Bootstrap / DHT server</strong> — provides initial peer addresses</li>
-              <li><strong>Smoke hub fallback</strong> (<code>/smoke-hub</code>) — WebSocket signaling for smoke WebRTC when GossipSub is unavailable</li>
+              <li><strong>GossipSub router</strong> - while browsers are on circuit-relay connections, the relay routes messages between them. Off the data path once browsers upgrade to direct WebRTC.</li>
+              <li><strong>Circuit relay v2</strong> - NAT traversal when direct WebRTC fails</li>
+              <li><strong>Bootstrap / DHT server</strong> - provides initial peer addresses</li>
+              <li><strong>Smoke hub fallback</strong> (<code>/smoke-hub</code>) - WebSocket signaling for smoke WebRTC when GossipSub is unavailable</li>
             </ul>
             <h3>Developer commands</h3>
             <ul>
-              <li><code>npm run dev</code> — starts Vite + relay on port 9090</li>
-              <li><code>npm run tunnel</code> — HTTPS tunnel for multi-device testing</li>
-              <li><code>node relay-server.js</code> — standalone relay for production</li>
+              <li><code>npm run dev</code> - starts Vite + relay on port 9090</li>
+              <li><code>npm run tunnel</code> - HTTPS tunnel for multi-device testing</li>
+              <li><code>node relay-server.js</code> - standalone relay for production</li>
               <li>Custom bootstrap: <code>localStorage.setItem('neuronchain_bootstrap', JSON.stringify([...multiaddrs]))</code></li>
             </ul>
+            <h3 id="help-p2p-multi-relay">Running multiple relays</h3>
+            <p>Browsers connected to different relays can only reach each other if those relays are connected. Each relay dials the others at startup and keeps the connections alive with a 60-second reconnect loop.</p>
+            <p><strong>Step 1</strong> — get each relay's peer ID (stable across restarts):</p>
+            <pre class="help-pre"><code>curl http://&lt;server&gt;:9092/relay-info
+# {"peerId":"12D3KooW...","wsPort":9090}</code></pre>
+            <p><strong>Step 2</strong> — restart each relay with <code>PEER_RELAYS</code> pointing at the others (comma-separated, each must include the <code>/p2p/&lt;peerId&gt;</code> suffix):</p>
+            <pre class="help-pre"><code># Server A
+PEER_RELAYS=/dns4/relay-b.example.com/tcp/9090/ws/p2p/12D3KooWBbb...,\
+            /dns4/relay-c.example.com/tcp/9090/ws/p2p/12D3KooWCcc... \
+  node relay-server.js
+
+# Server B
+PEER_RELAYS=/dns4/relay-a.example.com/tcp/9090/ws/p2p/12D3KooWAaa...,\
+            /dns4/relay-c.example.com/tcp/9090/ws/p2p/12D3KooWCcc... \
+  node relay-server.js</code></pre>
+            <p><strong>Step 3</strong> — bake all relay addresses into the app build so browsers connect to the full set:</p>
+            <pre class="help-pre"><code>BOOTSTRAP_ADDRS="/dns4/relay-a.example.com/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWAaa...,\
+                 /dns4/relay-b.example.com/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWBbb..." \
+  npm run build</code></pre>
+            <p>Users can also set the bootstrap list at runtime without a rebuild:</p>
+            <pre class="help-pre"><code>localStorage.setItem('neuronchain_bootstrap', JSON.stringify([
+  '/dns4/relay-a.example.com/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWAaa...',
+  '/dns4/relay-b.example.com/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWBbb...',
+]));</code></pre>
+            <p>The <code>localStorage</code> key always takes priority over the baked-in list.</p>
+            <h3>Protocol version</h3>
+            <p>All GossipSub topics are namespaced as <code>neuronchain/v1/&lt;network&gt;/&#8230;</code>. A fork or modified build using a different version string cannot affect this network even when sharing the same relay — their messages land on different topics and are never delivered to standard nodes.</p>
+            <h3 id="help-p2p-multiaddr">Relay multiaddr format</h3>
+            <p>Every relay address is a <strong>multiaddr</strong> — a self-describing, protocol-layered string:</p>
+            <pre class="help-pre"><code>/dns4/relay.example.com/tcp/443/wss/http-path/relay-ws/p2p/12D3KooW...</code></pre>
+            <table class="help-table">
+              <thead><tr><th>Segment</th><th>Meaning</th></tr></thead>
+              <tbody>
+                <tr><td><code>/dns4/relay.example.com</code></td><td>IPv4 DNS hostname</td></tr>
+                <tr><td><code>/tcp/443</code></td><td>TCP port</td></tr>
+                <tr><td><code>/wss</code></td><td>WebSocket Secure (TLS)</td></tr>
+                <tr><td><code>/http-path/relay-ws</code></td><td>HTTP upgrade path — must match the server's <code>WS_PATH</code> (<code>/relay-ws</code> by default)</td></tr>
+                <tr><td><code>/p2p/12D3KooW&#8230;</code></td><td>The relay's libp2p peer ID — required for identity verification</td></tr>
+              </tbody>
+            </table>
+            <p>Common variants:</p>
+            <pre class="help-pre"><code># Cleartext WebSocket (dev / local)
+/ip4/127.0.0.1/tcp/9000/ws/p2p/12D3KooW...
+
+# DNS + plain WS (behind a TLS-terminating proxy)
+/dns4/relay.example.com/tcp/80/ws/http-path/relay-ws/p2p/12D3KooW...
+
+# IPv6
+/dns6/relay.example.com/tcp/443/wss/http-path/relay-ws/p2p/12D3KooW...</code></pre>
+            <p>The peer ID (<code>12D3KooW&#8230;</code>) is derived from the relay's keypair and is printed to the console on first start. It is also available via <code>curl http://&lt;server&gt;:9092/relay-info</code>.</p>
           </div>
 
           <!-- CONTENT STORAGE -->
           <div class="help-section" id="help-content">
             <h2>Content Storage</h2>
-            <p>NeuronChain is a full content network — posts, images, video, audio, HTML, CSS, JS, and JSON stored <strong>on NeuronChain</strong> using its own content layer. No central server; content is served peer-to-peer via HTTP over WebRTC (<code>@sinclair/smoke</code>).</p>
+            <p>NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON stored <strong>on NeuronChain</strong> using its own content layer. No central server; content is served peer-to-peer via HTTP over WebRTC (<code>@sinclair/smoke</code>).</p>
             <h3>Properties</h3>
             <ul>
-              <li><strong>Content-addressed:</strong> every file stored by its SHA-256 CID (<code>bafkrei&#8230;</code>). SHA-256(fetched bytes) is verified against the CID before accepting — tamper-evident by construction.</li>
+              <li><strong>Content-addressed:</strong> every file stored by its SHA-256 CID (<code>bafkrei&#8230;</code>, CIDv1 raw codec). SHA-256(fetched bytes) is verified against the CID before accepting - tamper-evident by construction.</li>
               <li><strong>On-chain anchor:</strong> the CID is recorded in <code>block.contentCid</code> or smart contract state, creating an immutable provenance proof.</li>
-              <li><strong>ECDSA-signed:</strong> every store action is signed by the account key — public content is authentically attributed to you.</li>
+              <li><strong>ECDSA-signed:</strong> every store action is signed by the account key - public content is authentically attributed to you.</li>
               <li><strong>Served by any peer</strong> that holds a copy via smoke Http on virtual port 5891. Known holders from storage receipts are tried first before broadcasting to all peers.</li>
-              <li><strong>IndexedDB persistence:</strong> content stored locally survives relay downtime — readable offline.</li>
-              <li><strong>WebRTC signaling via GossipSub:</strong> smoke peer connections are coordinated through the GossipSub mesh. The relay's <code>/smoke-hub</code> is fallback only — relay is not on the content data path.</li>
+              <li><strong>IndexedDB persistence:</strong> content stored locally survives relay downtime - readable offline.</li>
+              <li><strong>WebRTC signaling via GossipSub:</strong> smoke peer connections are coordinated through the GossipSub mesh. The relay's <code>/smoke-hub</code> is fallback only - relay is not on the content data path.</li>
             </ul>
+            <h3>Meta-envelope pattern</h3>
+            <p>Every store call creates <strong>two separate blocks</strong> in IndexedDB, each with its own CID:</p>
+<pre class="help-pre">┌──────────────────────────────────────────────────────────┐
+│  Meta block  (handle.cid)                                │
+│  { mimeType, size, encrypted, timestamp, contentCid }    │
+└───────────────────────────┬──────────────────────────────┘
+                            │ contentCid points to ↓
+┌───────────────────────────▼──────────────────────────────┐
+│  Content block  (handle.contentCid)                      │
+│  Raw bytes (public) or AES-256-GCM ciphertext (private)  │
+└──────────────────────────────────────────────────────────┘</pre>
+            <p>The <code>cid</code> returned to you is always the <strong>meta CID</strong>. Pass it to retrieval — the library fetches the content block automatically via the embedded <code>contentCid</code>. When distributing to providers, pass <strong>both CIDs</strong> so providers can serve a full retrieval independently:</p>
+<pre class="help-pre"><span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContent</span>(data, <span class="hp-str">'image/jpeg'</span>, keys);
+<span class="hp-kw">const</span> cids = [handle.cid, handle.contentCid].<span class="hp-fn">filter</span>(Boolean);
+<span class="hp-kw">await</span> api.<span class="hp-fn">distributeContent</span>(cids, myPub, keys);</pre>
             <h3>Visibility modes</h3>
             <table class="help-table">
               <thead><tr><th>Mode</th><th>Storage</th><th>Who can read</th><th>Use for</th></tr></thead>
@@ -1684,26 +1791,31 @@ function getCount() { return state.counter; }"></textarea>
                 <tr><td>Private</td><td>AES-256-GCM, ECDH-derived key</td><td>Key holder only</td><td>Personal data, drafts, private media</td></tr>
               </tbody>
             </table>
-            <p>Retrieval auto-detects visibility: tries decryption first, falls back to public read.</p>
+            <p>Retrieval auto-detects visibility: tries decryption first (if keys provided), falls back to public read.</p>
           </div>
 
           <!-- STORAGE LEDGER -->
           <div class="help-section" id="help-ledger">
             <h2>Decentralised Storage Ledger</h2>
-            <p>Built-in automated storage incentives — no marketplace, no manual deals.</p>
+            <p>Built-in automated storage incentives - no marketplace, no manual deals.</p>
             <h3>Provider lifecycle</h3>
             <ol>
-              <li><strong>Register</strong> — publish a <code>storage-register</code> block with capacity in GB. Automatic heartbeats and daily reward blocks begin.</li>
-              <li><strong>Heartbeat</strong> — a <code>storage-heartbeat</code> block is issued every ~4 hours. Each heartbeat records the smoke Hub address on-chain so peers survive restarts.</li>
-              <li><strong>Reward</strong> — a self-issued <code>storage-reward</code> block mints UNIT once per 24 h. The network verifies the amount against on-chain heartbeat count — over-claiming is rejected. A chain scan prevents double-issue from multiple devices.</li>
+              <li><strong>Register</strong> - publish a <code>storage-register</code> block with a declared capacity limit in GB. Automatic heartbeats and daily reward blocks begin.</li>
+              <li><strong>Heartbeat</strong> - a <code>storage-heartbeat</code> block is issued every ~4 hours. Each heartbeat records the provider's current smoke Hub address and <strong>actual bytes stored</strong> on-chain so the network can verify contributions and peers can reconnect after restarts.</li>
+              <li><strong>Reward</strong> - a self-issued <code>storage-reward</code> block mints UNIT once per 24 h. The reward is based on <code>min(actualStoredGB, registeredCapacityGB)</code> - you earn for bytes you actually serve, not just declared space. Over-claiming or falsifying the stored amount is rejected by all peers.</li>
             </ol>
             <h3>Earning rate</h3>
-            <pre class="help-pre">daily_reward = 1 UNIT &#215; capacityGB &#215; uptime_factor &#215; latency_factor &#215; spotcheck_factor
+            <pre class="help-pre">daily_reward = 1 UNIT &#215; effectiveGB &#215; uptime_factor &#215; latency_factor &#215; spotcheck_factor
 
+effectiveGB      = min(actualStoredGB, registeredCapacityGB)   (declared capacity is an upper bound only)
 uptime_factor    = heartbeat_blocks_today / 6        (max 1.0 &#8212; one every ~4 h)
 latency_factor   = 1000ms / avg_retrieval_latency    (max 1.0; response rank weighted)
 spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
-            <p>Response <em>rank</em> (arrival order among all providers for a CID) is factored into the latency score — providers who respond first earn more.</p>
+            <p>Response <em>rank</em> (arrival order among all providers for a CID) is factored into the latency score - providers who respond first earn more.</p>
+            <h3>Network stats</h3>
+            <p>The Storage tab shows a real-time summary of the whole network: active/total provider count, total declared capacity, estimated free space, average uptime, average score, and total UNIT minted to storage providers. These are computed from on-chain heartbeat data.</p>
+            <h3>Redundancy check</h3>
+            <p>Before any upload the UI checks that at least <strong>2 active providers</strong> have enough free space to hold the file. If fewer than 2 qualify, a warning is shown and the upload proceeds with reduced redundancy.</p>
             <h3>Content distribution</h3>
             <ul>
               <li>Uploaders select up to 10 providers by weighted-random (weight = capacityGB &#215; score)</li>
@@ -1713,22 +1825,43 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
             </ul>
             <h3>Spot checks &amp; integrity</h3>
             <p>Nodes periodically fetch blocks directly from each provider's smoke address and verify <code>SHA-256(bytes) === CID</code>. Providers serving wrong bytes are removed from the confirmed-provider set and excluded from future selection.</p>
+            <h3>StorageProvider fields</h3>
+            <table class="help-table">
+              <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">pub</td><td>string</td><td>Provider's ECDSA public key</td></tr>
+                <tr><td class="mono">deviceId</td><td>string</td><td>Stable device ID — prevents double-serving from the same key on two machines</td></tr>
+                <tr><td class="mono">capacityGB</td><td>number</td><td>Declared storage limit in GB (upper bound; rewards use actualStoredGB)</td></tr>
+                <tr><td class="mono">lastActualStoredBytes</td><td>number</td><td>Actual bytes stored as reported in the last heartbeat</td></tr>
+                <tr><td class="mono">lastHeartbeat</td><td>number</td><td>Unix ms timestamp of the most recent storage-heartbeat block</td></tr>
+                <tr><td class="mono">heartbeatsLast24h</td><td>number</td><td>Heartbeat blocks received in the last 24 h window (max 6)</td></tr>
+                <tr><td class="mono">lastRewardEpoch</td><td>number</td><td>epochDay index of the last storage-reward block (0 = never rewarded)</td></tr>
+                <tr><td class="mono">totalEarned</td><td>number</td><td>Cumulative milli-UNIT minted via storage-reward blocks</td></tr>
+                <tr><td class="mono">smokeAddr</td><td>string?</td><td>Current smoke Hub address for WebRTC retrieval (set from latest heartbeat)</td></tr>
+                <tr><td class="mono">avgLatencyMs</td><td>number</td><td>Rolling average retrieval latency from peer-signed receipts</td></tr>
+                <tr><td class="mono">spotCheckPassRate</td><td>number</td><td>Fraction of spot-check requests answered correctly (0–1, default 1)</td></tr>
+                <tr><td class="mono">score</td><td>number</td><td>Composite score: uptime × latency × spot-check factors (0–1)</td></tr>
+                <tr><td class="mono">earningRate</td><td>number</td><td>Projected milli-UNIT earned per day at current score</td></tr>
+              </tbody>
+            </table>
             <h3>Content deletion</h3>
-            <p>The owner broadcasts a signed <code>DeleteRequest</code> via GossipSub. Any node that holds a copy verifies the ECDSA signature and immediately drops the block from IndexedDB. Ownership is enforced per-CID — only the original uploader's public key can delete.</p>
+            <p>The owner broadcasts a signed <code>DeleteRequest</code> via GossipSub. Any node that holds a copy verifies the ECDSA signature and immediately drops the block from IndexedDB. Ownership is enforced per-CID - only the original uploader's public key can delete.</p>
+            <h3>Content replacement</h3>
+            <p>The owner stores new content locally (obtaining a new CID), then calls <code>replaceContent(oldCids, newCids, ownerPub, keys)</code>. This broadcasts a signed <code>ReplaceRequest</code> via GossipSub (<code>storage/replace-requests</code> topic). Every provider that holds the old CID verifies the signature, drops the old blocks, and fetches the new blocks from the owner via smoke Http. A <code>CacheRequest</code> is simultaneously sent to ensure the new content reaches the full redundancy target. Storage rewards auto-adjust: each provider's next <code>storage-heartbeat</code> block reports updated <code>actualStoredBytes</code>, so reward calculation reflects the new data size automatically.</p>
           </div>
 
           <!-- SMART CONTRACTS -->
           <div class="help-section" id="help-contracts">
             <h2>Smart Contracts</h2>
-            <p>Contracts are written in plain <strong>JavaScript</strong> and execute in an isolated <strong>Web Worker sandbox</strong> — no access to DOM, <code>fetch</code>, <code>localStorage</code>, <code>WebSocket</code>, or any browser API. Execution is terminated after 3 seconds. Load templates from the <strong>Contracts</strong> tab, edit the code, and click <strong>Deploy</strong>.</p>
+            <p>Contracts are written in plain <strong>JavaScript</strong> and execute in a <strong>sandboxed null-origin iframe</strong> - the iframe has no <code>allow-same-origin</code> permission, so it cannot access <code>localStorage</code>, <code>IndexedDB</code>, cookies, or the parent page. Network APIs (<code>fetch</code>, <code>WebSocket</code>, <code>XMLHttpRequest</code>) and timing globals (<code>setTimeout</code>, <code>setInterval</code>) are blocked by overriding them on the iframe's <code>window</code> before execution. Execution is terminated after 3 seconds by the parent frame. Load templates from the <strong>Contracts</strong> tab, edit the code, and click <strong>Deploy</strong>.</p>
 
             <div id="help-contracts-sandbox">
               <h3>Sandbox Environment</h3>
-              <p>Each contract runs in its own Web Worker context with three globals injected at call time:</p>
+              <p>Each contract runs in a null-origin iframe with three globals injected at call time:</p>
               <table class="help-table">
                 <thead><tr><th>Global</th><th>Type</th><th>Description</th></tr></thead>
                 <tbody>
-                  <tr><td class="mono">state</td><td>object</td><td>Persistent JSON object that survives across calls. Read and write freely — changes are committed after each successful call. Starts as <code>{}</code> on first deploy.</td></tr>
+                  <tr><td class="mono">state</td><td>object</td><td>Persistent JSON object that survives across calls. Read and write freely - changes are committed after each successful call. Starts as <code>{}</code> on first deploy.</td></tr>
                   <tr><td class="mono">caller</td><td>string</td><td>The ECDSA public key (hex) of the account that created the <code>call</code> block. Use this for ownership checks and per-user balances.</td></tr>
                   <tr><td class="mono">args</td><td>any[]</td><td>Array of arguments passed to the method by the caller. Types are preserved as JSON.</td></tr>
                 </tbody>
@@ -1738,28 +1871,28 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
             <div id="help-contracts-state">
               <h3>State &amp; Variables</h3>
               <ul>
-                <li><code>state</code> persists in IndexedDB across calls and page reloads — treat it as your database</li>
+                <li><code>state</code> persists in IndexedDB across calls and page reloads - treat it as your database</li>
                 <li>Any JSON-serializable value can be stored: strings, numbers, booleans, arrays, nested objects</li>
-                <li>Only named top-level <code>function</code> declarations are callable — arrow functions and methods on objects are not exposed</li>
-                <li>Return any JSON-serializable value from a function — it is stored in the <code>call</code> block's result field and returned to the caller</li>
-                <li>Return <code>{ error: '...' }</code> to signal failure — state is only committed on success, so an error return leaves state unchanged</li>
-                <li>No async/await — all logic must be synchronous</li>
+                <li>Only named top-level <code>function</code> declarations are callable - arrow functions and methods on objects are not exposed</li>
+                <li>Return any JSON-serializable value from a function - it is stored in the <code>call</code> block's result field and returned to the caller</li>
+                <li>Return <code>{ error: '...' }</code> to signal failure - state is only committed on success, so an error return leaves state unchanged</li>
+                <li>No async/await - all logic must be synchronous</li>
               </ul>
               <div class="help-callout">Contract calls on conflicted blocks are deferred until the conflict resolves. Always guard initialisation with <code>if (state.initialized) return</code> to prevent re-init after a fork rollback.</div>
             </div>
 
             <div id="help-contracts-token">
-              <h3>Token Contract — Full Example</h3>
+              <h3>Token Contract - Full Example</h3>
               <p>A fungible token with owner-controlled minting, peer-to-peer transfers, and balance queries. Load from Contracts tab &#8594; Simple Token template, then call <code>init</code> after deploying.</p>
 <pre class="help-pre"><span class="hp-cmt">// ── STATE SHAPE ────────────────────────────────────────────────</span>
 <span class="hp-cmt">// state.initialized  boolean</span>
-<span class="hp-cmt">// state.owner        string  (deployer pub key — only they can issue)</span>
+<span class="hp-cmt">// state.owner        string  (deployer pub key - only they can issue)</span>
 <span class="hp-cmt">// state.name         string</span>
 <span class="hp-cmt">// state.symbol       string</span>
 <span class="hp-cmt">// state.totalSupply  number</span>
 <span class="hp-cmt">// state.balances     { [address: string]: number }</span>
 
-<span class="hp-cmt">// Step 1 — call once: init("MyToken", "MTK", 1000000)</span>
+<span class="hp-cmt">// Step 1 - call once: init("MyToken", "MTK", 1000000)</span>
 <span class="hp-kw">function</span> <span class="hp-fn">init</span>(name, symbol, totalSupply) {
   <span class="hp-kw">if</span> (state.initialized) <span class="hp-kw">return</span> { error: <span class="hp-str">'already initialized'</span> };
   state.name        = name;
@@ -1793,7 +1926,7 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
   <span class="hp-kw">return</span> { success: <span class="hp-kw">true</span>, from: caller, to, amount };
 }
 
-<span class="hp-cmt">// Queries — callable by anyone</span>
+<span class="hp-cmt">// Queries - callable by anyone</span>
 <span class="hp-kw">function</span> <span class="hp-fn">balanceOf</span>(address) { <span class="hp-kw">return</span> state.balances[address] || 0; }
 
 <span class="hp-kw">function</span> <span class="hp-fn">getInfo</span>() {
@@ -1803,16 +1936,16 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
 <span class="hp-kw">function</span> <span class="hp-fn">allBalances</span>() { <span class="hp-kw">return</span> state.balances; }</pre>
               <h4>Workflow</h4>
               <ol>
-                <li><strong>Deploy</strong> — Contracts tab &#8594; paste code &#8594; Deploy &#8594; contract gets a unique ID (its block hash)</li>
-                <li><strong>Init</strong> — Call &#8594; method: <code>init</code> &#8594; args: <code>"MyToken", "MTK", 1000000</code></li>
-                <li><strong>Issue more tokens</strong> — Call &#8594; method: <code>issue</code> &#8594; args: <code>"&lt;address&gt;", 500000</code> (owner only)</li>
-                <li><strong>Transfer</strong> — Call &#8594; method: <code>transfer</code> &#8594; args: <code>"&lt;address&gt;", 100</code></li>
-                <li><strong>Check balance</strong> — Call &#8594; method: <code>balanceOf</code> &#8594; args: <code>"&lt;address&gt;"</code></li>
+                <li><strong>Deploy</strong> - Contracts tab &#8594; paste code &#8594; Deploy &#8594; contract gets a unique ID (its block hash)</li>
+                <li><strong>Init</strong> - Call &#8594; method: <code>init</code> &#8594; args: <code>"MyToken", "MTK", 1000000</code></li>
+                <li><strong>Issue more tokens</strong> - Call &#8594; method: <code>issue</code> &#8594; args: <code>"&lt;address&gt;", 500000</code> (owner only)</li>
+                <li><strong>Transfer</strong> - Call &#8594; method: <code>transfer</code> &#8594; args: <code>"&lt;address&gt;", 100</code></li>
+                <li><strong>Check balance</strong> - Call &#8594; method: <code>balanceOf</code> &#8594; args: <code>"&lt;address&gt;"</code></li>
               </ol>
             </div>
 
             <div id="help-contracts-nft">
-              <h3>NFT Contract — Full Example</h3>
+              <h3>NFT Contract - Full Example</h3>
               <p>A non-fungible token collection where each token carries a <strong>content CID</strong> pointing to media stored on NeuronChain's content layer. Upload media via the Storage tab to get a CID, then pass it to <code>mint</code>.</p>
 <pre class="help-pre"><span class="hp-cmt">// ── STATE SHAPE ────────────────────────────────────────────────</span>
 <span class="hp-cmt">// state.initialized  boolean</span>
@@ -1821,7 +1954,7 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
 <span class="hp-cmt">// state.nextId       number  (auto-incrementing)</span>
 <span class="hp-cmt">// state.tokens       { [id]: { owner, metadata, cid, mintedAt } }</span>
 
-<span class="hp-cmt">// Step 1 — call once: init("My Art", "MART")</span>
+<span class="hp-cmt">// Step 1 - call once: init("My Art", "MART")</span>
 <span class="hp-kw">function</span> <span class="hp-fn">init</span>(name, symbol) {
   <span class="hp-kw">if</span> (state.initialized) <span class="hp-kw">return</span> { error: <span class="hp-str">'already initialized'</span> };
   state.name = name; state.symbol = symbol;
@@ -1830,7 +1963,7 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
   <span class="hp-kw">return</span> { name, symbol };
 }
 
-<span class="hp-cmt">// Mint a token — cid = SHA-256 CID from the Storage tab</span>
+<span class="hp-cmt">// Mint a token - cid = SHA-256 CID from the Storage tab</span>
 <span class="hp-cmt">// Call: mint("&lt;recipient&gt;", "Artwork #1", "bafkrei...")</span>
 <span class="hp-kw">function</span> <span class="hp-fn">mint</span>(to, metadata, cid) {
   <span class="hp-kw">if</span> (caller !== state.owner) <span class="hp-kw">return</span> { error: <span class="hp-str">'not authorized'</span> };
@@ -1866,72 +1999,82 @@ spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
 }</pre>
               <h4>Workflow with Content API</h4>
               <ol>
-                <li><strong>Upload media</strong> — Storage tab &#8594; upload image &#8594; get CID (e.g. <code>bafkreiabc&#8230;</code>)</li>
-                <li><strong>Distribute</strong> — Storage tab &#8594; Distribute &#8594; sends the CID to up to 10 providers</li>
-                <li><strong>Deploy contract</strong> — Contracts tab &#8594; paste code &#8594; Deploy</li>
-                <li><strong>Init collection</strong> — Call &#8594; method: <code>init</code> &#8594; args: <code>"My Art", "MART"</code></li>
-                <li><strong>Mint NFT</strong> — Call &#8594; method: <code>mint</code> &#8594; args: <code>"&lt;owner-address&gt;", "Artwork #1", "bafkreiabc&#8230;"</code></li>
-                <li><strong>Transfer NFT</strong> — Call (as token owner) &#8594; method: <code>transfer</code> &#8594; args: <code>1, "&lt;new-owner&gt;"</code></li>
-                <li><strong>View collection</strong> — Call &#8594; method: <code>allTokens</code> &#8594; returns all tokens with their CIDs</li>
+                <li><strong>Upload media</strong> - Storage tab &#8594; upload image &#8594; get CID (e.g. <code>bafkreiabc&#8230;</code>)</li>
+                <li><strong>Distribute</strong> - Storage tab &#8594; Distribute &#8594; sends the CID to up to 10 providers</li>
+                <li><strong>Deploy contract</strong> - Contracts tab &#8594; paste code &#8594; Deploy</li>
+                <li><strong>Init collection</strong> - Call &#8594; method: <code>init</code> &#8594; args: <code>"My Art", "MART"</code></li>
+                <li><strong>Mint NFT</strong> - Call &#8594; method: <code>mint</code> &#8594; args: <code>"&lt;owner-address&gt;", "Artwork #1", "bafkreiabc&#8230;"</code></li>
+                <li><strong>Transfer NFT</strong> - Call (as token owner) &#8594; method: <code>transfer</code> &#8594; args: <code>1, "&lt;new-owner&gt;"</code></li>
+                <li><strong>View collection</strong> - Call &#8594; method: <code>allTokens</code> &#8594; returns all tokens with their CIDs</li>
               </ol>
-              <div class="help-callout ok">The <code>cid</code> field in each token is a permanent content address — any peer holding the media can serve it via smoke Http. Token ownership and media ownership are separate: the contract records who owns the NFT; the CID points to the content bytes.</div>
+              <div class="help-callout ok">The <code>cid</code> field in each token is a permanent content address - any peer holding the media can serve it via smoke Http. Token ownership and media ownership are separate: the contract records who owns the NFT; the CID points to the content bytes.</div>
             </div>
           </div>
 
           <!-- CONTENT API -->
           <div class="help-section" id="help-api">
             <h2>Content API</h2>
-            <p>The <code>NeuronChainAPI</code> facade in <code>src/api/neuronchain-api.ts</code> provides a stable interface for building apps on NeuronChain. Instantiate with a running <code>NeuronNode</code>:</p>
+            <p>The <code>NeuronChainAPI</code> facade in <code>src/api/neuronchain-api.ts</code> provides a stable interface for building apps on NeuronChain. Instantiate with a network name — the node starts internally:</p>
 <pre class="help-pre"><span class="hp-kw">import</span> { NeuronChainAPI } <span class="hp-kw">from</span> <span class="hp-str">'./src/api/neuronchain-api'</span>;
-<span class="hp-kw">const</span> api = <span class="hp-kw">new</span> <span class="hp-cls">NeuronChainAPI</span>(node); <span class="hp-cmt">// node = running NeuronNode instance</span></pre>
+<span class="hp-kw">const</span> api = <span class="hp-kw">new</span> <span class="hp-cls">NeuronChainAPI</span>(<span class="hp-str">'testnet'</span>); <span class="hp-cmt">// or 'mainnet'</span>
+<span class="hp-kw">await</span> api.<span class="hp-fn">start</span>();
+api.<span class="hp-fn">registerKey</span>(myPub, myKeys); <span class="hp-cmt">// allows auto-receive and auto-vote for local accounts</span></pre>
 
             <div id="help-api-store">
               <h3>Storing Content</h3>
+              <p>All store methods return a <code>ContentHandle</code>: <code>{ cid, contentCid?, size, mimeType, timestamp }</code>. Pass both <code>cid</code> and <code>contentCid</code> to <code>distributeContent</code> so providers can pin both blocks of the meta-envelope.</p>
               <h4>Public content (unencrypted)</h4>
-<pre class="help-pre"><span class="hp-cmt">// Store a JSON object</span>
-<span class="hp-kw">const</span> encoder = <span class="hp-kw">new</span> TextEncoder();
-<span class="hp-kw">const</span> { cid } = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContentPublic</span>(
-  encoder.<span class="hp-fn">encode</span>(JSON.<span class="hp-fn">stringify</span>({ title: <span class="hp-str">'Hello'</span>, body: <span class="hp-str">'...'</span> })),
+<pre class="help-pre"><span class="hp-cmt">// Store a JSON object — anyone with the CID can read it</span>
+<span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContentPublic</span>(
+  <span class="hp-kw">new</span> TextEncoder().<span class="hp-fn">encode</span>(JSON.<span class="hp-fn">stringify</span>({ title: <span class="hp-str">'Hello'</span> })),
   <span class="hp-str">'application/json'</span>,
-  <span class="hp-str">'my-post'</span>        <span class="hp-cmt">// optional filename hint</span>
+  <span class="hp-str">'my-post'</span>,   <span class="hp-cmt">// optional name</span>
 );
-<span class="hp-cmt">// cid: 'bafkrei...' — permanent, immutable content address</span>
+console.<span class="hp-fn">log</span>(handle.cid);         <span class="hp-cmt">// meta CID — share this</span>
+console.<span class="hp-fn">log</span>(handle.contentCid);  <span class="hp-cmt">// inner content CID — pass to distributeContent too</span>
 
 <span class="hp-cmt">// Store a file from &lt;input type="file"&gt;</span>
-<span class="hp-kw">const</span> file  = fileInput.files[0];
-<span class="hp-kw">const</span> bytes = <span class="hp-kw">new</span> Uint8Array(<span class="hp-kw">await</span> file.<span class="hp-fn">arrayBuffer</span>());
-<span class="hp-kw">const</span> { cid: imgCid } = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContentPublic</span>(bytes, file.type, file.name);</pre>
+<span class="hp-kw">const</span> file   = fileInput.files[0];
+<span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContentPublic</span>(<span class="hp-kw">new</span> Uint8Array(<span class="hp-kw">await</span> file.<span class="hp-fn">arrayBuffer</span>()), file.type, file.name);</pre>
               <h4>Private content (AES-256-GCM encrypted)</h4>
-<pre class="help-pre"><span class="hp-cmt">// myKeys = { pub, priv, epub, epriv, pqPub?, pqPriv?, ... }</span>
-<span class="hp-kw">const</span> { cid: privateCid } = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContent</span>(
-  imageBytes,
+<pre class="help-pre"><span class="hp-cmt">// myKeys = { pub, priv, epub, epriv, pqPub?, pqPriv? }</span>
+<span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContent</span>(
+  imageBytes,         <span class="hp-cmt">// Uint8Array</span>
   <span class="hp-str">'image/jpeg'</span>,
   myKeys,
-  <span class="hp-str">'profile-photo'</span>
+  <span class="hp-str">'profile-photo'</span>,  <span class="hp-cmt">// optional name</span>
 );
-<span class="hp-cmt">// Encrypted before touching IndexedDB or any peer — only your keys can decrypt it</span></pre>
-              <h4>With metadata</h4>
-<pre class="help-pre"><span class="hp-cmt">// Returns cid + ContentMeta { name, mimeType, size, createdAt, contentCid }</span>
-<span class="hp-kw">const</span> { cid, meta } = <span class="hp-kw">await</span> api.store.<span class="hp-fn">storeWithMetaPublic</span>(bytes, <span class="hp-str">'image/png'</span>, <span class="hp-str">'avatar'</span>);
-console.<span class="hp-fn">log</span>(meta.size, meta.createdAt, meta.contentCid);</pre>
+<span class="hp-cmt">// Encrypted before touching IndexedDB or any peer - only your keys can decrypt it</span></pre>
+              <h4>JSON and text helpers (encrypted)</h4>
+<pre class="help-pre"><span class="hp-cmt">// Store any JSON-serialisable value</span>
+<span class="hp-kw">const</span> cid = <span class="hp-kw">await</span> api.<span class="hp-fn">storeJSON</span>({ title: <span class="hp-str">'Hello'</span>, tags: [<span class="hp-str">'web3'</span>] }, myKeys);
+
+<span class="hp-cmt">// Store raw text (HTML, CSS, JS, markdown)</span>
+<span class="hp-kw">const</span> cid = <span class="hp-kw">await</span> api.<span class="hp-fn">storeText</span>(<span class="hp-str">'&lt;html&gt;&lt;body&gt;My dApp&lt;/body&gt;&lt;/html&gt;'</span>, myKeys);</pre>
+              <div class="help-callout">These helpers return a plain CID string (not a ContentHandle). The JSON is serialised to UTF-8 and encrypted — no separate meta block is created for JSON/text helpers.</div>
             </div>
 
             <div id="help-api-retrieve">
               <h3>Retrieving Content</h3>
-<pre class="help-pre"><span class="hp-cmt">// Public</span>
+<pre class="help-pre"><span class="hp-cmt">// Public — throws if not found</span>
 <span class="hp-kw">const</span> bytes = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveContentPublic</span>(cid);
 <span class="hp-kw">const</span> text  = <span class="hp-kw">new</span> TextDecoder().<span class="hp-fn">decode</span>(bytes);
 
-<span class="hp-cmt">// Private (decrypts with your keys)</span>
+<span class="hp-cmt">// Private — decrypts with your keys; throws if decryption fails</span>
 <span class="hp-kw">const</span> bytes = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveContent</span>(privateCid, myKeys);
 
-<span class="hp-cmt">// Auto-detect — tries decryption first, falls back to public</span>
-<span class="hp-kw">const</span> bytes = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveContentAuto</span>(cid, myKeys);
+<span class="hp-cmt">// Auto-detect — tries decryption first (if keys given), falls back to public read</span>
+<span class="hp-cmt">// Returns { data, mimeType, size, wasEncrypted } or undefined if not found</span>
+<span class="hp-kw">const</span> result = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveContentAuto</span>(cid, myKeys);
+<span class="hp-kw">if</span> (result) {
+  <span class="hp-kw">const</span> blob = <span class="hp-kw">new</span> Blob([result.data], { type: result.mimeType });
+  img.src = URL.<span class="hp-fn">createObjectURL</span>(blob);
+}
 
-<span class="hp-cmt">// With metadata</span>
-<span class="hp-kw">const</span> { data, meta } = <span class="hp-kw">await</span> api.store.<span class="hp-fn">retrieveWithMetaPublic</span>(cid);
-console.<span class="hp-fn">log</span>(meta.mimeType, meta.name, data.byteLength);</pre>
-              <p>Retrieval checks local IndexedDB first (instant if cached), then queries known providers from receipts (targeted fetch), and finally broadcasts to all peer fallbacks. Every fetch verifies <code>SHA-256(bytes) === CID</code> before returning.</p>
+<span class="hp-cmt">// JSON and text helpers (encrypted)</span>
+<span class="hp-kw">const</span> post = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveJSON</span>(cid, myKeys);  <span class="hp-cmt">// returns parsed object or undefined</span>
+<span class="hp-kw">const</span> html = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveText</span>(cid, myKeys);   <span class="hp-cmt">// returns string or undefined</span></pre>
+              <p>Retrieval checks local IndexedDB first (instant if cached), then queries known providers from receipts (targeted fetch). Every fetch verifies <code>SHA-256(bytes) === CID</code> before returning.</p>
             </div>
 
             <div id="help-api-distribute">
@@ -1941,7 +2084,7 @@ console.<span class="hp-fn">log</span>(meta.mimeType, meta.name, data.byteLength
 
 <span class="hp-cmt">// Delete locally + broadcast signed delete to all known holders</span>
 <span class="hp-kw">await</span> api.<span class="hp-fn">deleteContent</span>([cid], myPub, myKeys);
-<span class="hp-cmt">// Holders verify your signature — only you can delete your content</span></pre>
+<span class="hp-cmt">// Holders verify your signature - only you can delete your content</span></pre>
               <h4>Complete end-to-end workflow</h4>
 <pre class="help-pre"><span class="hp-cmt">// 1. Upload media</span>
 <span class="hp-kw">const</span> { cid } = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContentPublic</span>(bytes, <span class="hp-str">'image/jpeg'</span>, <span class="hp-str">'cover'</span>);
@@ -1959,29 +2102,148 @@ console.<span class="hp-fn">log</span>(meta.mimeType, meta.name, data.byteLength
 <span class="hp-kw">await</span> api.<span class="hp-fn">deleteContent</span>([cid], myPub, myKeys);</pre>
             </div>
 
+            <div id="help-api-replace">
+              <h3>Replacing Content</h3>
+              <p>Because CIDs are SHA-256 hashes they are immutable - changing the bytes creates a new CID. <code>replaceContent</code> lets you publish a new version while automatically retiring the old one from all providers.</p>
+              <ol>
+                <li>Store the new version locally to get a new CID</li>
+                <li>Call <code>replaceContent</code> with the old and new CID arrays</li>
+                <li>Providers that hold the old blocks drop them and cache the new ones</li>
+                <li>Storage rewards auto-adjust via the next heartbeat block</li>
+              </ol>
+<pre class="help-pre"><span class="hp-cmt">// Store updated image</span>
+<span class="hp-kw">const</span> newHandle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContent</span>(newImageBytes, <span class="hp-str">'image/jpeg'</span>, myKeys);
+
+<span class="hp-cmt">// Replace the old version across the network</span>
+<span class="hp-kw">const</span> { providers } = <span class="hp-kw">await</span> api.<span class="hp-fn">replaceContent</span>(
+  [oldHandle.cid, oldHandle.contentCid].<span class="hp-fn">filter</span>(Boolean),  <span class="hp-cmt">// old CIDs</span>
+  [newHandle.cid, newHandle.contentCid].<span class="hp-fn">filter</span>(Boolean),  <span class="hp-cmt">// new CIDs</span>
+  myPub, myKeys,
+);
+<span class="hp-cmt">// Old blocks gone from all providers; new blocks now replicated to ${providers.length} nodes</span>
+
+<span class="hp-cmt">// Update your contract/block to reference the new CID</span>
+<span class="hp-kw">await</span> api.<span class="hp-fn">callContract</span>(nftContract, <span class="hp-str">'updateCid'</span>, [tokenId, newHandle.cid], myPub, myKeys);
+
+<span class="hp-cmt">// Listen for the event when a provider confirms the swap</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:replaced'</span>, ({ oldCid, newCid, pub }) =&gt; {
+  console.<span class="hp-fn">log</span>(<span class="hp-str">`Provider ${pub.slice(0,12)} replaced ${oldCid.slice(0,12)} → ${newCid.slice(0,12)}`</span>);
+});</pre>
+              <div class="help-callout">Pass <strong>both</strong> the meta CID and the inner <code>contentCid</code> in each array so providers drop and re-cache the complete two-block envelope.</div>
+            </div>
+
             <div id="help-api-ref">
               <h3>API Reference</h3>
+              <h4>Content</h4>
               <table class="help-table">
                 <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
                 <tbody>
-                  <tr><td class="mono">storeContentPublic(data, mime, name?)</td><td class="mono">{ cid }</td><td>Store unencrypted content</td></tr>
-                  <tr><td class="mono">storeContent(data, mime, keys, name?)</td><td class="mono">{ cid }</td><td>Store AES-256-GCM encrypted content</td></tr>
-                  <tr><td class="mono">retrieveContentPublic(cid)</td><td class="mono">Uint8Array</td><td>Fetch unencrypted content by CID</td></tr>
-                  <tr><td class="mono">retrieveContent(cid, keys)</td><td class="mono">Uint8Array</td><td>Fetch and decrypt private content</td></tr>
-                  <tr><td class="mono">retrieveContentAuto(cid, keys?)</td><td class="mono">Uint8Array</td><td>Auto-detect visibility; tries decryption first</td></tr>
-                  <tr><td class="mono">distributeContent(cids, pub, keys)</td><td class="mono">void</td><td>Push CIDs to up to 10 weighted-random providers</td></tr>
+                  <tr><td class="mono">storeContentPublic(data, mime, name?)</td><td class="mono">ContentHandle</td><td>Store unencrypted content; anyone with the CID can read it</td></tr>
+                  <tr><td class="mono">storeContent(data, mime, keys, name?)</td><td class="mono">ContentHandle</td><td>Store AES-256-GCM encrypted content</td></tr>
+                  <tr><td class="mono">storeJSON(data, keys)</td><td class="mono">string (CID)</td><td>Serialise + encrypt a JSON value; returns CID directly</td></tr>
+                  <tr><td class="mono">storeText(text, keys)</td><td class="mono">string (CID)</td><td>Encrypt a text string (HTML, CSS, JS, markdown); returns CID directly</td></tr>
+                  <tr><td class="mono">retrieveContentPublic(cid)</td><td class="mono">Uint8Array</td><td>Fetch unencrypted content; throws if not found</td></tr>
+                  <tr><td class="mono">retrieveContent(cid, keys)</td><td class="mono">Uint8Array</td><td>Fetch and decrypt private content; throws if decryption fails</td></tr>
+                  <tr><td class="mono">retrieveContentAuto(cid, keys?)</td><td class="mono">{ data, mimeType, size, wasEncrypted } | undefined</td><td>Auto-detect visibility; tries decryption first, falls back to public</td></tr>
+                  <tr><td class="mono">retrieveJSON&lt;T&gt;(cid, keys)</td><td class="mono">T | undefined</td><td>Decrypt and parse a stored JSON value</td></tr>
+                  <tr><td class="mono">retrieveText(cid, keys)</td><td class="mono">string | undefined</td><td>Decrypt and return a stored text string</td></tr>
+                  <tr><td class="mono">distributeContent(cids, pub, keys)</td><td class="mono">{ providers, error? }</td><td>Push CIDs to up to 10 weighted-random providers; pass both meta CID and contentCid</td></tr>
                   <tr><td class="mono">deleteContent(cids, pub, keys)</td><td class="mono">void</td><td>Delete locally and broadcast signed delete to all holders</td></tr>
-                  <tr><td class="mono">send(from, to, amount, keys)</td><td class="mono">AccountBlock</td><td>Send UNIT — amount in milli-UNIT</td></tr>
-                  <tr><td class="mono">deployContract(name, code, pub, keys)</td><td class="mono">{ contractId }</td><td>Deploy a JS sandbox contract</td></tr>
-                  <tr><td class="mono">callContract(id, method, args, pub, keys)</td><td class="mono">any</td><td>Call a contract method; returns the function's return value</td></tr>
-                  <tr><td class="mono">registerStorage(pub, capacityGB, keys)</td><td class="mono">void</td><td>Register as a provider; starts automatic heartbeats and daily rewards</td></tr>
+                  <tr><td class="mono">replaceContent(oldCids, newCids, pub, keys)</td><td class="mono">{ providers, error? }</td><td>Drop old blocks from all providers and cache new version in their place</td></tr>
+                </tbody>
+              </table>
+              <h4>Transfers</h4>
+              <table class="help-table">
+                <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+                <tbody>
+                  <tr><td class="mono">send(from, to, amount, keys)</td><td class="mono">{ block?, error? }</td><td>Send UNIT; amount is in milli-UNIT (use parseUNIT() to convert)</td></tr>
+                </tbody>
+              </table>
+              <h4>Accounts</h4>
+              <table class="help-table">
+                <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+                <tbody>
+                  <tr><td class="mono">registerKey(pub, keys)</td><td class="mono">void</td><td>Load a local key so the node auto-receives transfers and auto-votes</td></tr>
+                  <tr><td class="mono">getBalance(pub)</td><td class="mono">number</td><td>Balance in milli-UNIT</td></tr>
+                  <tr><td class="mono">getBalanceFormatted(pub)</td><td class="mono">string</td><td>Human-readable balance e.g. <code>'1,000.000 UNIT'</code></td></tr>
+                  <tr><td class="mono">getAccount(pub)</td><td class="mono">Account | undefined</td><td>Account object by public key</td></tr>
+                  <tr><td class="mono">getAccountByUsername(name)</td><td class="mono">Account | undefined</td><td>Account object by username</td></tr>
+                  <tr><td class="mono">resolveAddress(identifier)</td><td class="mono">string | undefined</td><td>Resolve username or public key to a public key</td></tr>
+                </tbody>
+              </table>
+              <h4>Smart Contracts</h4>
+              <table class="help-table">
+                <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+                <tbody>
+                  <tr><td class="mono">deployContract(name, code, pub, keys)</td><td class="mono">{ contractId?, error? }</td><td>Deploy a JS sandbox contract; ID is permanent (block hash)</td></tr>
+                  <tr><td class="mono">callContract(id, method, args, pub, keys)</td><td class="mono">{ block?, error? }</td><td>Call a contract method; result delivered via contract:executed event</td></tr>
+                  <tr><td class="mono">getContractState(id)</td><td class="mono">Record&lt;string,unknown&gt; | undefined</td><td>Read contract state locally — no network round-trip</td></tr>
+                  <tr><td class="mono">listContracts()</td><td class="mono">{ id, name, owner, deployedAt }[]</td><td>All contracts on the local ledger</td></tr>
+                </tbody>
+              </table>
+              <h4>Storage Ledger</h4>
+              <table class="help-table">
+                <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+                <tbody>
+                  <tr><td class="mono">registerStorage(pub, capacityGB, keys)</td><td class="mono">{ success, error? }</td><td>Register as a provider; starts automatic heartbeats and daily rewards</td></tr>
+                  <tr><td class="mono">deregisterStorage(pub, keys)</td><td class="mono">{ success, error? }</td><td>Remove yourself from the storage ledger (sets capacityGB = 0)</td></tr>
+                  <tr><td class="mono">getStorageProviders()</td><td class="mono">StorageProvider[]</td><td>All active providers sorted by score descending</td></tr>
+                  <tr><td class="mono">getStorageProvider(pub)</td><td class="mono">StorageProvider | undefined</td><td>Single provider's live profile</td></tr>
+                  <tr><td class="mono">broadcastHeartbeat(pub, keys)</td><td class="mono">{ success, error? }</td><td>Manually fire a heartbeat block (normally automatic every ~4 h)</td></tr>
+                  <tr><td class="mono">issueStorageReward()</td><td class="mono">void</td><td>Manually claim today's storage reward if eligible (normally automatic once/day)</td></tr>
+                </tbody>
+              </table>
+              <h4>Block Explorer</h4>
+              <table class="help-table">
+                <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+                <tbody>
+                  <tr><td class="mono">getBlock(hash)</td><td class="mono">AccountBlock | undefined</td><td>Block by hash</td></tr>
+                  <tr><td class="mono">getChain(pub)</td><td class="mono">AccountBlock[]</td><td>Full account chain in order</td></tr>
+                  <tr><td class="mono">getRecentBlocks(limit?)</td><td class="mono">AccountBlock[]</td><td>Last N blocks across all accounts (default 50)</td></tr>
+                  <tr><td class="mono">getLedgerStats()</td><td class="mono">DAGStats</td><td>{ network, totalAccounts, totalBlocks, pendingBlocks, confirmedBlocks, tps }</td></tr>
                 </tbody>
               </table>
               <h4>Events</h4>
-<pre class="help-pre">node.<span class="hp-fn">on</span>(<span class="hp-str">'block'</span>,   (block)   =&gt; { <span class="hp-cmt">/* new block confirmed on any local account */</span> });
-node.<span class="hp-fn">on</span>(<span class="hp-str">'receive'</span>, (block)   =&gt; { <span class="hp-cmt">/* incoming transfer to a local account */</span> });
-node.<span class="hp-fn">on</span>(<span class="hp-str">'peer'</span>,    (peerId)  =&gt; { <span class="hp-cmt">/* new peer connected */</span> });
-node.<span class="hp-fn">on</span>(<span class="hp-str">'account'</span>, (account) =&gt; { <span class="hp-cmt">/* account data updated from network */</span> });</pre>
+<pre class="help-pre"><span class="hp-cmt">// Ledger</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'block:added'</span>,            (block)   =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'block:confirmed'</span>,        (block)   =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'block:conflict'</span>,         ({ a, b }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'block:rejected'</span>,         (block)   =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'account:synced'</span>,         (account) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'vote:received'</span>,          (vote)    =&gt; { });
+
+<span class="hp-cmt">// Smart contracts</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'contract:deployed'</span>,      ({ contractId, name }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'contract:executed'</span>,      ({ contractId, method, result }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'contract:error'</span>,         ({ contractId, error }) =&gt; { });
+
+<span class="hp-cmt">// Storage ledger</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:registered'</span>,     ({ pub, capacityGB }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:deregistered'</span>,   ({ pub }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:heartbeat-sent'</span>, ({ pub }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:reward-issued'</span>,  ({ pub, amount, epochDay }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:cached'</span>,         ({ pub, cid }) =&gt; { });  <span class="hp-cmt">// a provider cached a block</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:deleted'</span>,        ({ cid }) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:replaced'</span>,       ({ oldCid, newCid, pub }) =&gt; { });
+
+<span class="hp-cmt">// Messaging / receive</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'inbox:signal'</span>,           (signal) =&gt; { });  <span class="hp-cmt">// incoming transfer notification</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'auto:received'</span>,          (block)  =&gt; { });  <span class="hp-cmt">// receive block auto-claimed</span>
+
+<span class="hp-cmt">// Network</span>
+api.<span class="hp-fn">on</span>(<span class="hp-str">'peer:connected'</span>,         (peerId) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'peer:disconnected'</span>,      (peerId) =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'node:started'</span>,           () =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'node:stopped'</span>,           () =&gt; { });
+api.<span class="hp-fn">on</span>(<span class="hp-str">'resync'</span>,                  () =&gt; { });</pre>
+              <h4>ContentHandle type</h4>
+<pre class="help-pre"><span class="hp-kw">interface</span> ContentHandle {
+  cid:          string;   <span class="hp-cmt">// meta CID — use in block.contentCid or contract state</span>
+  contentCid?:  string;   <span class="hp-cmt">// inner content CID — pass alongside cid to distributeContent</span>
+  size:         number;   <span class="hp-cmt">// original byte length before encryption</span>
+  mimeType:     string;
+  timestamp:    number;   <span class="hp-cmt">// Unix ms</span>
+}</pre>
             </div>
           </div>
 
@@ -1998,8 +2260,8 @@ node.<span class="hp-fn">on</span>(<span class="hp-str">'account'</span>, (accou
                 <tr><td class="mono">pqKemPub / pqKemPriv</td><td>ML-KEM-768 (Kyber)</td><td>Key encapsulation (quantum-safe, FIPS 203)</td></tr>
               </tbody>
             </table>
-            <p>Every block carries both an ECDSA <code>signature</code> and an ML-DSA-65 <code>pqSignature</code>. Both are verified on receipt. Legacy accounts without PQ keys are fully backward-compatible — the PQ signature field is optional.</p>
-            <p>Implemented in pure TypeScript via <code>@noble/post-quantum</code> — no WASM required.</p>
+            <p>Every block carries both an ECDSA <code>signature</code> and an ML-DSA-65 <code>pqSignature</code>. Both are verified on receipt. Legacy accounts without PQ keys are fully backward-compatible - the PQ signature field is optional.</p>
+            <p>Implemented in pure TypeScript via <code>@noble/post-quantum</code> - no WASM required.</p>
           </div>
 
           <!-- PIN BACKOFF -->
@@ -2019,7 +2281,7 @@ node.<span class="hp-fn">on</span>(<span class="hp-str">'account'</span>, (accou
                 <tr><td>10+</td><td>24 hours</td></tr>
               </tbody>
             </table>
-            <p>The counter is stored in <strong>IndexedDB</strong> (fast local check) and inside the <strong>face-key-encrypted blob</strong> (transfers to new devices; cannot be cleared without face auth). When the threshold is crossed, a lockout notice is broadcast via GossipSub — other nodes delay processing blocks from the locked account.</p>
+            <p>The counter is stored in <strong>IndexedDB</strong> (fast local check) and inside the <strong>face-key-encrypted blob</strong> (transfers to new devices; cannot be cleared without face auth). When the threshold is crossed, a lockout notice is broadcast via GossipSub - other nodes delay processing blocks from the locked account.</p>
           </div>
 
           <!-- SECURITY -->
@@ -2028,18 +2290,18 @@ node.<span class="hp-fn">on</span>(<span class="hp-str">'account'</span>, (accou
             <table class="help-table">
               <thead><tr><th>Layer</th><th>Protection</th></tr></thead>
               <tbody>
-                <tr><td>Transport</td><td>Noise protocol (libp2p) — all peer connections encrypted + authenticated</td></tr>
+                <tr><td>Transport</td><td>Noise protocol (libp2p) - all peer connections encrypted + authenticated</td></tr>
                 <tr><td>Blocks</td><td>ECDSA P-256 + ML-DSA-65 hybrid signatures on every block; both verified on receipt</td></tr>
                 <tr><td>Key storage</td><td>AES-256-GCM(face key) &#8594; AES-256-GCM(PIN key) double encryption</td></tr>
-                <tr><td>Key blob integrity</td><td><code>linkedAnchor</code> SHA-256 stored on-chain — tamper detection on recovery</td></tr>
-                <tr><td>Face descriptor</td><td>PIN-encrypted canonical in blob; live scan used only for identity check, not key derivation</td></tr>
+                <tr><td>Key blob integrity</td><td><code>linkedAnchor</code> SHA-256 stored on-chain - tamper detection on recovery</td></tr>
+                <tr><td>Face descriptor</td><td>Encrypted canonical in blob; live scan required as identity confirmation - both factors enforced</td></tr>
                 <tr><td>PIN brute force</td><td>PBKDF2-SHA-512 600K iterations + exponential backoff + decentralised GossipSub lockout</td></tr>
-                <tr><td>Votes</td><td>ECDSA-signed + balance proofs (<code>chainHeadHash</code>); verified client-side — relay cannot fabricate votes</td></tr>
+                <tr><td>Votes</td><td>ECDSA-signed + balance proofs (<code>chainHeadHash</code>); verified client-side - relay cannot fabricate votes</td></tr>
                 <tr><td>Inbox signals</td><td>ECDSA-signed by sender; recipients verify before accepting</td></tr>
-                <tr><td>Smart contracts</td><td>Web Worker sandbox — no DOM/network/storage access; 3 s execution timeout</td></tr>
+                <tr><td>Smart contracts</td><td>Web Worker sandbox - no DOM/network/storage access; 3 s execution timeout</td></tr>
                 <tr><td>Content integrity</td><td>SHA-256(fetched bytes) verified against CID on every retrieve and spot-check</td></tr>
-                <tr><td>Delete ownership</td><td>Uploader public key stored per-CID — only original uploader can broadcast a valid delete</td></tr>
-                <tr><td>Receipt gaming</td><td>Self-signed receipts (provider = requester) are discarded — providers cannot inflate their own score</td></tr>
+                <tr><td>Delete ownership</td><td>Uploader public key stored per-CID - only original uploader can broadcast a valid delete</td></tr>
+                <tr><td>Receipt gaming</td><td>Self-signed receipts (provider = requester) are discarded - providers cannot inflate their own score</td></tr>
                 <tr><td>Reward double-issue</td><td>Chain scan before reward block creation prevents dual-device double-issue</td></tr>
                 <tr><td>Balance overflow</td><td><code>Number.isSafeInteger</code> validation on all amounts</td></tr>
                 <tr><td>XSS</td><td>All peer-supplied data HTML-escaped before rendering</td></tr>
@@ -2078,11 +2340,11 @@ node.<span class="hp-fn">on</span>(<span class="hp-str">'account'</span>, (accou
                 <tr><td>Face descriptor</td><td>128 dimensions, 3-sample average, quantized to 0.05 bins</td></tr>
                 <tr><td>PIN brute-force hardening</td><td>600K PBKDF2 iterations &#8776; 300 ms/attempt &#8594; ~50 min offline for 10K PINs</td></tr>
                 <tr><td>Consensus</td><td>Optimistic confirmation + conflict-only stake-weighted voting (&gt; 2/3, 10 s timeout)</td></tr>
-                <tr><td>P2P</td><td>libp2p — WebRTC, WebSocket, circuit relay v2, GossipSub, Kademlia DHT</td></tr>
-                <tr><td>Content storage</td><td>@sinclair/smoke — SHA-256 CIDs, AES-256-GCM, HTTP-over-WebRTC</td></tr>
+                <tr><td>P2P</td><td>libp2p - WebRTC, WebSocket, circuit relay v2, GossipSub, Kademlia DHT</td></tr>
+                <tr><td>Content storage</td><td>@sinclair/smoke - SHA-256 CIDs, AES-256-GCM, HTTP-over-WebRTC</td></tr>
                 <tr><td>Smoke signaling</td><td>GossipSub topics (primary); relay /smoke-hub WebSocket (fallback)</td></tr>
                 <tr><td>Storage scoring</td><td>Uptime &#215; latency rank &#215; spot-check pass rate, updated per receipt</td></tr>
-                <tr><td>Local persistence</td><td>IndexedDB — blocks, accounts, keyblobs, contracts, content</td></tr>
+                <tr><td>Local persistence</td><td>IndexedDB - blocks, accounts, keyblobs, contracts, content</td></tr>
                 <tr><td>Contract sandbox</td><td>Web Worker, 3 s execution timeout, no DOM/network/storage</td></tr>
                 <tr><td>Max safe balance</td><td>Number.MAX_SAFE_INTEGER milli-UNIT</td></tr>
                 <tr><td>Storage reward interval</td><td>24 hours (1 reward block per epoch per device)</td></tr>
@@ -2105,7 +2367,8 @@ node.<span class="hp-fn">on</span>(<span class="hp-str">'account'</span>, (accou
             '#helpContent #help-contracts-sandbox, #helpContent #help-contracts-state, ' +
             '#helpContent #help-contracts-token, #helpContent #help-contracts-nft, ' +
             '#helpContent #help-api-store, #helpContent #help-api-retrieve, ' +
-            '#helpContent #help-api-distribute, #helpContent #help-api-ref'
+            '#helpContent #help-api-distribute, #helpContent #help-api-replace, ' +
+            '#helpContent #help-api-ref'
           ));
 
           function setActive(id) {

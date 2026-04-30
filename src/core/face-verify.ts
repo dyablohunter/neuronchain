@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import * as faceapi from '@vladmandic/face-api';
+import { bytesToHex } from './dag-block';
 
 let modelsLoaded = false;
 
@@ -210,16 +211,13 @@ export function quantizeDescriptor(descriptor: number[]): number[] {
 
 /**
  * Derive a stable AES encryption key from a quantized face descriptor.
- * Uses PBKDF2 with the quantized descriptor as the password
- * and a fixed salt derived from the descriptor itself.
+ * Salt is per-account: "neuronchain-face-v2:<accountPub>" - prevents cross-account
+ * rainbow tables even if two accounts share similar descriptors.
  */
-export async function deriveFaceKey(quantized: number[]): Promise<CryptoKey> {
+export async function deriveFaceKey(quantized: number[], accountPub: string): Promise<CryptoKey> {
   const descriptorStr = quantized.map((v) => v.toFixed(4)).join(',');
   const encoded = new TextEncoder().encode(descriptorStr);
-
-  // Use first 16 bytes of SHA-256 of descriptor as salt (deterministic)
-  const saltHash = await crypto.subtle.digest('SHA-256', encoded);
-  const salt = new Uint8Array(saltHash).slice(0, 16);
+  const salt = new TextEncoder().encode(`neuronchain-face-v2:${accountPub}`);
 
   const keyMaterial = await crypto.subtle.importKey(
     'raw', encoded, 'PBKDF2', false, ['deriveKey'],
@@ -232,6 +230,27 @@ export async function deriveFaceKey(quantized: number[]): Promise<CryptoKey> {
     false,
     ['encrypt', 'decrypt'],
   );
+}
+
+/**
+ * Derive 32 raw bytes from a quantized face descriptor using PBKDF2-SHA-256.
+ * Uses the same per-account salt as deriveFaceKey.
+ */
+export async function deriveFaceRawBits(quantized: number[], accountPub: string): Promise<Uint8Array> {
+  const descriptorStr = quantized.map((v) => v.toFixed(4)).join(',');
+  const encoded = new TextEncoder().encode(descriptorStr);
+  const salt = new TextEncoder().encode(`neuronchain-face-v2:${accountPub}`);
+
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', encoded, 'PBKDF2', false, ['deriveBits'],
+  );
+
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    256,
+  );
+  return new Uint8Array(bits);
 }
 
 /**
@@ -249,7 +268,7 @@ export async function encryptWithFaceKey(data: string, faceKey: CryptoKey): Prom
   const combined = new Uint8Array(iv.length + new Uint8Array(ciphertext).length);
   combined.set(iv);
   combined.set(new Uint8Array(ciphertext), iv.length);
-  return btoa(String.fromCharCode(...combined));
+  return uint8ToBase64(combined);
 }
 
 /**
@@ -258,7 +277,9 @@ export async function encryptWithFaceKey(data: string, faceKey: CryptoKey): Prom
  */
 export async function decryptWithFaceKey(encrypted: string, faceKey: CryptoKey): Promise<string | null> {
   try {
-    const combined = new Uint8Array(atob(encrypted).split('').map((c) => c.charCodeAt(0)));
+    const raw = atob(encrypted);
+    const combined = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) combined[i] = raw.charCodeAt(i);
     const iv = combined.slice(0, 12);
     const ciphertext = combined.slice(12);
     const decrypted = await crypto.subtle.decrypt(
@@ -287,13 +308,20 @@ export async function hashDescriptor(descriptor: number[]): Promise<string> {
   const str = descriptor.map((v) => v.toFixed(4)).join(',');
   const encoded = new TextEncoder().encode(str);
   const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
-  return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return bytesToHex(new Uint8Array(hashBuffer));
 }
 
 // ──── Helpers ────
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Encode Uint8Array to base64 without spread operator (safe for large arrays). */
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 export { MATCH_THRESHOLD, ENROLLMENT_SAMPLES, QUANT_BIN };

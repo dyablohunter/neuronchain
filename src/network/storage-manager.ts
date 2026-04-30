@@ -43,7 +43,7 @@ export interface StorageReceipt {
   timestamp: number;
   /** ECDSA signature by requesterPub over canonical payload */
   signature: string;
-  /** Smoke Hub address of the provider — other nodes use this for Http.fetch fallback */
+  /** Smoke Hub address of the provider - other nodes use this for Http.fetch fallback */
   providerSmokeAddr?: string;
   /** 1-indexed response rank among all providers checked in this spot-check round (1 = fastest) */
   responseRank?: number;
@@ -59,7 +59,7 @@ export interface CacheRequest {
   /** Public keys of providers selected to cache this CID */
   targetProviders: string[];
   uploaderPub: string;
-  /** Smoke Hub address of the uploader — providers use Http.fetch to pull blocks via WebRTC */
+  /** Smoke Hub address of the uploader - providers use Http.fetch to pull blocks via WebRTC */
   uploaderSmokeAddr?: string;
   timestamp: number;
   signature: string;
@@ -71,6 +71,24 @@ export interface DeleteRequest {
   ownerPub: string;
   timestamp: number;
   /** ECDSA signature by ownerPub over `delete:<cids.join(',')>:<ownerPub>:<timestamp>` */
+  signature: string;
+}
+
+export interface ReplaceRequest {
+  [key: string]: unknown;
+  /** Primary old CID being replaced */
+  oldCid: string;
+  /** Additional old CIDs to drop (e.g. old inner contentCid) */
+  oldAdditionalCids?: string[];
+  /** New primary CID to cache */
+  newCid: string;
+  /** Additional new CIDs to cache (e.g. new inner contentCid) */
+  newAdditionalCids?: string[];
+  ownerPub: string;
+  /** Smoke Hub address of the owner - providers use this to fetch new blocks via WebRTC */
+  uploaderSmokeAddr?: string;
+  timestamp: number;
+  /** ECDSA signature by ownerPub over `replace:<oldCid>:<newCid>:<ownerPub>:<timestamp>` */
   signature: string;
 }
 
@@ -90,7 +108,7 @@ export class StorageManager extends EventEmitter {
   /** CIDs we're tracking for redundancy: cid → { owner, confirmedProviders, additionalCids, lastDistributed } */
   private trackedCids: Map<string, { ownerPub: string; confirmedProviders: Set<string>; additionalCids: string[]; lastDistributed: number }> = new Map();
 
-  /** Known providers for each CID (from receipts) — used for targeted retrieval */
+  /** Known providers for each CID (from receipts) - used for targeted retrieval */
   private cidToSmokeAddrs: Map<string, Set<string>> = new Map();
 
   /** CIDs that failed distribution (no providers at upload time): primaryCid → { ownerPub, additionalCids } */
@@ -113,12 +131,23 @@ export class StorageManager extends EventEmitter {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
 
+    // P7: load persisted trackedCids from IDB so redundancy checks survive restarts
+    const persisted = await this.net.loadTrackedCids();
+    for (const rec of persisted) {
+      this.trackedCids.set(rec.cid, {
+        ownerPub: rec.ownerPub,
+        confirmedProviders: new Set(rec.confirmedProviders),
+        additionalCids: rec.additionalCids,
+        lastDistributed: rec.lastDistributed,
+      });
+    }
+
     // Watch for incoming cache requests from other nodes.
-    // Every node — not just providers — registers the uploader's smoke address so
+    // Every node - not just providers - registers the uploader's smoke address so
     // retrieve() can fetch directly from the uploader via WebRTC if needed.
     this.net.watchCacheRequests(async (req) => {
       const r = req as unknown as CacheRequest;
@@ -129,9 +158,14 @@ export class StorageManager extends EventEmitter {
     // Watch for retrieval receipts from peers
     this.net.watchStorageReceipts((receipt) => this.handleReceipt(receipt as unknown as StorageReceipt));
 
-    // Watch for content delete requests — any node that holds the blocks drops them
+    // Watch for content delete requests - any node that holds the blocks drops them
     this.net.watchDeleteRequests(async (req) => {
       await this.handleDeleteRequest(req as unknown as DeleteRequest);
+    });
+
+    // Watch for content replace requests - providers holding old content swap to the new version
+    this.net.watchReplaceRequests(async (req) => {
+      await this.handleReplaceRequest(req as unknown as ReplaceRequest);
     });
 
     // Retry pending CIDs whenever a new provider registers (covers the case where
@@ -192,7 +226,8 @@ export class StorageManager extends EventEmitter {
 
   async broadcastHeartbeat(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
     const smokeAddr = await this.store.getSmokeHostname();
-    const result = await this.ledger.createStorageHeartbeat(pub, keys, smokeAddr);
+    const actualStoredBytes = this.store.isStarted() ? await this.store.storageUsedBytes() : 0;
+    const result = await this.ledger.createStorageHeartbeat(pub, keys, smokeAddr, actualStoredBytes);
     if (!result.block) return { success: false, error: result.error };
     const submitResult = await this.submitBlock(result.block);
     if (submitResult.success) {
@@ -235,14 +270,20 @@ export class StorageManager extends EventEmitter {
    */
   selectProviders(count: number): StorageProvider[] {
     const localDeviceId = getDeviceId();
-    // Exclude providers registered on this physical device — their content is already local.
+    // Exclude providers registered on this physical device - their content is already local.
     // Providers on other devices are eligible even if the same account key is loaded here.
-    const candidates = this.ledger.getStorageProviders()
-      .filter(p => !p.deviceId || p.deviceId !== localDeviceId);
+    const allProviders = this.ledger.getStorageProviders();
+    const candidates = allProviders.filter(p => !p.deviceId || p.deviceId !== localDeviceId);
+
+    console.log(`[StorageManager] selectProviders: ${allProviders.length} total, ${candidates.length} remote candidates (want ${count})`);
+    if (candidates.length > 0) {
+      console.log(`[StorageManager] selectProviders candidates:`, candidates.map(p => `${p.pub.slice(0, 12)}… cap=${p.capacityGB}GB score=${p.score.toFixed(3)}`));
+    }
 
     if (candidates.length === 0) return [];
 
-    const weights = candidates.map(p => Math.max(0.01, p.capacityGB * Math.max(0.1, p.score)));
+    // A6: cap contribution at 100GB to prevent one large provider monopolising selection
+    const weights = candidates.map(p => Math.max(0.01, Math.min(p.capacityGB, 100) * Math.max(0.1, p.score)));
     const totalWeight = weights.reduce((a, b) => a + b, 0);
     const take = Math.min(count, candidates.length);
 
@@ -294,11 +335,11 @@ export class StorageManager extends EventEmitter {
 
       const confirmed = tracked.confirmedProviders.size;
       if (confirmed === 0) {
-        // No confirmed providers — full redistribution
+        // No confirmed providers - full redistribution
         tracked.lastDistributed = now;
         await this.distributeContent(cid, tracked.ownerPub, keys, tracked.additionalCids);
       } else if (confirmed < REDUNDANCY_TARGET / 2) {
-        // Under-replicated (below half target) — top up with additional providers,
+        // Under-replicated (below half target) - top up with additional providers,
         // excluding those already confirmed so we don't ask them to re-cache.
         const additional = this.selectProviders(REDUNDANCY_TARGET).filter(
           p => !tracked.confirmedProviders.has(p.pub),
@@ -334,8 +375,10 @@ export class StorageManager extends EventEmitter {
     keys: KeyPair,
     additionalCids: string[] = [],
   ): Promise<{ providers: string[]; error?: string }> {
+    console.log(`[StorageManager] distributeContent: cid=${cid.slice(0, 20)}… additionalCids=${additionalCids.length} uploader=${uploaderPub.slice(0, 12)}…`);
     const providers = this.selectProviders(REDUNDANCY_TARGET);
     if (providers.length === 0) {
+      console.warn(`[StorageManager] distributeContent: no remote providers — storing locally only`);
       this.pendingCids.set(cid, { ownerPub: uploaderPub, additionalCids });
       return { providers: [], error: 'No storage providers available - content stored locally only' };
     }
@@ -346,6 +389,7 @@ export class StorageManager extends EventEmitter {
 
     // Include our smoke Hub address so providers can Http.fetch blocks via WebRTC
     const uploaderSmokeAddr = await this.store.getSmokeHostname();
+    console.log(`[StorageManager] distributeContent: uploaderSmokeAddr=${uploaderSmokeAddr ?? '(none)'} publishing CacheRequest to ${providers.length} providers: ${providers.map(p => p.pub.slice(0, 12)).join(', ')}`);
 
     const request: CacheRequest = {
       cid,
@@ -359,7 +403,9 @@ export class StorageManager extends EventEmitter {
 
     this.net.publishCacheRequest(request);
 
-    this.trackedCids.set(cid, { ownerPub: uploaderPub, confirmedProviders: new Set(), additionalCids, lastDistributed: Date.now() });
+    const entry = { ownerPub: uploaderPub, confirmedProviders: new Set<string>(), additionalCids, lastDistributed: Date.now() };
+    this.trackedCids.set(cid, entry);
+    this.net.saveTrackedCid({ cid, ownerPub: uploaderPub, confirmedProviders: [], additionalCids, lastDistributed: entry.lastDistributed });
 
     console.log(`[StorageManager] Cache request published for ${cid.slice(0, 16)}... (+${additionalCids.length} extra) to ${providers.length} providers`);
     return { providers: providers.map(p => p.pub) };
@@ -370,6 +416,7 @@ export class StorageManager extends EventEmitter {
   private async handleCacheRequest(req: CacheRequest): Promise<void> {
     // Check if we are one of the target providers
     const myProviderPub = Array.from(this.localKeys.keys()).find(pub => req.targetProviders.includes(pub));
+    console.log(`[StorageManager] handleCacheRequest: cid=${req.cid.slice(0, 20)}… targets=${req.targetProviders.length} additionalCids=${req.additionalCids?.length ?? 0} iAmTarget=${!!myProviderPub}`);
     if (!myProviderPub) {
       return;
     }
@@ -400,14 +447,17 @@ export class StorageManager extends EventEmitter {
     }
 
     // Pin content via smoke Http (HTTP-over-WebRTC). The uploader's smoke Hub address
-    // is in req.uploaderSmokeAddr — smoke's Net module uses the hub to exchange WebRTC
+    // is in req.uploaderSmokeAddr - smoke's Net module uses the hub to exchange WebRTC
     // ICE candidates and establish a direct data-channel connection to the uploader.
     if (!this.store.isStarted()) { console.warn('[StorageManager] SmokeStore not started, cannot cache'); return; }
     try {
       const start = Date.now();
       const allCids = [req.cid, ...(Array.isArray(req.additionalCids) ? req.additionalCids : [])];
+      console.log(`[StorageManager] handleCacheRequest: starting cache of ${allCids.length} CID(s) via smokeAddr=${req.uploaderSmokeAddr ?? '(none)'}`);
       for (const c of allCids) {
+        console.log(`[StorageManager] handleCacheRequest: caching ${c.slice(0, 20)}…`);
         await this.store.cache(c, 600_000, req.uploaderSmokeAddr as string | undefined, req.uploaderPub as string | undefined);
+        console.log(`[StorageManager] handleCacheRequest: cached ${c.slice(0, 20)}… OK`);
       }
       const latencyMs = Date.now() - start;
       console.log(`[StorageManager] Cached ${req.cid.slice(0, 16)}... in ${latencyMs}ms`);
@@ -474,16 +524,154 @@ export class StorageManager extends EventEmitter {
       await this.store.deleteBlock(cid);
     }
     // Remove from tracked CIDs so we stop retrying distribution
-    if (req.cids.length > 0) this.trackedCids.delete(req.cids[0]);
+    if (req.cids.length > 0) {
+      const primaryCid = req.cids[0];
+      this.trackedCids.delete(primaryCid);
+      this.net.deleteTrackedCid(primaryCid);
+    }
+  }
+
+  // ── Replace request (owner initiates) ────────────────────────────────────
+
+  /**
+   * Replace content across the network. Broadcasts a signed ReplaceRequest so
+   * every provider holding the old CID drops it and caches the new CID.
+   * Also redistributes the new CID to up to REDUNDANCY_TARGET providers.
+   * Call storeContent / storeContentPublic first to obtain newCid.
+   */
+  async replaceContent(
+    oldCid: string,
+    newCid: string,
+    ownerPub: string,
+    keys: KeyPair,
+    oldAdditionalCids: string[] = [],
+    newAdditionalCids: string[] = [],
+  ): Promise<{ providers: string[]; error?: string }> {
+    const ts = Date.now();
+    const payload = `replace:${oldCid}:${newCid}:${ownerPub}:${ts}`;
+    const signature = await signData(payload, keys);
+    const uploaderSmokeAddr = await this.store.getSmokeHostname();
+
+    const request: ReplaceRequest = {
+      oldCid,
+      oldAdditionalCids: oldAdditionalCids.length > 0 ? oldAdditionalCids : undefined,
+      newCid,
+      newAdditionalCids: newAdditionalCids.length > 0 ? newAdditionalCids : undefined,
+      ownerPub,
+      uploaderSmokeAddr,
+      timestamp: ts,
+      signature,
+    };
+    this.net.publishReplaceRequest(request as unknown as Record<string, unknown>);
+
+    // Remove old tracked CID tracking so retries don't re-distribute it
+    this.trackedCids.delete(oldCid);
+    this.net.deleteTrackedCid(oldCid);
+    // Transfer known smoke addresses for the old CID to the new one
+    const oldAddrs = this.cidToSmokeAddrs.get(oldCid);
+    if (oldAddrs) {
+      this.cidToSmokeAddrs.delete(oldCid);
+      const newAddrs = this.cidToSmokeAddrs.get(newCid) ?? new Set<string>();
+      for (const a of oldAddrs) newAddrs.add(a);
+      this.cidToSmokeAddrs.set(newCid, newAddrs);
+    }
+
+    // Distribute new content to providers (CacheRequest path)
+    const result = await this.distributeContent(newCid, ownerPub, keys, newAdditionalCids);
+    console.log(`[StorageManager] Replace broadcast: ${oldCid.slice(0, 16)}… → ${newCid.slice(0, 16)}… (${result.providers.length} providers)`);
+    return result;
+  }
+
+  // ── Replace request handling (provider side) ──────────────────────────────
+
+  private async handleReplaceRequest(req: ReplaceRequest): Promise<void> {
+    if (!req.oldCid || !req.newCid || !req.ownerPub || !req.signature) return;
+
+    const payload = `replace:${req.oldCid}:${req.newCid}:${req.ownerPub}:${req.timestamp}`;
+    try {
+      const verified = await verifySignature(req.signature, req.ownerPub);
+      if (verified !== payload) {
+        console.warn('[StorageManager] Rejected replace request - invalid signature');
+        return;
+      }
+    } catch {
+      console.warn('[StorageManager] Rejected replace request - signature verification failed');
+      return;
+    }
+
+    if (!this.store.isStarted()) return;
+
+    const oldCids = [req.oldCid, ...(Array.isArray(req.oldAdditionalCids) ? req.oldAdditionalCids : [])];
+    const newCids = [req.newCid, ...(Array.isArray(req.newAdditionalCids) ? req.newAdditionalCids : [])];
+
+    // Determine whether we are a provider that had the old content cached
+    const myProviderPub = Array.from(this.localKeys.keys()).find(pub => {
+      const provider = this.ledger.storageProviders.get(pub);
+      return provider && provider.capacityGB > 0;
+    });
+
+    let wasProvider = false;
+    if (myProviderPub) {
+      const localDeviceId = getDeviceId();
+      const provider = this.ledger.storageProviders.get(myProviderPub);
+      if (provider && (!provider.deviceId || provider.deviceId === localDeviceId)) {
+        wasProvider = await this.store.isCached(req.oldCid);
+      }
+    }
+
+    // Drop all old blocks from local storage (idempotent for non-holders)
+    for (const cid of oldCids) {
+      await this.store.deleteBlock(cid);
+    }
+
+    // Providers that held the old content fetch and cache the new content
+    if (wasProvider && myProviderPub) {
+      try {
+        for (const cid of newCids) {
+          await this.store.cache(cid, 600_000, req.uploaderSmokeAddr as string | undefined, req.ownerPub);
+        }
+        const keys = this.localKeys.get(myProviderPub);
+        if (keys && this.net.running) {
+          const providerSmokeAddr = await this.store.getSmokeHostname();
+          const ts = Date.now();
+          const receiptPayload = `receipt:${req.newCid}:${myProviderPub}:${myProviderPub}:0:true:${ts}`;
+          const sig = await signData(receiptPayload, keys);
+          const receipt: StorageReceipt = {
+            providerPub: myProviderPub, requesterPub: myProviderPub,
+            cid: req.newCid, latencyMs: 0, success: true,
+            timestamp: ts, signature: sig, providerSmokeAddr,
+          };
+          this.net.publishStorageReceipt(receipt);
+        }
+        console.log(`[StorageManager] Provider replaced: ${req.oldCid.slice(0, 16)}… → ${req.newCid.slice(0, 16)}…`);
+        this.emit('storage:replaced', { pub: myProviderPub, oldCid: req.oldCid, newCid: req.newCid });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[StorageManager] Failed to cache replacement ${req.newCid.slice(0, 16)}…: ${msg}`);
+      }
+    }
+
+    // Remove old tracking entry if this node was the owner tracking it
+    const oldTracked = this.trackedCids.get(req.oldCid);
+    if (oldTracked && oldTracked.ownerPub === req.ownerPub) {
+      this.trackedCids.delete(req.oldCid);
+      this.net.deleteTrackedCid(req.oldCid);
+    }
   }
 
   // ── Receipt handling ──────────────────────────────────────────────────────
 
   handleReceipt(receipt: StorageReceipt): void {
+    console.log(`[StorageManager] handleReceipt: cid=${receipt.cid.slice(0, 20)}… provider=${receipt.providerPub.slice(0, 12)}… success=${receipt.success} latency=${receipt.latencyMs}ms`);
     // Mark provider as confirmed for this CID so we stop retrying
     if (receipt.success) {
       const tracked = this.trackedCids.get(receipt.cid);
-      if (tracked) tracked.confirmedProviders.add(receipt.providerPub);
+      if (tracked) {
+        tracked.confirmedProviders.add(receipt.providerPub);
+        console.log(`[StorageManager] handleReceipt: confirmed providers for ${receipt.cid.slice(0, 20)}… = ${tracked.confirmedProviders.size}`);
+        // Persist updated confirmed providers
+        this.net.saveTrackedCid({ cid: receipt.cid, ownerPub: tracked.ownerPub, confirmedProviders: Array.from(tracked.confirmedProviders), additionalCids: tracked.additionalCids, lastDistributed: tracked.lastDistributed });
+      }
       // Register provider's smoke address for general fallback and per-CID targeted retrieval
       if (receipt.providerSmokeAddr) {
         this.store.addPeerFallback(receipt.providerSmokeAddr);
@@ -494,7 +682,7 @@ export class StorageManager extends EventEmitter {
     }
 
     // Self-signed receipts (provider confirming their own cache) only serve as
-    // an acknowledgment — they don't affect score metrics. Only third-party receipts
+    // an acknowledgment - they don't affect score metrics. Only third-party receipts
     // (from spot-checkers) are counted toward latency and pass rate.
     if (receipt.requesterPub === receipt.providerPub) return;
 
@@ -531,7 +719,7 @@ export class StorageManager extends EventEmitter {
    * smoke address. All providers for a given CID are checked in parallel; the response
    * arrival order is tracked so faster providers receive a higher score.
    *
-   * Only third-party-signed receipts (requesterPub ≠ providerPub) affect scores —
+   * Only third-party-signed receipts (requesterPub ≠ providerPub) affect scores -
    * this prevents providers from gaming metrics by self-signing.
    */
   private async runSpotChecks(): Promise<void> {
@@ -567,7 +755,7 @@ export class StorageManager extends EventEmitter {
           // serving tampered or corrupted data. No local copy needed for verification.
           const integrous = await this.store.verifyBlockIntegrity(cid, fetchedBytes);
           if (!integrous) {
-            console.warn(`[StorageManager] CID integrity failure from ${pub.slice(0, 12)}… — block is tampered`);
+            console.warn(`[StorageManager] CID integrity failure from ${pub.slice(0, 12)}… - block is tampered`);
             tracked.confirmedProviders.delete(pub);
             // fall through to receipt with success=false and latencyMs=9999
           } else {
