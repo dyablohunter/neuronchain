@@ -735,9 +735,8 @@ export class NeuronNode extends EventEmitter {
     if (!result.block) return { success: false, error: result.error };
     const submitResult = await this.submitBlock(result.block);
     if (submitResult.success) {
-      // Send an immediate heartbeat so score and actualStoredBytes are initialised
-      // right away rather than waiting for the ~4-hour scheduled interval.
-      setTimeout(() => this.storage.broadcastHeartbeat(pub, keys), 1500);
+      // Gossip live storage stats so all peers see accurate free-space immediately.
+      setTimeout(() => this.storage.broadcastStorageStats(pub, keys).catch(() => {}), 2_000);
     }
     return submitResult;
   }
@@ -755,7 +754,11 @@ export class NeuronNode extends EventEmitter {
   async deregisterStorage(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
     const result = await this.ledger.createStorageDeregister(pub, keys);
     if (!result.block) return { success: false, error: result.error };
-    return this.submitBlock(result.block);
+    const submitResult = await this.submitBlock(result.block);
+    if (submitResult.success) {
+      setTimeout(() => this.storage.broadcastStorageStats(pub, keys).catch(() => {}), 2_000);
+    }
+    return submitResult;
   }
 
   /** Distribute stored CIDs to up to 10 network providers. Pass all CIDs that must be pinned together (e.g. metaCid + contentCid). */

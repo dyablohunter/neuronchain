@@ -225,6 +225,7 @@ function topicBlobRequests(network: string): string { return `neuronchain/${PROT
 function topicPeerAddrs(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/peer-addrs`; }
 function topicRelays(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/relays`; }
 function topicSnapshots(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/snapshots`; }
+function topicFileAnnouncements(network: string): string { return `neuronchain/${PROTOCOL_VERSION}/${network}/files`; }
 
 // localStorage bootstrap cache — addresses only, for buildBootstrapList (pre-DB)
 const KNOWN_RELAYS_KEY = 'neuronchain_known_relays';
@@ -265,6 +266,14 @@ export interface KnownRelayRecord {
   announcerPub: string; // account pub that signed the announcement
 }
 
+export interface FileIndexRecord {
+  cid: string;
+  sizeBytes: number;
+  mimeType?: string;
+  timestamp: number;
+  uploaderPub: string;
+}
+
 interface NeuronDB {
   blocks: AccountBlock & { id?: string; _blockVersion?: number };
   accounts: Record<string, unknown> & { pub: string };
@@ -273,10 +282,17 @@ interface NeuronDB {
   votes: Vote & { id?: string };
   trackedCids: TrackedCidRecord;
   knownRelays: KnownRelayRecord;
+  fileIndex: FileIndexRecord;
 }
 
 async function openNeuronDB(network: string): Promise<IDBPDatabase<NeuronDB>> {
-  return openDB<NeuronDB>(`neuronchain-${network}`, 7, {
+  return openDB<NeuronDB>(`neuronchain-${network}`, 8, {
+    // Another tab has a newer DB version open — close this connection so the
+    // upgrade can proceed instead of blocking indefinitely.
+    blocking() { location.reload(); },
+    // This tab holds an old version while another tab tries to upgrade — close
+    // our connection immediately so the upgrade isn't blocked.
+    blocked() { location.reload(); },
     upgrade(db, oldVersion, _newVersion, transaction) {
       if (oldVersion < 2) {
         const bs = db.createObjectStore('blocks', { keyPath: 'hash' });
@@ -330,6 +346,12 @@ async function openNeuronDB(network: string): Promise<IDBPDatabase<NeuronDB>> {
           db.createObjectStore('knownRelays', { keyPath: 'addr' });
         }
       }
+      // v8: fileIndex — network-wide file announcement index
+      if (oldVersion < 8) {
+        if (!db.objectStoreNames.contains('fileIndex')) {
+          db.createObjectStore('fileIndex', { keyPath: 'cid' });
+        }
+      }
     },
   });
 }
@@ -365,7 +387,12 @@ export class Libp2pNetwork extends EventEmitter {
   private static readonly BUCKET_CAPACITY = 50;
   private static readonly BUCKET_REFILL_PER_SEC = 10;
   private peerAddrTimer: ReturnType<typeof setInterval> | null = null;
+  private relayPingTimer: ReturnType<typeof setInterval> | null = null;
   private peerAddrBroadcastDebounce: ReturnType<typeof setTimeout> | null = null;
+  /** Tracks whether circuit-relay addresses have been successfully obtained at least once */
+  private relayAddrsAvailable = false;
+  /** Timestamp of last proactive relay reconnect attempt — rate-limited to once per 30s */
+  private lastRelayReconnectAttempt = 0;
   /** Our own smoke Hub address - included in peer-addrs broadcasts for peer discovery */
   private smokeAddr = '';
   /** P4: monotonic counter stamped on every IDB account write; enables range-query incremental resync */
@@ -560,6 +587,7 @@ export class Libp2pNetwork extends EventEmitter {
     pubsub.subscribe(topicPeerAddrs(this.network));
     pubsub.subscribe(topicRelays(this.network));
     pubsub.subscribe(topicSnapshots(this.network));
+    pubsub.subscribe(topicFileAnnouncements(this.network));
 
     pubsub.addEventListener('message', (evt) => {
       const msg = evt.detail as { topic: string; data: Uint8Array; from?: { toString(): string } };
@@ -601,6 +629,20 @@ export class Libp2pNetwork extends EventEmitter {
 
     // Heartbeat every 15s as a fallback for any missed events.
     this.peerAddrTimer = setInterval(() => this.broadcastPeerAddrs(), 15_000);
+
+    // Ping relay (WebSocket) peers every 10s so the TCP connection stays alive through
+    // NAT devices that drop idle connections after 20-30s. 10s gives a comfortable
+    // margin. Direct browser↔browser WebRTC connections are excluded (/ws/ filter).
+    const pingService = (this.libp2p.services as Record<string, unknown>).ping as
+      { ping: (peer: unknown) => Promise<number> } | undefined;
+    this.relayPingTimer = setInterval(() => {
+      if (!this.running || !pingService) return;
+      for (const conn of this.libp2p.getConnections()) {
+        if (conn.remoteAddr.toString().includes('/ws')) {
+          pingService.ping(conn.remotePeer).catch(() => {});
+        }
+      }
+    }, 10_000);
 
     // Fallback: if the relay wasn't up during fetchRelayInfo (all retries exhausted),
     // try one more time after the node has been running for 3s. This covers the edge
@@ -650,7 +692,9 @@ export class Libp2pNetwork extends EventEmitter {
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
+    this.relayAddrsAvailable = false;
     if (this.peerAddrTimer) { clearInterval(this.peerAddrTimer); this.peerAddrTimer = null; }
+    if (this.relayPingTimer) { clearInterval(this.relayPingTimer); this.relayPingTimer = null; }
     if (this.peerAddrBroadcastDebounce) { clearTimeout(this.peerAddrBroadcastDebounce); this.peerAddrBroadcastDebounce = null; }
     await this.libp2p?.stop();
     this.trackedPeers.clear();
@@ -672,14 +716,37 @@ export class Libp2pNetwork extends EventEmitter {
     if (this.running) this.scheduleBroadcastPeerAddrs(200);
   }
 
+  private tryRelayReconnect(): void {
+    const now = Date.now();
+    if (now - this.lastRelayReconnectAttempt < 30_000) return;
+    this.lastRelayReconnectAttempt = now;
+    // Re-dial all known relay addresses so the circuit-relay transport can attempt
+    // a fresh reservation. libp2p's bootstrap peer-discovery fires only at startup,
+    // so after a disconnect we must dial explicitly to trigger reconnection.
+    const relayAddrs = [...new Set([...lsLoadRelayAddrs(), ...this.knownRelayMap.keys()])].slice(0, 5);
+    for (const addr of relayAddrs) {
+      try { this.libp2p.dial(multiaddr(addr)).catch(() => {}); } catch { /* ignore */ }
+    }
+  }
+
   private broadcastPeerAddrs(): void {
     if (!this.running) return;
     const all = (this.libp2p?.getMultiaddrs?.() ?? []).map(ma => ma.toString());
     const addrs = all.filter(a => a.includes('p2p-circuit'));
-    if (addrs.length === 0) { console.warn('[Libp2p] No circuit-relay addrs yet - relay reservation may not have completed'); return; }
+    if (addrs.length === 0) {
+      console.warn('[Libp2p] No circuit-relay addrs yet - relay reservation may not have completed');
+      // Mark relay as lost so relay:addresses-ready fires again when it reconnects.
+      this.relayAddrsAvailable = false;
+      this.tryRelayReconnect();
+      return;
+    }
     const msg: Record<string, unknown> = { peerId: this.peerId, addrs };
     if (this.smokeAddr) msg.smokeAddr = this.smokeAddr;
     this.publish(topicPeerAddrs(this.network), msg);
+    if (!this.relayAddrsAvailable) {
+      this.relayAddrsAvailable = true;
+      this.emit('relay:addresses-ready');
+    }
   }
 
   // ── Message handler ───────────────────────────────────────────────────────
@@ -709,6 +776,7 @@ export class Libp2pNetwork extends EventEmitter {
           await this.db.clear('votes');
           await this.db.clear('contracts');
           await this.db.clear('trackedCids');
+          await (this.db as IDBPDatabase<any>).clear('fileIndex').catch(() => {});
         } catch { /* ignore */ }
         this.processedBlocks.clear();
         this.processedVotes.clear();
@@ -813,6 +881,14 @@ export class Libp2pNetwork extends EventEmitter {
       const req = decode<Record<string, unknown>>(data);
       if (req.oldCid && req.newCid && req.ownerPub && req.signature) {
         this.emit('storage:replace-request', req);
+      }
+      return;
+    }
+
+    if (topic === topicFileAnnouncements(this.network)) {
+      const ann = decode<Record<string, unknown>>(data);
+      if (ann.cid && typeof ann.sizeBytes === 'number' && ann.uploaderPub && typeof ann.timestamp === 'number') {
+        this.emit('file:announced', ann);
       }
       return;
     }
@@ -1205,6 +1281,8 @@ export class Libp2pNetwork extends EventEmitter {
       await this.db.clear('accounts');
       await this.db.clear('votes');
       await this.db.clear('contracts');
+      await (this.db as IDBPDatabase<any>).clear('fileIndex').catch(() => {});
+      await (this.db as IDBPDatabase<any>).clear('trackedCids').catch(() => {});
       // Keep keyblobs - user still needs to recover their account
     } catch { /* ignore */ }
 
@@ -1334,6 +1412,27 @@ export class Libp2pNetwork extends EventEmitter {
 
   watchReplaceRequests(callback: (request: Record<string, unknown>) => void): void {
     this.on('storage:replace-request', callback as (data: unknown) => void);
+  }
+
+  publishFileAnnouncement(ann: Record<string, unknown>): void {
+    if (!this.running) return;
+    this.publish(topicFileAnnouncements(this.network), ann);
+  }
+
+  watchFileAnnouncements(callback: (ann: Record<string, unknown>) => void): void {
+    this.on('file:announced', callback as (data: unknown) => void);
+  }
+
+  async saveFileIndexRecord(record: FileIndexRecord): Promise<void> {
+    try { await (this.db as IDBPDatabase<any>).put('fileIndex', record); } catch { /* ignore */ }
+  }
+
+  async loadFileIndex(): Promise<FileIndexRecord[]> {
+    try { return await (this.db as IDBPDatabase<any>).getAll('fileIndex'); } catch { return []; }
+  }
+
+  async deleteFileIndexRecord(cid: string): Promise<void> {
+    try { await (this.db as IDBPDatabase<any>).delete('fileIndex', cid); } catch { /* ignore */ }
   }
 
   getStats(): NetworkStats {

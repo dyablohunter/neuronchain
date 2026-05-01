@@ -216,14 +216,15 @@ export async function createAccountBlock(
 
 /**
  * Verify block signature(s).
- * Always checks ECDSA. If pqPub is provided, pqSignature must be present and valid (mandatory).
+ * Always checks ECDSA. If pqPub is provided AND pqSignature is present, the PQ signature
+ * must be valid. A missing pqSignature is accepted (accounts recovered from a classic backup
+ * key lack pqPriv and cannot produce a PQ signature).
  */
 export async function verifyBlockSignature(block: AccountBlock, pqPub?: string): Promise<boolean> {
   const result = await verifySignature(block.signature, block.accountPub);
   if (result !== block.hash) return false;
 
-  if (pqPub) {
-    if (!block.pqSignature) return false;
+  if (pqPub && block.pqSignature) {
     if (!pqVerify(block.hash, block.pqSignature, pqPub)) return false;
   }
 

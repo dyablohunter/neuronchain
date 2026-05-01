@@ -7,6 +7,7 @@ import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock } from '.
 import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
+import { initStreamSW, registerStreamURL, unregisterStreamURL } from './network/stream-sw';
 import {
   derivePinRawBits, encryptWithPinKey, decryptWithPinKey,
   checkPinLockout, recordPinFailure, recordPinSuccess,
@@ -29,6 +30,8 @@ if (!acquireTabLock()) {
 // ──── State ────
 const savedNetwork = (localStorage.getItem('neuronchain_network') || 'testnet') as NetworkType;
 let node = new NeuronNode(savedNetwork);
+// Register Service Worker for seekable video/audio streaming (range-request proxy)
+initStreamSW(node.store);
 let localAccounts: AccountWithKeys[] = [];
 let cameraStream: MediaStream | null = null;
 let isRecovering = false;
@@ -354,7 +357,7 @@ function toast(msg: string, type: 'success' | 'error' | 'info' = 'info') {
 }
 
 const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString();
-const trunc = (s: string, n = 16) => s.length <= n ? s : s.slice(0, n) + '...';
+const trunc = (s: string, n = 16) => s.length <= n ? s : s.slice(0, Math.ceil(n / 2)) + '…' + s.slice(-Math.floor(n / 2));
 
 // ──── Compact backup key encoding (Base58) ────
 // Keys are stored as base64(JWK JSON). Each P-256 JWK private key contains
@@ -455,10 +458,6 @@ function addLog(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'inf
   logBuffer.push({ html, level });
   if (logBuffer.length > 500) logBuffer.shift();
 
-  // Write to Node-tab console (may not exist yet during early init)
-  const log = document.querySelector('#nodeLog');
-  if (log) { log.appendChild(entry.cloneNode(true)); log.scrollTop = log.scrollHeight; }
-
   // Write to mobile panel if open, otherwise increment badge
   const panel = document.getElementById('mobileLogPanel');
   const scroller = document.getElementById('mobileLogScroller');
@@ -526,9 +525,6 @@ document.addEventListener('DOMContentLoaded', () => {
     scroller.innerHTML = '';
     unreadLogCount = 0;
     badge.style.display = 'none';
-    // Also clear the Node-tab console
-    const nodeLog = document.querySelector('#nodeLog');
-    if (nodeLog) nodeLog.innerHTML = '';
   });
 
   copyBtn.addEventListener('click', async () => {
@@ -556,7 +552,7 @@ document.addEventListener('DOMContentLoaded', () => {
 function resolveNamePlain(pub: string): string {
   if (!pub) return '-';
   for (const a of localAccounts) if (a.pub === pub) return a.username;
-  for (const [, acc] of node.ledger.accounts) if (acc.pub === pub) return acc.username;
+  for (const [, acc] of node.ledger.accounts) if (acc.pub === pub && acc.username !== pub) return acc.username;
   return trunc(pub);
 }
 
@@ -829,11 +825,18 @@ $$('.tab-btn').forEach((btn) => {
 });
 
 function setNodeDependentTabs(enabled: boolean) {
-  const tabs = ['transfer', 'contracts', 'storage'];
+  const tabs = ['account', 'transfer', 'contracts', 'storage'];
   tabs.forEach((t) => {
     const btn = document.querySelector(`.tab-btn[data-tab="${t}"]`) as HTMLButtonElement;
     if (btn) btn.disabled = !enabled;
   });
+  // If the active tab just got disabled, fall back to the node tab.
+  if (!enabled && tabs.includes(activeTab())) {
+    $$('.tab-btn').forEach((b) => b.classList.remove('active'));
+    $$('.tab-panel').forEach((p) => p.classList.remove('active'));
+    document.querySelector('.tab-btn[data-tab="node"]')?.classList.add('active');
+    $('#tab-node').classList.add('active');
+  }
 }
 
 function activeTab(): string {
@@ -899,7 +902,11 @@ function refreshChain() {
 
 function refreshNode() {
   const s = node.getStats();
-  const uptime = s.uptime > 0 ? `${Math.floor(s.uptime / 1000)}s` : '-';
+  const uptimeSec = Math.floor(s.uptime / 1000);
+  const uptime = s.uptime <= 0 ? '-'
+    : uptimeSec < 60 ? `${uptimeSec}s`
+    : uptimeSec < 3600 ? `${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s`
+    : `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`;
   $('#nodeStats').innerHTML = `
     <div class="stat-item"><div class="stat-label">Status</div><div class="stat-value small" style="color:${s.status === 'stopped' ? 'var(--danger)' : s.status === 'validating' ? 'var(--success)' : 'var(--accent)'}">${s.status.toUpperCase()}</div></div>
     <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${uptime}</div></div>
@@ -929,7 +936,8 @@ function refreshRelays() {
     list.innerHTML = '<p style="font-size:12px;color:var(--text-dim);margin:0;">No community relays known yet.</p>';
     return;
   }
-  list.innerHTML = `<table style="width:100%;font-size:12px;border-collapse:collapse;">
+  const prevScroll = (list.querySelector('div') as HTMLDivElement | null)?.scrollLeft ?? 0;
+  list.innerHTML = `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;"><table style="width:100%;min-width:480px;font-size:12px;border-collapse:collapse;">
     <thead><tr style="color:var(--text-dim);text-align:left;">
       <th style="padding:4px 8px;">Status</th>
       <th style="padding:4px 8px;">Address</th>
@@ -948,7 +956,9 @@ function refreshRelays() {
         <td style="padding:4px 8px;">${r.failCount}</td>
         <td style="padding:4px 8px;"><button class="btn btn-outline" style="padding:2px 8px;font-size:11px;" data-remove-relay="${escHtml(r.addr)}">Remove</button></td>
       </tr>`;
-    }).join('')}</tbody></table>`;
+    }).join('')}</tbody></table></div>`;
+  const scroller = list.querySelector('div') as HTMLDivElement | null;
+  if (scroller && prevScroll) scroller.scrollLeft = prevScroll;
   list.querySelectorAll('[data-remove-relay]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const addr = btn.getAttribute('data-remove-relay')!;
@@ -970,7 +980,7 @@ function refreshAccount() {
           <td>${escHtml(acc.username)}</td>
           <td><span class="hash truncate">${escHtml(trunc(acc.pub, 20))}</span></td>
           <td>${formatUNIT(bal)} UNIT</td>
-          <td>
+          <td style="white-space:nowrap;">
             <button class="btn btn-outline" onclick="navigator.clipboard.writeText('${escHtml(acc.username)}')">Copy</button>
             <button class="btn btn-delete-account" data-pub="${escHtml(acc.pub)}" style="background:var(--danger);color:#fff;margin-left:6px;">Delete</button>
           </td>
@@ -1311,6 +1321,9 @@ $('#btnResetConfirm').addEventListener('click', async () => {
   $('#resetDialog').classList.remove('active');
   await node.net.clearAll();
   node.ledger.reset();
+  node.storage.resetState();
+  if (node.store.isStarted()) await node.store.clearAllContent().catch(() => {});
+  saveContentLibrary([]);
   localAccounts = [];
   node.localKeys.clear();
   localStorage.removeItem(WALLET_KEY);
@@ -1422,6 +1435,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
   $('#btnCreateAccount').setAttribute('disabled', '');
     showCameraModal();
 
+  let partialPub: string | null = null;
   try {
     setCameraStatus('<span class="spinner"></span> Loading face recognition models...');
     await loadModels();
@@ -1488,6 +1502,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       pqKemPub: keys.pqKemPub,
     });
     node.ledger.registerAccount(account);
+    partialPub = account.pub;
 
     // Create open block (mints 1M UNIT)
     const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys);
@@ -1510,6 +1525,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     // Store locally
     const fullAcc: AccountWithKeys = { ...account, keys, balance: 1000000 };
+    partialPub = null; // fully committed — no rollback needed
     localAccounts.push(fullAcc);
     node.addLocalKey(keys.pub, keys);
     saveWallet();
@@ -1522,7 +1538,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       <div class="stat-item" style="margin-top:4px;"><div class="stat-label">Face Map Hash</div><input readonly class="form-input" style="font-size:11px;font-family:monospace;user-select:all;" value="${escHtml(faceMap.hash)}" onclick="this.select()"/></div>
       <div class="secret-box" style="margin-top:12px;">
         <div class="warn-text">&#9888; BACKUP KEY - save this secret key as a secondary recovery method.</div>
-        <input readonly class="form-input secret-value" style="font-size:12px;font-family:monospace;user-select:all;letter-spacing:1px;" value="${escHtml(backupCode)}" onclick="this.select()"/>
+        <input readonly class="form-input secret-value" style="font-size:12px;font-family:monospace;user-select:all;letter-spacing:1px;cursor:pointer;" value="${escHtml(backupCode)}" onclick="this.select();ncCopyToClip(this.value,'Backup key copied')"/>
         <p style="color:var(--text-muted);font-size:11px;margin-top:6px;">Contains your two private keys encoded as Base58. Import via "Recover with Key Pair" on any device.</p>
       </div>
       <p style="font-size:12px;margin-top:10px;line-height:1.7;">Primary recovery: <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(99,102,241,0.15);color:var(--primary-hover);border:1px solid rgba(99,102,241,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F4F7; Face</span> + <span style="display:inline-flex;align-items:center;gap:4px;background:rgba(34,211,238,0.12);color:var(--accent);border:1px solid rgba(34,211,238,0.3);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">&#x1F511; PIN</span> on any device.</p>
@@ -1533,6 +1549,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     addLog(`Account created: ${username} (+1M UNIT, face-locked)`, 'success');
     refreshAccount(); refreshTransfer(); refreshContracts();
   } catch (err) {
+    if (partialPub) { node.ledger.purgeAccount(partialPub); partialPub = null; }
     const msg = err instanceof Error ? err.message : String(err);
     addLog(`Account creation failed: ${msg}`, 'error');
     statusEl.innerHTML = `<span style="color:var(--danger)">${msg}</span>`;
@@ -2282,6 +2299,9 @@ function wireNodeEvents() {
     const block = b as { type: string; accountPub: string };
     addLog(`Confirmed: ${block.type} by ${resolveNamePlain(block.accountPub)}`, 'success');
     debouncedRefreshTab();
+    // Storage blocks need an immediate refresh so provider stats stay current even
+    // when the confirmed block arrives while the user is on another tab.
+    if (block.type.startsWith('storage-')) refreshStorage();
   });
   node.on('block:conflict', (b: unknown) => {
     const block = b as { hash: string; type: string; accountPub: string };
@@ -2289,10 +2309,32 @@ function wireNodeEvents() {
     debouncedRefreshTab();
   });
   node.on('block:rejected', (b: unknown) => {
-    const block = b as { hash: string };
-    addLog(`Rejected: ${trunc(block.hash)}`, 'error');
+    const block = b as { hash: string; type: string };
+    addLog(`Rejected: ${block.type ?? 'block'} ${trunc(block.hash, 12)}`, 'error');
     debouncedRefreshTab();
   });
+  node.on('storage:heartbeat-sent', (d: unknown) => {
+    const { pub } = d as { pub: string };
+    addLog(`Heartbeat sent for ${resolveNamePlain(pub)}`, 'info');
+    refreshStorage();
+  });
+  node.on('storage:reward-issued', (d: unknown) => {
+    const { pub, amount } = d as { pub: string; amount: number };
+    addLog(`Storage reward: +${formatUNIT(amount)} UNIT for ${resolveNamePlain(pub)}`, 'success');
+    refreshStorage();
+  });
+  node.on('storage:cached', (d: unknown) => {
+    const { pub, cid } = d as { pub: string; cid: string };
+    addLog(`Cached ${trunc(cid, 12)} for ${resolveNamePlain(pub)}`, 'info');
+    refreshStorage();
+  });
+  node.on('storage:replaced', (d: unknown) => {
+    const { pub, oldCid, newCid } = d as { pub: string; oldCid: string; newCid: string };
+    addLog(`Replaced ${trunc(oldCid, 12)} → ${trunc(newCid, 12)} for ${resolveNamePlain(pub)}`, 'info');
+    refreshStorage();
+  });
+  node.storage.on('file:index-updated', () => { refreshStorage(); });
+  node.storage.on('storage:providers-updated', () => { refreshStorage(); });
   node.on('peer:connected', () => { refreshNode(); });
   node.on('peer:disconnected', () => { refreshNode(); });
   node.on('auto:received', (data: unknown) => {
@@ -2364,7 +2406,7 @@ function startRefreshInterval() {
     refreshTab();
     // Always keep explorer current in the background so it's ready when switched to
     if (activeTab() !== 'explorer') refreshExplorer();
-  }, 5000);
+  }, 60000);
 }
 
 function stopRefreshInterval() {
@@ -2378,8 +2420,12 @@ function stopRefreshInterval() {
 
 interface ContentRecord {
   cid: string;
-  /** Inner content CID (the actual data block, separate from the meta envelope) */
+  /** Inner content CID for small files (≤ 8 MB) */
   contentCid?: string;
+  /** Chunk CIDs for large files (> 8 MB) stored in OPFS */
+  chunkCids?: string[];
+  /** true when the file uses the OPFS streaming path */
+  isStream?: boolean;
   name: string;
   contentType: string;
   mimeType: string;
@@ -2415,7 +2461,7 @@ function removeFromContentLibrary(cid: string): void {
   saveContentLibrary(loadContentLibrary().filter(r => r.cid !== cid));
 }
 
-(window as unknown as Record<string, unknown>)['removeFromLibraryAndRefresh'] = async (cid: string) => {
+async function doRemoveFromLibrary(cid: string): Promise<void> {
   const record = loadContentLibrary().find(r => r.cid === cid);
   removeFromContentLibrary(cid);
   refreshStorage();
@@ -2425,12 +2471,26 @@ function removeFromContentLibrary(cid: string): void {
     const keys = node.localKeys.get(record.ownerPub);
     if (keys) {
       await node.deleteContent(cids, record.ownerPub, keys).catch(() => {});
+      await node.storage.removeFileAnnouncement(cid, record.ownerPub, keys).catch(() => {});
     } else {
-      // Keys not loaded (e.g. wallet locked) - delete locally only
       for (const c of cids) await node.store.deleteBlock(c).catch(() => {});
     }
   }
+}
+
+let _pendingRemoveCid: string | null = null;
+(window as unknown as Record<string, unknown>)['removeFromLibraryAndRefresh'] = (cid: string) => {
+  _pendingRemoveCid = cid;
+  $('#removeFileDialog').classList.add('active');
 };
+$('#btnRemoveFileCancel')?.addEventListener('click', () => {
+  _pendingRemoveCid = null;
+  $('#removeFileDialog').classList.remove('active');
+});
+$('#btnRemoveFileConfirm')?.addEventListener('click', async () => {
+  $('#removeFileDialog').classList.remove('active');
+  if (_pendingRemoveCid) { await doRemoveFromLibrary(_pendingRemoveCid); _pendingRemoveCid = null; }
+});
 
 (window as unknown as Record<string, unknown>)['fillRetrieveCid'] = (cid: string) => {
   const el = $<HTMLInputElement>('#retrieveCid');
@@ -2445,7 +2505,9 @@ function removeFromContentLibrary(cid: string): void {
   const acc = localAccounts.find(a => a.pub === record.ownerPub);
   if (!acc) { toast('Owner account not loaded in wallet', 'error'); return; }
   toast('Distributing…', 'info');
-  const cids = [cid, ...(record.contentCid ? [record.contentCid] : [])];
+  const cids = record.isStream
+    ? [cid, ...(record.chunkCids ?? [])]
+    : [cid, ...(record.contentCid ? [record.contentCid] : [])];
   const result = await node.distributeContent(cids, record.ownerPub, acc.keys);
   if (result.error) toast(`Distribution: ${result.error}`, 'error');
   else toast(`Distributed to ${result.providers.length} provider(s)`, 'success');
@@ -2499,10 +2561,17 @@ $('#btnReplaceConfirm')?.addEventListener('click', async () => {
       : await node.store.storeWithMetaPublic(data, { mimeType, name });
 
     const newCid = storeResult.cid;
-    const newContentCid = (storeResult.meta as { contentCid?: string }).contentCid;
+    const newMeta = storeResult.meta as { contentCid?: string; streamChunks?: { cid: string }[] };
+    const newContentCid = newMeta.contentCid;
+    const newChunkCids = newMeta.streamChunks?.map(c => c.cid);
+    const newIsStream = !!newChunkCids?.length;
 
-    const oldCids = [cid, ...(record.contentCid ? [record.contentCid] : [])];
-    const newCids = [newCid, ...(newContentCid ? [newContentCid] : [])];
+    const oldCids = record.isStream
+      ? [cid, ...(record.chunkCids ?? [])]
+      : [cid, ...(record.contentCid ? [record.contentCid] : [])];
+    const newCids = newIsStream
+      ? [newCid, ...(newChunkCids ?? [])]
+      : [newCid, ...(newContentCid ? [newContentCid] : [])];
 
     statusEl.textContent = 'Broadcasting replace request…';
     const result = await node.replaceContent(oldCids, newCids, record.ownerPub, acc.keys);
@@ -2511,7 +2580,13 @@ $('#btnReplaceConfirm')?.addEventListener('click', async () => {
 
     // Update library record
     removeFromContentLibrary(cid);
-    addToContentLibrary({ ...record, cid: newCid, contentCid: newContentCid, sizeBytes: data.length, mimeType, timestamp: Date.now() });
+    addToContentLibrary({ ...record, cid: newCid, contentCid: newContentCid, chunkCids: newChunkCids, isStream: newIsStream, sizeBytes: data.length, mimeType, timestamp: Date.now() });
+
+    // Update global file index: remove old, announce new (public files only)
+    if (!record.encrypted) {
+      await node.storage.removeFileAnnouncement(cid, record.ownerPub, acc.keys).catch(() => {});
+      node.storage.announceFile(newCid, data.length, mimeType, record.ownerPub, acc.keys).catch(() => {});
+    }
 
     toast('Content replaced successfully', 'success');
     modal.classList.remove('active');
@@ -2589,6 +2664,8 @@ function refreshStorage() {
     const totalCapGB = providers.reduce((s, p) => s + p.capacityGB, 0);
     const storedBytes = active.reduce((s, p) => s + p.lastActualStoredBytes, 0);
     const freeGB = Math.max(0, totalCapGB - storedBytes / 1_073_741_824);
+    const fileIndex = node.storage.getFileIndex();
+    const fileCount = fileIndex.size;
     const avgUptime = active.length
       ? active.reduce((s, p) => s + (p.heartbeatsLast24h / 6), 0) / active.length
       : 0;
@@ -2604,6 +2681,7 @@ function refreshStorage() {
       </div>`;
     statBar.innerHTML = [
       chip('Providers', `${active.length} / ${providers.length}`, active.length > 0 ? 'var(--success)' : 'var(--danger)'),
+      chip('Files', fileCount.toLocaleString(), fileCount > 0 ? 'var(--success)' : 'var(--text-muted)'),
       chip('Total Capacity', fmtGB(totalCapGB)),
       chip('Free Space', fmtGB(freeGB), freeGB > 1 ? 'var(--success)' : 'var(--warning)'),
       chip('Avg Uptime', `${Math.round(avgUptime * 100)}%`, avgUptime >= 0.8 ? 'var(--success)' : avgUptime >= 0.4 ? 'var(--warning)' : 'var(--danger)'),
@@ -2772,7 +2850,30 @@ $('#btnServeStorage')?.addEventListener('click', async () => {
   const result = await node.registerStorage(pub, capacityGB, acc.keys);
   if (result.success) {
     toast(`Registered as storage provider: ${capacityGB} GB`, 'success');
+    addLog(`Storage registered: ${capacityGB} GB for ${acc.username}`, 'success');
     refreshStorage();
+
+    // Send the first heartbeat after a short delay so the register block has time
+    // to propagate to peers before the smoke address is announced.
+    const statusEl = document.getElementById('serveStorageStatus');
+    const DELAY = 8;
+    let remaining = DELAY;
+    if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Sending first heartbeat in ${remaining}s…`;
+    const ticker = setInterval(() => {
+      remaining--;
+      if (remaining > 0) {
+        if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Sending first heartbeat in ${remaining}s…`;
+      } else {
+        clearInterval(ticker);
+        node.storage.broadcastHeartbeat(pub, acc.keys).then(r => {
+          if (statusEl) statusEl.innerHTML = r.success
+            ? `<span style="color:var(--success)">&#10003; Heartbeat sent — you are now discoverable to peers.</span>`
+            : `<span style="color:var(--warning)">Heartbeat skipped: ${r.error}</span>`;
+          addLog(`First heartbeat ${r.success ? 'sent' : 'failed: ' + r.error} for ${acc.username}`, r.success ? 'success' : 'warn');
+          setTimeout(() => { if (statusEl) statusEl.innerHTML = ''; }, 5000);
+        });
+      }
+    }, 1000);
   } else {
     toast(`Error: ${result.error}`, 'error');
   }
@@ -2817,20 +2918,22 @@ $('#btnClaimReward')?.addEventListener('click', async () => {
   refreshStorage();
 });
 
-$('#btnRefreshProviders')?.addEventListener('click', async () => {
-  const btn = $<HTMLButtonElement>('#btnRefreshProviders');
-  const orig = btn.textContent;
-  btn.textContent = 'Refreshing…';
+$('#btnClearCache')?.addEventListener('click', () => {
+  $('#clearCacheDialog').classList.add('active');
+});
+$('#btnClearCacheCancel')?.addEventListener('click', () => {
+  $('#clearCacheDialog').classList.remove('active');
+});
+$('#btnClearCacheConfirm')?.addEventListener('click', async () => {
+  $('#clearCacheDialog').classList.remove('active');
+  if (!node.store.isStarted()) { toast('Start the node first', 'error'); return; }
+  const btn = $<HTMLButtonElement>('#btnClearCache');
   btn.disabled = true;
-  // Re-publish our full local chain so peers respond with theirs.
-  // This is the only reliable way to pull storage-register / heartbeat blocks
-  // that were published before we joined the GossipSub mesh.
-  await node.broadcastLocalState();
-  // Give peers time to receive our broadcast and reply with their blocks.
-  await new Promise(r => setTimeout(r, 3000));
-  refreshStorage();
-  btn.textContent = orig;
+  const count = await node.store.clearCached().catch(() => 0);
   btn.disabled = false;
+  toast(`Cleared ${count} cached file${count !== 1 ? 's' : ''}`, 'success');
+  node.storage.broadcastStorageStatsForLocalProviders().catch(() => {});
+  refreshStorage();
 });
 
 $('#btnStoreContent')?.addEventListener('click', async () => {
@@ -2925,12 +3028,16 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
       : await node.store.storeWithMetaPublic(data, { mimeType, name: finalName });
 
     const { cid } = storeResult;
-    const contentCid = (storeResult.meta as { contentCid?: string }).contentCid;
+    const metaObj = storeResult.meta as { contentCid?: string; streamChunks?: { cid: string }[] };
+    const contentCid = metaObj.contentCid;
+    const chunkCids = metaObj.streamChunks?.map(c => c.cid);
+    const isStreamFile = !!chunkCids?.length;
     const visLabel = isEncrypted ? 'private' : 'public';
 
-    // Distribute to network providers. Pass both the meta CID and the inner content
-    // CID so providers pin both blobs (they are separate UnixFS blocks).
-    const cidsToDistribute = contentCid ? [cid, contentCid] : [cid];
+    // Distribute: for large files pass all chunk CIDs so providers cache every chunk.
+    const cidsToDistribute = isStreamFile
+      ? [cid, ...(chunkCids ?? [])]
+      : (contentCid ? [cid, contentCid] : [cid]);
     const distResult = await node.distributeContent(cidsToDistribute, pub, acc.keys);
     const distInfo = distResult.error
       ? `<span style="color:var(--warning);font-size:11px;">⚠ ${escHtml(distResult.error)}</span>`
@@ -2938,11 +3045,16 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     if (distResult.error) addLog(`Storage distribution: ${distResult.error}`, 'warn');
     else addLog(`Content distributed to ${distResult.providers.length} provider(s)`, 'success');
 
+    const streamBadge = isStreamFile
+      ? ` <span style="color:var(--accent);font-size:11px;">OPFS stream (${chunkCids!.length} chunks)</span>`
+      : '';
     const resultEl = $('#storageCidResult');
     resultEl.style.display = 'block';
-    resultEl.innerHTML = `<strong>Stored!</strong> (${visLabel})&nbsp; CID: <span>${escHtml(cid)}</span> ${cpBtn(cid)}<br>${distInfo}`;
+    resultEl.innerHTML = `<strong>Stored!</strong> (${visLabel})${streamBadge}&nbsp; CID: <span>${escHtml(cid)}</span> ${cpBtn(cid)}<br>${distInfo}`;
 
-    addToContentLibrary({ cid, contentCid, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
+    addToContentLibrary({ cid, contentCid, chunkCids, isStream: isStreamFile, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
+    // Announce to the global file index (only for public files — don't leak encrypted CIDs)
+    if (!isEncrypted) node.storage.announceFile(cid, data.length, mimeType, pub, acc.keys).catch(() => {});
     toast(`Content stored (${visLabel})`, 'success');
     refreshStorage();
   } catch (err) {
@@ -2950,7 +3062,124 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
   }
 });
 
-// Retrieve content by CID
+// ── Stream helpers (large files > 8 MB) ──────────────────────────────────────
+
+function mimeTypeIcon(mime: string): string {
+  if (mime.startsWith('video/')) return '🎬';
+  if (mime.startsWith('audio/')) return '🎵';
+  if (mime.startsWith('image/')) return '🖼️';
+  if (mime.startsWith('text/html')) return '🌐';
+  if (mime.includes('json')) return '📋';
+  if (mime.includes('javascript')) return '⚙️';
+  if (mime.startsWith('text/')) return '📄';
+  return '📁';
+}
+
+function fmtBytes(n: number): string {
+  return n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(2)} MB`
+       : n > 1024        ? `${(n / 1024).toFixed(1)} KB`
+                         : `${n} B`;
+}
+
+/** Collect all chunks from a ReadableStream into a single Uint8Array. */
+async function drainStream(
+  stream: ReadableStream<Uint8Array>,
+  onProgress?: (loaded: number) => void,
+): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const parts: Uint8Array[] = [];
+  let loaded = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    loaded += value.byteLength;
+    onProgress?.(loaded);
+  }
+  const total = parts.reduce((s, p) => s + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.byteLength; }
+  return out;
+}
+
+/** Trigger a browser download from a ReadableStream, showing progress in statusEl. */
+async function downloadFromStream(
+  cid: string,
+  keys: typeof localAccounts[0]['keys'] | undefined,
+  mime: string,
+  filename: string,
+  statusEl: HTMLElement,
+  totalBytes: number,
+): Promise<void> {
+  statusEl.innerHTML = `<span class="spinner"></span> Streaming… 0 / ${fmtBytes(totalBytes)}`;
+  try {
+    const result = await node.store.retrieveStream(cid, keys);
+    if (!result) { statusEl.innerHTML = `<span style="color:var(--danger)">Content not found.</span>`; return; }
+    const data = await drainStream(result.stream, loaded => {
+      statusEl.innerHTML = `<span class="spinner"></span> Streaming… ${fmtBytes(loaded)} / ${fmtBytes(totalBytes)}`;
+    });
+    const blob = new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    statusEl.innerHTML = `<span style="color:var(--success)">✓ Downloaded ${fmtBytes(data.byteLength)}</span>`;
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color:var(--danger)">Error: ${escHtml(String(err))}</span>`;
+  }
+}
+
+/** Load a large audio/video file via the Service Worker range-request proxy. Fully seekable. */
+async function playFromStream(
+  cid: string,
+  keys: typeof localAccounts[0]['keys'] | undefined,
+  mime: string,
+  mediaEl: HTMLVideoElement | HTMLAudioElement,
+  statusEl: HTMLElement,
+  totalBytes: number,
+): Promise<void> {
+  statusEl.innerHTML = `<span class="spinner"></span> Preparing stream…`;
+  const swReady = !!navigator.serviceWorker?.controller;
+  addLog(`Stream play: ${trunc(cid, 12)} ${mime} ${fmtBytes(totalBytes)} SW=${swReady}`, 'info');
+  if (!swReady) {
+    statusEl.innerHTML = `<span style="color:var(--danger)">Service Worker not ready — reload the page and try again.</span>`;
+    return;
+  }
+  try {
+    const url = registerStreamURL(cid, totalBytes, mime, keys);
+    mediaEl.src = url;
+    mediaEl.style.display = 'block';
+    mediaEl.play().catch(() => {});
+    statusEl.innerHTML = '';
+    mediaEl.addEventListener('emptied', () => unregisterStreamURL(cid), { once: true });
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color:var(--danger)">Error: ${escHtml(String(err))}</span>`;
+  }
+}
+
+// Expose stream actions as window globals so inline onclick handlers can call them
+(window as unknown as Record<string, unknown>)['ncDownloadStream'] = async (cid: string, ownerPub: string, mime: string, filename: string, totalBytes: number, statusId: string) => {
+  const acc = localAccounts.find(a => a.pub === ownerPub);
+  const statusEl = document.getElementById(statusId);
+  if (!statusEl) return;
+  await downloadFromStream(cid, acc?.keys, mime, filename, statusEl, totalBytes);
+};
+
+(window as unknown as Record<string, unknown>)['ncPlayStream'] = async (cid: string, ownerPub: string, mime: string, totalBytes: number, mediaId: string, statusId: string) => {
+  const acc = localAccounts.find(a => a.pub === ownerPub);
+  const mediaEl = document.getElementById(mediaId) as HTMLVideoElement | HTMLAudioElement | null;
+  const statusEl = document.getElementById(statusId);
+  if (!mediaEl || !statusEl) return;
+  await playFromStream(cid, acc?.keys, mime, mediaEl, statusEl, totalBytes);
+};
+
+(window as unknown as Record<string, unknown>)['ncCopyToClip'] = (text: string, label = 'Copied') => {
+  navigator.clipboard.writeText(text).then(() => toast(label, 'success')).catch(() => toast('Copy failed', 'error'));
+};
+
+// ── Retrieve content by CID ───────────────────────────────────────────────────
+
 $('#btnRetrieveContent')?.addEventListener('click', async () => {
   const cid = $<HTMLInputElement>('#retrieveCid').value.trim();
   if (!cid) { toast('Enter a CID', 'error'); return; }
@@ -2961,43 +3190,94 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
 
   const resultEl = $('#retrieveResult');
   resultEl.style.display = 'block';
+  resultEl.innerHTML = `<span class="spinner"></span> Checking…`;
 
-  // Check library to know if content is encrypted
   const knownRecord = loadContentLibrary().find(r => r.cid === cid);
-  const hint = knownRecord ? (knownRecord.encrypted ? 'encrypted' : 'public') : 'auto';
-  resultEl.innerHTML = `<span class="spinner"></span> Retrieving${hint !== 'auto' ? ` (${hint})` : ''}...`;
+  const hintKeys = knownRecord?.encrypted !== false ? acc?.keys : undefined;
 
-  // Encrypted content requires the owner's keys; public content does not
-  if (hint === 'encrypted' && !acc) { toast('Select the owner account to decrypt', 'error'); return; }
+  // ── Step 1: fast availability check ─────────────────────────────────────
+  let avail: Awaited<ReturnType<typeof node.store.checkAvailability>>;
+  try {
+    avail = await node.store.checkAvailability(cid, hintKeys);
+  } catch (err) {
+    resultEl.innerHTML = `<span style="color:var(--danger)">Error: ${escHtml(String(err))}</span>`;
+    return;
+  }
 
+  if (!avail.available && !avail.meta) {
+    resultEl.innerHTML = `<span style="color:var(--danger)">Content not found. Ensure the uploader's node is online.</span>`;
+    return;
+  }
+
+  // ── Step 2a: large file — show placeholder with download / play ──────────
+  if (avail.isStream && avail.meta) {
+    const meta = avail.meta;
+    const mime = meta.mimeType || 'application/octet-stream';
+    const sizeStr = fmtBytes(meta.size);
+    const icon = mimeTypeIcon(mime);
+    const visLabel = meta.encrypted ? 'private / encrypted' : 'public / unencrypted';
+    const visColor = meta.encrypted ? 'var(--warning)' : 'var(--accent)';
+    const displayName = escHtml(meta.name || cid.slice(0, 16) + '…');
+    const safeCid = escHtml(cid);
+    const safeMime = escHtml(mime);
+    const statusId = `streamStatus_${cid.slice(0, 8)}`;
+    const mediaId  = `streamMedia_${cid.slice(0, 8)}`;
+    const ownerPub = knownRecord?.ownerPub ?? pub;
+    const ext = mime.startsWith('video/') ? '.mp4' : mime.startsWith('audio/') ? '.mp3' : mime.includes('json') ? '.json' : '';
+    const dlFilename = escHtml((meta.name || cid.slice(0, 12)) + ext);
+
+    const isVideo = mime.startsWith('video/');
+    const isAudio = mime.startsWith('audio/');
+    const mediaEl = isVideo
+      ? `<video id="${mediaId}" controls muted style="display:none;max-width:100%;border-radius:var(--radius);margin: 0 automargin-bottom:8px;"></video>`
+      : isAudio
+        ? `<audio id="${mediaId}" controls style="display:none;width:100%;margin-bottom:8px;"></audio>`
+        : '';
+    const playBtn = (isVideo || isAudio)
+      ? `<button class="btn btn-outline" style="font-size:12px;padding:6px 14px;" onclick="ncPlayStream('${safeCid}','${escHtml(ownerPub)}','${safeMime}',${meta.size},'${mediaId}','${statusId}')">▶ Play</button>`
+      : '';
+
+    resultEl.innerHTML = `
+      <div style="text-align:center;padding:20px 16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface2);">
+        <div style="font-size:48px;margin-bottom:8px;line-height:1;">${icon}</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:4px;">${displayName}</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">
+          ${escHtml(mime)} &nbsp;·&nbsp; ${sizeStr} &nbsp;·&nbsp;
+          <strong style="color:${visColor}">${visLabel}</strong> &nbsp;·&nbsp;
+          ${meta.streamChunks?.length ?? 0} chunks
+        </div>
+        ${mediaEl}
+        <div id="${statusId}" style="font-size:12px;margin:8px 0;min-height:18px;"></div>
+        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:8px;">
+          ${playBtn}
+          <button class="btn btn-primary" style="font-size:12px;padding:6px 14px;"
+            onclick="ncDownloadStream('${safeCid}','${escHtml(ownerPub)}','${safeMime}','${dlFilename}',${meta.size},'${statusId}')">⬇ Download</button>
+        </div>
+      </div>`;
+    return;
+  }
+
+  // ── Step 2b: small file — full retrieve and inline preview ───────────────
+  resultEl.innerHTML = `<span class="spinner"></span> Retrieving…`;
   let result: Awaited<ReturnType<typeof node.store.retrieveAuto>> = undefined;
   let lastErr: unknown;
-
   try {
-    result = hint === 'public'
-      ? await node.store.retrieveAuto(cid)
-      : await node.store.retrieveAuto(cid, acc?.keys);
-  } catch (err) {
-    lastErr = err;
-  }
+    result = await node.store.retrieveAuto(cid, hintKeys);
+  } catch (err) { lastErr = err; }
 
   try {
     if (!result) {
       const errMsg = lastErr instanceof Error ? escHtml(lastErr.message) : '';
-      resultEl.innerHTML = `<span style="color:var(--danger)">Content not found. Ensure the uploader's node is running and online. ${errMsg}</span>`;
+      resultEl.innerHTML = `<span style="color:var(--danger)">Content not found. Ensure the uploader's node is online. ${errMsg}</span>`;
       return;
     }
 
     const { data, meta, wasEncrypted } = result;
     const visLabel = wasEncrypted ? 'private / encrypted' : 'public / unencrypted';
     const mime = meta.mimeType || 'application/octet-stream';
-    const sizeBytes = data.length;
-    const sizeStr = sizeBytes > 1024 * 1024
-      ? `${(sizeBytes / 1024 / 1024).toFixed(2)} MB`
-      : sizeBytes > 1024 ? `${(sizeBytes / 1024).toFixed(1)} KB` : `${sizeBytes} B`;
+    const sizeStr = fmtBytes(data.length);
 
     let preview = '';
-
     const dataBuf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
     if (mime.startsWith('image/')) {
       const url = URL.createObjectURL(new Blob([dataBuf], { type: mime }));
@@ -3016,10 +3296,10 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
       const displayText = text.length > 5000 ? text.slice(0, 5000) + '\n\n[...truncated]' : text;
       preview = `<pre style="background:var(--surface2);padding:12px;border-radius:var(--radius);overflow:auto;max-height:340px;font-size:12px;font-family:var(--mono);white-space:pre-wrap;word-break:break-word;">${escHtml(displayText)}</pre>`;
     } else {
-      preview = `<div style="color:var(--text-dim);font-size:13px;margin-bottom:8px;">Binary content - use the download button to save.</div>`;
+      preview = `<div style="color:var(--text-dim);font-size:13px;margin-bottom:8px;">Binary content — use the download button to save.</div>`;
     }
 
-    const downloadUrl = URL.createObjectURL(new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer], { type: mime }));
+    const downloadUrl = URL.createObjectURL(new Blob([dataBuf], { type: mime }));
     const ext = mime.includes('json') || mime.includes('neuron') ? '.json' : mime.includes('html') ? '.html' : mime.includes('css') ? '.css' : mime.includes('javascript') ? '.js' : '';
     const filename = escHtml((meta.name || cid.slice(0, 12)) + ext);
 
@@ -3144,9 +3424,12 @@ $('#btnLoadNFTExample')?.addEventListener('click', () => {
     $('#btnMainnet').className = 'btn btn-primary';
   }
 
+  // Disable node-dependent tabs on load (node is not running yet)
+  setNodeDependentTabs(false);
+
   // Restore saved tab (skip disabled tabs)
   const savedTab = localStorage.getItem('neuronchain_tab');
-  const disabledTabs = ['transfer', 'contracts'];
+  const disabledTabs = ['account', 'transfer', 'contracts', 'storage'];
   if (savedTab && !disabledTabs.includes(savedTab)) {
     const tabBtn = document.querySelector(`.tab-btn[data-tab="${savedTab}"]`) as HTMLButtonElement;
     if (tabBtn && !tabBtn.disabled) {

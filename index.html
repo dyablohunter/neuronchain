@@ -905,6 +905,30 @@
     </div>
   </div>
 
+  <!-- Clear Cache Confirmation -->
+  <div class="dialog-overlay" id="clearCacheDialog">
+    <div class="dialog">
+      <h3>Clear Cached Files</h3>
+      <p>This will delete all files your node has cached for other users. Your own uploaded content will not be affected. This cannot be undone.</p>
+      <div class="btn-group">
+        <button class="btn btn-outline" id="btnClearCacheCancel">Cancel</button>
+        <button class="btn btn-danger" id="btnClearCacheConfirm">Clear Cache</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Remove File Confirmation -->
+  <div class="dialog-overlay" id="removeFileDialog">
+    <div class="dialog">
+      <h3>Remove File</h3>
+      <p>This will remove the file from your content library and delete all local chunks. This cannot be undone.</p>
+      <div class="btn-group">
+        <button class="btn btn-outline" id="btnRemoveFileCancel">Cancel</button>
+        <button class="btn btn-danger" id="btnRemoveFileConfirm">Remove</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Replace Content Modal -->
   <div class="dialog-overlay" id="replaceContentModal">
     <div class="dialog" style="max-width:460px;width:100%;">
@@ -998,10 +1022,6 @@
           <button class="btn btn-primary" id="btnAnnounceRelay" style="white-space:nowrap;">Announce Relay</button>
         </div>
         <div id="knownRelaysList"></div>
-      </div>
-      <div class="card">
-        <div class="card-title">Node Log</div>
-        <div class="log-console" id="nodeLog"></div>
       </div>
     </div>
 
@@ -1231,7 +1251,7 @@ function getCount() { return state.counter; }"></textarea>
         <div id="myStorageStats" style="display:none;margin-bottom:16px;">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Capacity</th><th>Uptime</th><th>Score</th><th>Rate/day</th><th>Total earned</th><th>Last reward</th></tr></thead>
+              <thead><tr><th>Capacity</th><th>Uptime</th><th>Latency</th><th>Score</th><th>Rate/day</th><th>Total earned</th><th>Last reward</th></tr></thead>
               <tbody id="myProviderStatsRow"></tbody>
             </table>
           </div>
@@ -1257,11 +1277,10 @@ function getCount() { return state.counter; }"></textarea>
 
         <!-- Controls shown when already serving -->
         <div id="stopServingArea" style="display:none;margin-top:12px;">
-          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
-            <input type="number" class="form-input" id="adjustCapacityGB" placeholder="New capacity (GB)" min="1" max="10000" style="width:180px;" />
+          <div id="serveStorageStatus" style="font-size:12px;min-height:18px;margin-bottom:8px;"></div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <input type="number" class="form-input" id="adjustCapacityGB" placeholder="Capacity (GB)" min="1" max="10000" style="width:160px;" />
             <button class="btn btn-outline" id="btnAdjustCapacity">Adjust Capacity</button>
-          </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <button class="btn btn-outline" id="btnManualHeartbeat">Send Heartbeat Now</button>
             <button class="btn btn-outline" id="btnClaimReward">Claim Today's Reward</button>
             <button class="btn btn-outline" id="btnStopServing" style="color:var(--danger);border-color:var(--danger);">Stop Serving Storage</button>
@@ -1273,7 +1292,7 @@ function getCount() { return state.counter; }"></textarea>
       <div class="card">
         <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
           <span>Storage Network</span>
-          <button class="btn btn-outline" style="font-size:11px;padding:3px 10px;" id="btnRefreshProviders">Refresh</button>
+          <button class="btn btn-outline" style="font-size:11px;padding:3px 10px;color:var(--danger);border-color:var(--danger);" id="btnClearCache">Clear Cache</button>
         </div>
         <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px;">All registered storage providers on NeuronChain, ranked by score.</p>
 
@@ -1758,37 +1777,81 @@ PEER_RELAYS=/dns4/relay-a.example.com/tcp/9090/ws/p2p/12D3KooWAaa...,\
           <!-- CONTENT STORAGE -->
           <div class="help-section" id="help-content">
             <h2>Content Storage</h2>
-            <p>NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON stored <strong>on NeuronChain</strong> using its own content layer. No central server; content is served peer-to-peer via HTTP over WebRTC (<code>@sinclair/smoke</code>).</p>
+            <p>NeuronChain is a full content network — posts, images, video, audio, HTML, CSS, JS, and JSON stored <strong>on NeuronChain</strong> using its own content layer. No central server; content is served peer-to-peer via HTTP over WebRTC (<code>@sinclair/smoke</code>).</p>
             <h3>Properties</h3>
             <ul>
-              <li><strong>Content-addressed:</strong> every file stored by its SHA-256 CID (<code>bafkrei&#8230;</code>, CIDv1 raw codec). SHA-256(fetched bytes) is verified against the CID before accepting - tamper-evident by construction.</li>
+              <li><strong>Content-addressed:</strong> every file stored by its SHA-256 CID (<code>bafkrei&#8230;</code>, CIDv1 raw codec). SHA-256(fetched bytes) is verified against the CID before accepting — tamper-evident by construction.</li>
               <li><strong>On-chain anchor:</strong> the CID is recorded in <code>block.contentCid</code> or smart contract state, creating an immutable provenance proof.</li>
-              <li><strong>ECDSA-signed:</strong> every store action is signed by the account key - public content is authentically attributed to you.</li>
+              <li><strong>ECDSA-signed:</strong> every store action is signed by the account key — public content is authentically attributed to you.</li>
               <li><strong>Served by any peer</strong> that holds a copy via smoke Http on virtual port 5891. Known holders from storage receipts are tried first before broadcasting to all peers.</li>
-              <li><strong>IndexedDB persistence:</strong> content stored locally survives relay downtime - readable offline.</li>
-              <li><strong>WebRTC signaling via GossipSub:</strong> smoke peer connections are coordinated through the GossipSub mesh. The relay's <code>/smoke-hub</code> is fallback only - relay is not on the content data path.</li>
+              <li><strong>OPFS + IndexedDB persistence:</strong> large files use the browser's Origin Private File System (OPFS); small files use IndexedDB. All content survives relay downtime — readable offline.</li>
+              <li><strong>WebRTC signaling via GossipSub:</strong> smoke peer connections are coordinated through the GossipSub mesh. The relay's <code>/smoke-hub</code> is fallback only — relay is not on the content data path.</li>
             </ul>
-            <h3>Meta-envelope pattern</h3>
-            <p>Every store call creates <strong>two separate blocks</strong> in IndexedDB, each with its own CID:</p>
+            <h3>Storage paths</h3>
+            <table class="help-table">
+              <thead><tr><th>File size</th><th>Storage backend</th><th>Network transfer</th><th>Playback</th></tr></thead>
+              <tbody>
+                <tr><td>≤ 8 MB</td><td>IndexedDB (smoke FS)</td><td>Single block via smoke Http</td><td>Full file loaded into RAM</td></tr>
+                <tr><td>&gt; 8 MB</td><td>OPFS (per-chunk files)</td><td>One chunk per WebRTC message</td><td>Seekable via Service Worker (HTTP Range proxy)</td></tr>
+              </tbody>
+            </table>
+            <h3>Meta-envelope pattern — small files (≤ 8 MB)</h3>
+            <p>Two IndexedDB blocks, each with its own CID:</p>
 <pre class="help-pre">┌──────────────────────────────────────────────────────────┐
 │  Meta block  (handle.cid)                                │
 │  { mimeType, size, encrypted, timestamp, contentCid }    │
 └───────────────────────────┬──────────────────────────────┘
-                            │ contentCid points to ↓
+                            │ contentCid ↓
 ┌───────────────────────────▼──────────────────────────────┐
 │  Content block  (handle.contentCid)                      │
 │  Raw bytes (public) or AES-256-GCM ciphertext (private)  │
 └──────────────────────────────────────────────────────────┘</pre>
-            <p>The <code>cid</code> returned to you is always the <strong>meta CID</strong>. Pass it to retrieval — the library fetches the content block automatically via the embedded <code>contentCid</code>. When distributing to providers, pass <strong>both CIDs</strong> so providers can serve a full retrieval independently:</p>
-<pre class="help-pre"><span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContent</span>(data, <span class="hp-str">'image/jpeg'</span>, keys);
-<span class="hp-kw">const</span> cids = [handle.cid, handle.contentCid].<span class="hp-fn">filter</span>(Boolean);
+            <h3>Chunked OPFS manifest — large files (&gt; 8 MB)</h3>
+            <p>The file is split into 8 MB chunks. Each chunk is encrypted independently (IV embedded in ciphertext). Chunk files live in OPFS; a small JSON manifest lives in IndexedDB:</p>
+<pre class="help-pre">┌──────────────────────────────────────────────────────────────────┐
+│  Manifest block  (handle.cid) — stored encrypted in smoke FS     │
+│  { mimeType, size, encrypted, timestamp,                         │
+│    streamChunks: [{ cid, size }, …] }                            │
+└──────┬───────────┬───────────┬──────────────────────────────────┘
+       │ chunk[0]  │ chunk[1]  │ chunk[N]  (each in OPFS)
+       ▼           ▼           ▼
+   bafkrei…    bafkrei…    bafkrei…
+   AES-GCM     AES-GCM     AES-GCM     (each chunk independently decryptable)</pre>
+            <p>The <code>cid</code> returned is always the <strong>manifest CID</strong>. To distribute large files to providers, pass <strong>all chunk CIDs</strong> alongside the manifest CID:</p>
+<pre class="help-pre"><span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContent</span>(videoBytes, <span class="hp-str">'video/mp4'</span>, keys);
+<span class="hp-cmt">// handle.isStream === true for large files; handle.chunkCids has all chunk CIDs</span>
+<span class="hp-kw">const</span> cids = handle.isStream
+  ? [handle.cid, ...(handle.chunkCids ?? [])]
+  : [handle.cid, handle.contentCid].<span class="hp-fn">filter</span>(Boolean);
 <span class="hp-kw">await</span> api.<span class="hp-fn">distributeContent</span>(cids, myPub, keys);</pre>
+            <h3>Retrieving large files</h3>
+            <p>Use <code>checkAvailability</code> to probe whether a file is locally available without loading it. For video and audio, the <strong>Play</strong> button routes through the Service Worker range-request proxy — the browser can seek to any position without buffering the whole file. For downloads, <code>retrieveStream</code> yields one decrypted chunk at a time.</p>
+<pre class="help-pre"><span class="hp-kw">const</span> info = <span class="hp-kw">await</span> api.<span class="hp-fn">checkAvailability</span>(cid, keys);
+<span class="hp-cmt">// info.available — true if retrievable now</span>
+<span class="hp-cmt">// info.isStream  — true if file uses OPFS chunks (&gt; 8 MB)</span>
+<span class="hp-cmt">// info.meta      — { mimeType, size, name, … }</span>
+
+<span class="hp-kw">if</span> (info.isStream) {
+  <span class="hp-cmt">// Play via Service Worker — fully seekable, no full-file buffer</span>
+  videoEl.src = <span class="hp-str">`/__nc_stream__/${cid}`</span>;  <span class="hp-cmt">// SW intercepts, serves Range responses</span>
+
+  <span class="hp-cmt">// Or download: pull-based stream, one decrypted 8 MB chunk at a time</span>
+  <span class="hp-kw">const</span> result = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveStream</span>(cid, keys);
+  <span class="hp-kw">const</span> reader = result.stream.<span class="hp-fn">getReader</span>();
+  <span class="hp-kw">while</span> (<span class="hp-kw">true</span>) {
+    <span class="hp-kw">const</span> { done, value } = <span class="hp-kw">await</span> reader.<span class="hp-fn">read</span>(); <span class="hp-kw">if</span> (done) <span class="hp-kw">break</span>;
+    <span class="hp-cmt">// value — decrypted Uint8Array chunk, pipe to file picker or accumulate</span>
+  }
+}</pre>
+            <h4>How the Service Worker proxy works</h4>
+            <p><code>/sw.js</code> is registered at startup. When a <code>&lt;video&gt;</code> or <code>&lt;audio&gt;</code> element requests <code>/__nc_stream__/{cid}</code>, the SW intercepts each <code>Range</code> request, asks the main thread for the relevant bytes via a <code>MessageChannel</code>, and returns a <code>206 Partial Content</code> response. The main thread reads the matching OPFS chunk(s), decrypts if private, and sends back only the requested byte slice — so scrubbing a 2 GB video only reads the 8 MB chunk covering that timestamp.</p>
+            <p>The Storage tab UI uses <code>checkAvailability</code> when you click <strong>Retrieve &amp; Decrypt</strong>. For large files it shows a placeholder with the file type icon, size, and <strong>Play</strong> / <strong>Download</strong> buttons. Small files are previewed inline as before.</p>
             <h3>Visibility modes</h3>
             <table class="help-table">
               <thead><tr><th>Mode</th><th>Storage</th><th>Who can read</th><th>Use for</th></tr></thead>
               <tbody>
                 <tr><td>Public</td><td>Raw bytes, no encryption</td><td>Anyone with the CID</td><td>Posts, profiles, public media</td></tr>
-                <tr><td>Private</td><td>AES-256-GCM, ECDH-derived key</td><td>Key holder only</td><td>Personal data, drafts, private media</td></tr>
+                <tr><td>Private</td><td>AES-256-GCM, ECDH-derived key per chunk</td><td>Key holder only</td><td>Personal data, drafts, private media</td></tr>
               </tbody>
             </table>
             <p>Retrieval auto-detects visibility: tries decryption first (if keys provided), falls back to public read.</p>
@@ -1800,8 +1863,8 @@ PEER_RELAYS=/dns4/relay-a.example.com/tcp/9090/ws/p2p/12D3KooWAaa...,\
             <p>Built-in automated storage incentives - no marketplace, no manual deals.</p>
             <h3>Provider lifecycle</h3>
             <ol>
-              <li><strong>Register</strong> - publish a <code>storage-register</code> block with a declared capacity limit in GB. Automatic heartbeats and daily reward blocks begin.</li>
-              <li><strong>Heartbeat</strong> - a <code>storage-heartbeat</code> block is issued every ~4 hours. Each heartbeat records the provider's current smoke Hub address and <strong>actual bytes stored</strong> on-chain so the network can verify contributions and peers can reconnect after restarts.</li>
+              <li><strong>Register</strong> - publish a <code>storage-register</code> block with a declared capacity limit in GB. The node immediately starts accepting content from uploaders. Heartbeat and reward blocks are issued automatically while the node is running — they are driven by the node process, not by registration itself. Use <strong>Send Heartbeat Now</strong> after registering to advertise your smoke address to peers straight away rather than waiting up to 4 hours for the first automatic heartbeat.</li>
+              <li><strong>Heartbeat</strong> - a <code>storage-heartbeat</code> block is issued every ~4 hours (±5 min jitter). Each heartbeat records the provider's current smoke Hub address and <strong>actual bytes stored</strong> on-chain. Both fields are optional for forward-compatibility — nodes that cannot report them send zero. Peers use the smoke address to reconnect after restarts; the stored-bytes figure feeds directly into reward calculation.</li>
               <li><strong>Reward</strong> - a self-issued <code>storage-reward</code> block mints UNIT once per 24 h. The reward is based on <code>min(actualStoredGB, registeredCapacityGB)</code> - you earn for bytes you actually serve, not just declared space. Over-claiming or falsifying the stored amount is rejected by all peers.</li>
             </ol>
             <h3>Earning rate</h3>
@@ -2022,7 +2085,7 @@ api.<span class="hp-fn">registerKey</span>(myPub, myKeys); <span class="hp-cmt">
 
             <div id="help-api-store">
               <h3>Storing Content</h3>
-              <p>All store methods return a <code>ContentHandle</code>: <code>{ cid, contentCid?, size, mimeType, timestamp }</code>. Pass both <code>cid</code> and <code>contentCid</code> to <code>distributeContent</code> so providers can pin both blocks of the meta-envelope.</p>
+              <p>All store methods return a <code>ContentHandle</code>: <code>{ cid, contentCid?, chunkCids?, isStream, size, mimeType, timestamp }</code>. Files ≤ 8 MB set <code>contentCid</code>; files &gt; 8 MB set <code>isStream: true</code> and <code>chunkCids</code>. Pass all relevant CIDs to <code>distributeContent</code> so providers can serve the file completely.</p>
               <h4>Public content (unencrypted)</h4>
 <pre class="help-pre"><span class="hp-cmt">// Store a JSON object — anyone with the CID can read it</span>
 <span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContentPublic</span>(
@@ -2055,7 +2118,7 @@ console.<span class="hp-fn">log</span>(handle.contentCid);  <span class="hp-cmt"
             </div>
 
             <div id="help-api-retrieve">
-              <h3>Retrieving Content</h3>
+              <h3>Retrieving Content — small files (≤ 8 MB)</h3>
 <pre class="help-pre"><span class="hp-cmt">// Public — throws if not found</span>
 <span class="hp-kw">const</span> bytes = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveContentPublic</span>(cid);
 <span class="hp-kw">const</span> text  = <span class="hp-kw">new</span> TextDecoder().<span class="hp-fn">decode</span>(bytes);
@@ -2074,7 +2137,25 @@ console.<span class="hp-fn">log</span>(handle.contentCid);  <span class="hp-cmt"
 <span class="hp-cmt">// JSON and text helpers (encrypted)</span>
 <span class="hp-kw">const</span> post = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveJSON</span>(cid, myKeys);  <span class="hp-cmt">// returns parsed object or undefined</span>
 <span class="hp-kw">const</span> html = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveText</span>(cid, myKeys);   <span class="hp-cmt">// returns string or undefined</span></pre>
-              <p>Retrieval checks local IndexedDB first (instant if cached), then queries known providers from receipts (targeted fetch). Every fetch verifies <code>SHA-256(bytes) === CID</code> before returning.</p>
+              <h3>Retrieving Content — large files (&gt; 8 MB, OPFS stream)</h3>
+              <p>Use <code>checkAvailability</code> first to know if the file is ready. For video/audio playback use the Service Worker URL — the browser can seek freely. For download or custom processing use <code>retrieveStream</code> for a pull-based <code>ReadableStream&lt;Uint8Array&gt;</code> that yields one decrypted 8 MB chunk per pull.</p>
+<pre class="help-pre"><span class="hp-cmt">// Step 1 — check availability (fast, only probes first chunk)</span>
+<span class="hp-kw">const</span> { available, isStream, meta } = <span class="hp-kw">await</span> api.<span class="hp-fn">checkAvailability</span>(cid, myKeys);
+<span class="hp-kw">if</span> (!available) { console.<span class="hp-fn">warn</span>(<span class="hp-str">'Not found locally'</span>); }
+
+<span class="hp-cmt">// Step 2a — play video/audio: Service Worker serves Range requests, fully seekable</span>
+videoEl.src = <span class="hp-str">`/__nc_stream__/${cid}`</span>;
+videoEl.<span class="hp-fn">play</span>();
+
+<span class="hp-cmt">// Step 2b — download: pull one decrypted 8 MB chunk at a time</span>
+<span class="hp-kw">const</span> result = <span class="hp-kw">await</span> api.<span class="hp-fn">retrieveStream</span>(cid, myKeys);
+<span class="hp-cmt">// result.stream — ReadableStream&lt;Uint8Array&gt;</span>
+<span class="hp-cmt">// result.meta   — { mimeType, size, name, encrypted, … }</span>
+
+<span class="hp-cmt">// Pipe to a file download (Streams API)</span>
+<span class="hp-kw">const</span> fh = <span class="hp-kw">await</span> window.<span class="hp-fn">showSaveFilePicker</span>({ suggestedName: result.meta.name });
+<span class="hp-kw">await</span> result.stream.<span class="hp-fn">pipeTo</span>(<span class="hp-kw">await</span> fh.<span class="hp-fn">createWritable</span>());</pre>
+              <p>Retrieval checks OPFS first (instant if local), then fetches from peers over WebRTC. Every chunk verifies <code>SHA-256(bytes) === chunkCID</code> automatically.</p>
             </div>
 
             <div id="help-api-distribute">
@@ -2144,7 +2225,9 @@ api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:replaced'</span>
                   <tr><td class="mono">storeText(text, keys)</td><td class="mono">string (CID)</td><td>Encrypt a text string (HTML, CSS, JS, markdown); returns CID directly</td></tr>
                   <tr><td class="mono">retrieveContentPublic(cid)</td><td class="mono">Uint8Array</td><td>Fetch unencrypted content; throws if not found</td></tr>
                   <tr><td class="mono">retrieveContent(cid, keys)</td><td class="mono">Uint8Array</td><td>Fetch and decrypt private content; throws if decryption fails</td></tr>
-                  <tr><td class="mono">retrieveContentAuto(cid, keys?)</td><td class="mono">{ data, mimeType, size, wasEncrypted } | undefined</td><td>Auto-detect visibility; tries decryption first, falls back to public</td></tr>
+                  <tr><td class="mono">retrieveContentAuto(cid, keys?)</td><td class="mono">{ data, mimeType, size, wasEncrypted } | undefined</td><td>Auto-detect visibility; tries decryption first, falls back to public. Small files only — use retrieveStream for &gt; 8 MB files.</td></tr>
+                  <tr><td class="mono">checkAvailability(cid, keys?)</td><td class="mono">{ available, isStream, meta? }</td><td>Fast local probe — does not load data. <code>isStream</code> is true for &gt; 8 MB OPFS files. Use before showing a placeholder or setting a stream URL.</td></tr>
+                  <tr><td class="mono">retrieveStream(cid, keys?)</td><td class="mono">{ stream: ReadableStream, meta } | undefined</td><td>Pull-based stream: one decrypted 8 MB chunk per <code>reader.read()</code>. Best for download / custom processing. For video/audio playback use the Service Worker URL (<code>/__nc_stream__/{cid}</code>) instead — it serves HTTP Range requests so the browser can seek freely.</td></tr>
                   <tr><td class="mono">retrieveJSON&lt;T&gt;(cid, keys)</td><td class="mono">T | undefined</td><td>Decrypt and parse a stored JSON value</td></tr>
                   <tr><td class="mono">retrieveText(cid, keys)</td><td class="mono">string | undefined</td><td>Decrypt and return a stored text string</td></tr>
                   <tr><td class="mono">distributeContent(cids, pub, keys)</td><td class="mono">{ providers, error? }</td><td>Push CIDs to up to 10 weighted-random providers; pass both meta CID and contentCid</td></tr>
@@ -2185,7 +2268,7 @@ api.<span class="hp-fn">on</span>(<span class="hp-str">'storage:replaced'</span>
               <table class="help-table">
                 <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
                 <tbody>
-                  <tr><td class="mono">registerStorage(pub, capacityGB, keys)</td><td class="mono">{ success, error? }</td><td>Register as a provider; starts automatic heartbeats and daily rewards</td></tr>
+                  <tr><td class="mono">registerStorage(pub, capacityGB, keys)</td><td class="mono">{ success, error? }</td><td>Register as a provider. The node accepts uploads immediately. Heartbeats and rewards are issued automatically by the running node process — call <code>broadcastHeartbeat</code> once after registering to advertise your smoke address without waiting for the first 4 h cycle.</td></tr>
                   <tr><td class="mono">deregisterStorage(pub, keys)</td><td class="mono">{ success, error? }</td><td>Remove yourself from the storage ledger (sets capacityGB = 0)</td></tr>
                   <tr><td class="mono">getStorageProviders()</td><td class="mono">StorageProvider[]</td><td>All active providers sorted by score descending</td></tr>
                   <tr><td class="mono">getStorageProvider(pub)</td><td class="mono">StorageProvider | undefined</td><td>Single provider's live profile</td></tr>

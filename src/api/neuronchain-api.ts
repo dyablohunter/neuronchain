@@ -34,15 +34,24 @@ import { NeuronNode } from '../network/node';
 import { AccountBlock, formatUNIT, parseUNIT } from '../core/dag-block';
 import { KeyPair } from '../core/crypto';
 import { NetworkType, StorageProvider } from '../core/dag-ledger';
+import { ContentMeta, StreamChunk } from '../network/smoke-store';
 import { EventEmitter } from '../core/events';
 
 export { formatUNIT, parseUNIT };
+export type { ContentMeta, StreamChunk };
 
 export interface ContentHandle {
-  /** Meta CID (SHA-256) - store in block.contentCid or contract state */
+  /** Meta CID (SHA-256) — store in block.contentCid or contract state */
   cid: string;
-  /** Inner content CID - pass alongside cid to distributeContent so providers cache both blocks */
+  /** Inner content CID for small files — pass with cid to distributeContent */
   contentCid?: string;
+  /**
+   * Chunk CIDs for large files (> 8 MB) stored in OPFS.
+   * Pass [cid, ...chunkCids] to distributeContent so providers cache all chunks.
+   */
+  chunkCids?: string[];
+  /** true when the file uses the OPFS streaming path (size > 8 MB) */
+  isStream: boolean;
   /** Original byte length before encryption */
   size: number;
   mimeType: string;
@@ -132,7 +141,14 @@ export class NeuronChainAPI extends EventEmitter {
   ): Promise<ContentHandle> {
     if (!this.node.store.isStarted()) throw new Error('Node not started');
     const result = await this.node.store.storeWithMeta(data, { mimeType, name }, keys);
-    return { cid: result.cid, contentCid: result.meta.contentCid, size: data.length, mimeType, timestamp: result.meta.timestamp };
+    const chunks = result.meta.streamChunks;
+    return {
+      cid: result.cid,
+      contentCid: result.meta.contentCid,
+      chunkCids: chunks?.map(c => c.cid),
+      isStream: !!chunks?.length,
+      size: data.length, mimeType, timestamp: result.meta.timestamp,
+    };
   }
 
   /** Retrieve and decrypt private content by CID. Throws if decryption fails. */
@@ -154,7 +170,14 @@ export class NeuronChainAPI extends EventEmitter {
   ): Promise<ContentHandle> {
     if (!this.node.store.isStarted()) throw new Error('Node not started');
     const result = await this.node.store.storeWithMetaPublic(data, { mimeType, name });
-    return { cid: result.cid, contentCid: result.meta.contentCid, size: data.length, mimeType, timestamp: result.meta.timestamp };
+    const chunks = result.meta.streamChunks;
+    return {
+      cid: result.cid,
+      contentCid: result.meta.contentCid,
+      chunkCids: chunks?.map(c => c.cid),
+      isStream: !!chunks?.length,
+      size: data.length, mimeType, timestamp: result.meta.timestamp,
+    };
   }
 
   /**
@@ -166,6 +189,44 @@ export class NeuronChainAPI extends EventEmitter {
     const result = await this.node.store.retrieveWithMetaPublic(cid);
     if (!result) throw new Error(`Content not found: ${cid}`);
     return result.data;
+  }
+
+  /**
+   * Check whether content is available locally without fully loading it.
+   * Fast — only reads the manifest and probes the first chunk / content block.
+   *
+   * `isStream` is true when the file was stored via the OPFS path (> 8 MB).
+   * For large files use `retrieveStream` to avoid loading everything into RAM.
+   */
+  async checkAvailability(
+    cid: string,
+    keys?: KeyPair,
+  ): Promise<{
+    available: boolean;
+    isStream: boolean;
+    meta?: ContentMeta & { contentCid?: string; streamChunks?: StreamChunk[] };
+  }> {
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.store.checkAvailability(cid, keys);
+  }
+
+  /**
+   * Return a pull-based ReadableStream that yields decrypted (or raw) chunks on demand.
+   * The file is never fully held in RAM — each 8 MB chunk is read from OPFS and
+   * decrypted only when the consumer pulls from the stream.
+   *
+   * Also works for small files — wraps the single content block in a one-chunk stream.
+   * Returns undefined if the manifest cannot be read or content is not found.
+   */
+  async retrieveStream(
+    cid: string,
+    keys?: KeyPair,
+  ): Promise<{
+    stream: ReadableStream<Uint8Array>;
+    meta: ContentMeta & { contentCid?: string; streamChunks?: StreamChunk[] };
+  } | undefined> {
+    if (!this.node.store.isStarted()) throw new Error('Node not started');
+    return this.node.store.retrieveStream(cid, keys);
   }
 
   /**

@@ -8,6 +8,9 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     allowedHosts: true,
+    watch: {
+      ignored: ['**/.relay-peer-id.json'],
+    },
     proxy: {
       // Proxy relay WebSocket through Vite so the tunnel URL (port 5173/443)
       // can reach the relay (port 9090).  Mobile browsers connect to:
@@ -16,6 +19,10 @@ export default defineConfig({
         target: 'ws://localhost:9090',
         ws: true,
         rewrite: (path) => path.replace(/^\/relay-ws/, '') || '/',
+        // Disable proxy timeouts so the WebSocket is never torn down by Vite
+        // for being idle — the libp2p ping keepalive handles NAT, not Vite.
+        timeout: 0,
+        proxyTimeout: 0,
       },
       '/smoke-hub': {
         target: 'ws://localhost:9092',

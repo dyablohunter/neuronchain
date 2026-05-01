@@ -169,6 +169,17 @@ async function main() {
 
   await node.start();
 
+  // ── Server-side keepalive pings ───────────────────────────────────────────
+  // Ping all connected peers every 10s so the WebSocket TCP connections stay
+  // alive through NAT. Both sides must push bytes — the browser pings the relay
+  // and the relay pings the browser. Without server-side pings, an idle browser
+  // tab that sends no libp2p traffic loses its NAT mapping anyway.
+  setInterval(() => {
+    for (const conn of node.getConnections()) {
+      node.services.ping.ping(conn.remotePeer).catch(() => {});
+    }
+  }, 10_000);
+
   // ── Relay-to-relay mesh ───────────────────────────────────────────────────
   // Dial each peer relay from PEER_RELAYS so their GossipSub meshes merge.
   // Without this, browsers on relay-A and browsers on relay-B are in separate
@@ -346,6 +357,11 @@ async function main() {
   smokeHubWss.on('connection', (ws) => {
     let address = null;
 
+    // Send WebSocket-level ping frames every 15s to keep the TCP connection alive
+    // through NAT devices that drop idle connections after 20-30s. Mobile browsers
+    // automatically respond with pong frames, so the NAT table entry stays fresh.
+    const keepAlive = setInterval(() => { if (ws.readyState === 1) ws.ping(); }, 15_000);
+
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
@@ -365,6 +381,7 @@ async function main() {
     });
 
     ws.on('close', () => {
+      clearInterval(keepAlive);
       if (address) {
         smokeHubPeers.delete(address);
         console.log(`[SmokeHub] Peer disconnected: ${address.slice(0, 8)}...`);

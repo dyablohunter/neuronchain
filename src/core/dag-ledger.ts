@@ -129,6 +129,25 @@ export class DAGLedger extends EventEmitter {
     return true;
   }
 
+  /** Roll back a partially-created account (registerAccount + openAccount) that never fully committed. */
+  purgeAccount(pub: string): void {
+    const account = this.accounts.get(pub);
+    if (!account) return;
+    this.accounts.delete(pub);
+    if (this.usernameToPublicKey.get(account.username) === pub) {
+      this.usernameToPublicKey.delete(account.username);
+    }
+    const chain = this.accountChains.get(pub) ?? [];
+    for (const block of chain) {
+      this.allBlocks.delete(block.hash);
+      if (block.type === 'open' && block.faceMapHash) {
+        const prev = this.faceAccountCount.get(block.faceMapHash) ?? 0;
+        if (prev > 0) this.faceAccountCount.set(block.faceMapHash, prev - 1);
+      }
+    }
+    this.accountChains.delete(pub);
+  }
+
   getAccountByUsername(username: string): Account | undefined {
     const pub = this.usernameToPublicKey.get(username);
     return pub ? this.accounts.get(pub) : undefined;

@@ -23,13 +23,15 @@ npm run tunnel     # (second terminal) HTTPS tunnel for multiple-device testing
 
 ### First Steps
 
-1. **Create account** - Account tab → choose username → liveness check → face enrollment (3 captures) → set 4-digit PIN → 1,000,000 UNIT minted → save backup secret key
-2. **Start node** - Node tab → Start Node (connects to relay, starts syncing via libp2p + smoke)
+1. **Start node** - Node tab → Start Node (connects to relay, starts syncing via libp2p + smoke)
+2. **Create account** - Account tab → choose username → liveness check → face enrollment (3 captures) → set 4-digit PIN → 1,000,000 UNIT minted → save backup secret key
 3. **Send UNIT** - Transfer tab → recipient username → amount → **PIN required**
 4. **Recover account** - Account tab → enter username → PIN prompt → face scan / paste backup secret key (from any device)
 5. **Store content** - Storage tab → select account → paste JSON or upload file → get CID
 6. **Deploy contract** - Contracts tab → load Token or NFT template → deploy → **PIN required**
 7. **Update PIN / face** - Account tab → Update PIN / Face section → authenticate → change credentials
+
+> **Note:** The Account, Transfer, Contracts, and Storage tabs are disabled until the node is running.
 
 ### Production Relay
 
@@ -204,22 +206,53 @@ GossipSub topics are sharded across 4 synapse paths by `hash(accountPub) % 4`.
 
 ### Content Storage
 
-NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON are stored **on NeuronChain** using its own content layer. `@sinclair/smoke` provides IndexedDB-backed local storage and HTTP-over-WebRTC for peer-to-peer block transfer - content is served by NeuronChain peers directly, with no dependency on the public IPFS network. Each piece of content is:
+NeuronChain is a full content network - posts, images, video, audio, HTML, CSS, JS, and JSON are stored **on NeuronChain** using its own content layer. `@sinclair/smoke` provides HTTP-over-WebRTC for peer-to-peer block transfer - content is served by NeuronChain peers directly, with no dependency on the public IPFS network. Each piece of content is:
 
 - **Content-addressed** by SHA-256 CID (`bafkrei…` format via `multiformats`) - tamper-evident: any peer serving a wrong byte is rejected
 - **Anchored on-chain** - the CID is recorded in `block.contentCid` or smart contract state, creating an immutable provenance proof
 - **ECDSA-signed** - every store action is signed by the account key regardless of visibility
 - **Served by any peer** that holds a copy via smoke Http (HTTP-over-WebRTC to the peer's virtual port 5891)
-- **Persisted locally** in IndexedDB - readable offline without a relay
+- **Persisted locally** - small files in IndexedDB (smoke FS), large files in OPFS; both readable offline without a relay
+
+**Two storage paths based on file size:**
+
+| File size | Local storage | Encryption | Playback |
+|---|---|---|---|
+| ≤ 8 MB | IndexedDB (smoke FS) — single content block | AES-256-GCM (private only) | Full file loaded into RAM |
+| > 8 MB | OPFS — one file per 8 MB chunk | Per-chunk AES-256-GCM, IV embedded (private only) | Seekable via Service Worker range-request proxy |
+
+For large files the smoke HTTP server streams directly from OPFS via `File.stream()` — no in-memory copy. Peers receive each chunk as a `ReadableStream` over the WebRTC data channel.
+
+A registered Service Worker (`/sw.js`) intercepts requests to `/__nc_stream__/{cid}` and serves HTTP `206 Partial Content` responses by reading individual OPFS chunks on demand. This means `<video>` and `<audio>` elements can seek to any position in an arbitrarily large file without buffering the whole file first.
 
 Content has **dynamic visibility**:
 
 | Visibility | Storage | Who can read |
 |---|---|---|
 | **Public** | Raw bytes, no encryption | Anyone with the CID |
-| **Private** | AES-256-GCM encrypted with the account's content key | Only the key holder |
+| **Private** | AES-256-GCM encrypted (per chunk for large files) | Only the key holder |
 
 Retrieval auto-detects visibility: tries decryption first, falls back to public read.
+
+**Stream API for large files:**
+
+```typescript
+// Check availability without loading the file
+const { available, isStream, meta } = await api.checkAvailability(cid, keys);
+
+// Play/seek via Service Worker — set directly as <video> src, fully seekable
+// (handled automatically by the Storage tab UI)
+videoEl.src = `/__nc_stream__/${cid}`;
+
+// Or get a pull-based ReadableStream for download / custom processing
+const { stream, meta } = await api.retrieveStream(cid, keys);
+const reader = stream.getReader();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  // value = decrypted Uint8Array chunk (~8 MB) — pipe to OPFS, file picker, etc.
+}
+```
 
 ### Decentralised Storage Ledger
 
@@ -227,8 +260,8 @@ NeuronChain has a built-in automated storage incentive system - no marketplace, 
 
 | Step | Action | On-chain |
 |---|---|---|
-| Provider registers | `storage-register` block (capacityGB) | Yes |
-| Proof of uptime | `storage-heartbeat` block every ~4h | Yes |
+| Provider registers | `storage-register` block (capacityGB) — node starts accepting uploads immediately | Yes |
+| Proof of uptime | `storage-heartbeat` block every ~4h (driven by the running node, not by registration) | Yes |
 | Daily reward | `storage-reward` block - mints new UNIT | Yes |
 | Content distribution | Cache request via GossipSub → smoke Http fetch | Off-chain |
 | Content deletion | Delete request via GossipSub → all holders drop blocks | Off-chain |
@@ -243,11 +276,17 @@ latency_factor   = 1000ms / avg_retrieval_latency   (max 1.0)
 spot_check_factor = checks_passed / checks_received (max 1.0)
 ```
 
-Rewards are based on **actual bytes stored**, not declared capacity. Each heartbeat block includes `actualStoredBytes` (read from `SmokeStore.storageUsedBytes()`). The reward is proportional to `min(actualStoredGB, registeredCapacityGB)` - the declared capacity is only an upper limit. Other nodes verify the amount against on-chain heartbeat data before accepting. Over-claiming is rejected by the ledger.
+Rewards are based on **actual bytes stored**, not declared capacity. Each heartbeat block includes `actualStoredBytes` (read from `SmokeStore.storageUsedBytes()`) and the provider's current smoke Hub address. The reward is proportional to `min(actualStoredGB, registeredCapacityGB)` - the declared capacity is only an upper limit. Other nodes verify the amount against on-chain heartbeat data before accepting. Over-claiming is rejected by the ledger.
+
+The first automatic heartbeat fires ~4 hours after the node starts. In addition to heartbeat blocks, a lightweight **stat gossip** message (`broadcastStorageStats`) is published immediately after node restart, provider registration/deregistration, file upload, deletion, replacement, and cache clear. This keeps free-space stats accurate on all peers without waiting for the next 4-hour heartbeat. Stat gossip carries an ECDSA signature (`stats:<pub>:<bytes>:<ts>`); receiving peers verify the signature before applying the update — a peer cannot forge storage stats for a provider it doesn't control.
 
 `registeredCapacityGB` (from `storage-register` block) is a soft limit the provider declares; it does not affect how much is paid - only actual bytes stored do. Use it to signal to uploaders how much space you can offer.
 
 **Content distribution:** uploaders select up to 10 providers via weighted-random (weight = `min(capacityGB, 100) × score` - capped at 100 GB so one very large provider cannot monopolise selection), publish a signed `CacheRequest` via GossipSub (including the uploader's smoke Hub address so providers can reach the uploader over WebRTC), and providers fetch each block via smoke Http (HTTP-over-WebRTC) and write it to their local IndexedDB. Non-provider nodes that observe the `CacheRequest` also register the uploader's smoke address as a peer fallback so they can retrieve directly from the uploader if a provider is unavailable.
+
+**Redundancy target enforcement:** every `CacheRequest` includes `confirmedProviderCount` — the number of providers that have already confirmed this CID. Providers reject the request if this count is already at `REDUNDANCY_TARGET` (10). The uploader also skips redistribution if its local confirmed set has reached 10. A retry loop runs every 30 seconds and tops up any CID with fewer than 10 confirmed providers by sending new cache requests to providers that haven't yet confirmed.
+
+**Cache-groups index:** when a provider caches a multi-chunk upload (meta envelope + content CIDs), the root CID → sub-CID mapping is saved to a local `/cache-groups/` index. This lets `clearCached()` and `deleteBlock()` find and remove all associated chunks accurately, even for encrypted files where the sub-CIDs cannot be derived from the content alone.
 
 **Content deletion:** the owner broadcasts a signed `DeleteRequest` via GossipSub (`storage/delete-requests` topic). Any node that receives it - provider or non-provider - verifies the ECDSA signature against the owner's public key and immediately drops all local copies from IndexedDB. No restart required; deletion propagates across the mesh as fast as GossipSub delivers the message.
 
@@ -304,7 +343,7 @@ Build applications on NeuronChain using the `NeuronChainAPI` facade in [`src/api
 | Transfers | `send(from, to, amount, keys)` | Send UNIT (amount in milli-UNIT) |
 | Contracts | `deployContract(name, code, pub, keys)` | Deploy a JS sandbox contract |
 | Contracts | `callContract(id, method, args, pub, keys)` | Call a contract method |
-| Storage | `registerStorage(pub, capacityGB, keys)` | Register as a provider (auto heartbeats + rewards) |
+| Storage | `registerStorage(pub, capacityGB, keys)` | Register as a provider — node accepts uploads immediately; heartbeats and rewards run automatically while the node is running |
 
 ### Two-Factor Key Protection (Face + PIN)
 
@@ -463,6 +502,7 @@ Formula: `delay_s = attempt > 3 ? Math.min(86400, 30 × 4^(attempt − 3)) : 0`
 | Lockout notices | ECDSA-signed by account holder - peers reject unsigned or forged lockout broadcasts |
 | Smart contracts | Null-origin iframe sandbox - no DOM/network/storage access; results returned via private MessageChannel port |
 | Content | AES-256-GCM encryption before smoke storage |
+| Storage stats gossip | ECDSA-signed by the provider — peers reject unsigned or spoofed `actualStoredBytes` updates |
 | Range requests | 416 returned for out-of-bounds or inverted byte ranges |
 | Generation governance | Mainnet resets require signed message from known operator keys |
 | Null-write rejection | Client-side null-field guards on all received data |
