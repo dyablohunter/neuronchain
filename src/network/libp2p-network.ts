@@ -389,10 +389,15 @@ export class Libp2pNetwork extends EventEmitter {
   private peerAddrTimer: ReturnType<typeof setInterval> | null = null;
   private relayPingTimer: ReturnType<typeof setInterval> | null = null;
   private peerAddrBroadcastDebounce: ReturnType<typeof setTimeout> | null = null;
+  private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Tracks whether circuit-relay addresses have been successfully obtained at least once */
   private relayAddrsAvailable = false;
-  /** Timestamp of last proactive relay reconnect attempt — rate-limited to once per 30s */
+  /** Timestamp of last proactive relay reconnect attempt — rate-limited to once per 5s */
   private lastRelayReconnectAttempt = 0;
+  /** Known relay peer ID — used to detect relay-specific disconnects */
+  private relayPeerId: string | null = null;
+  /** Exponential backoff delay for relay reconnect, resets on success */
+  private relayReconnectBackoff = 2_000;
   /** Our own smoke Hub address - included in peer-addrs broadcasts for peer discovery */
   private smokeAddr = '';
   /** P4: monotonic counter stamped on every IDB account write; enables range-query incremental resync */
@@ -554,6 +559,7 @@ export class Libp2pNetwork extends EventEmitter {
     });
 
     this.peerId = this.libp2p.peerId.toString();
+    this.relayPeerId = relayInfo?.peerId ?? null;
 
     // Peer events
     this.libp2p.addEventListener('peer:connect', (evt) => {
@@ -562,11 +568,21 @@ export class Libp2pNetwork extends EventEmitter {
         this.trackedPeers.add(id);
         this.emit('peer:connected', id);
       }
+      // Relay reconnected — cancel pending reconnect and reset backoff
+      if (id === this.relayPeerId) {
+        this.relayReconnectBackoff = 2_000;
+        if (this.relayReconnectTimer) { clearTimeout(this.relayReconnectTimer); this.relayReconnectTimer = null; }
+      }
     });
     this.libp2p.addEventListener('peer:disconnect', (evt) => {
       const id = evt.detail.toString();
       this.trackedPeers.delete(id);
       this.emit('peer:disconnected', id);
+      // Relay disconnected — schedule fast reconnect with backoff
+      if (id === this.relayPeerId) {
+        console.warn('[Libp2p] Relay peer disconnected — reconnecting');
+        this.scheduleRelayReconnect();
+      }
     });
 
     await this.libp2p.start();
@@ -693,9 +709,12 @@ export class Libp2pNetwork extends EventEmitter {
     if (!this.running) return;
     this.running = false;
     this.relayAddrsAvailable = false;
+    this.relayPeerId = null;
+    this.relayReconnectBackoff = 2_000;
     if (this.peerAddrTimer) { clearInterval(this.peerAddrTimer); this.peerAddrTimer = null; }
     if (this.relayPingTimer) { clearInterval(this.relayPingTimer); this.relayPingTimer = null; }
     if (this.peerAddrBroadcastDebounce) { clearTimeout(this.peerAddrBroadcastDebounce); this.peerAddrBroadcastDebounce = null; }
+    if (this.relayReconnectTimer) { clearTimeout(this.relayReconnectTimer); this.relayReconnectTimer = null; }
     await this.libp2p?.stop();
     this.trackedPeers.clear();
     this.emit('network:stopped');
@@ -718,15 +737,34 @@ export class Libp2pNetwork extends EventEmitter {
 
   private tryRelayReconnect(): void {
     const now = Date.now();
-    if (now - this.lastRelayReconnectAttempt < 30_000) return;
+    if (now - this.lastRelayReconnectAttempt < 5_000) return;
     this.lastRelayReconnectAttempt = now;
-    // Re-dial all known relay addresses so the circuit-relay transport can attempt
-    // a fresh reservation. libp2p's bootstrap peer-discovery fires only at startup,
-    // so after a disconnect we must dial explicitly to trigger reconnection.
     const relayAddrs = [...new Set([...lsLoadRelayAddrs(), ...this.knownRelayMap.keys()])].slice(0, 5);
     for (const addr of relayAddrs) {
       try { this.libp2p.dial(multiaddr(addr)).catch(() => {}); } catch { /* ignore */ }
     }
+  }
+
+  /**
+   * Relay-specific reconnect with exponential backoff. Triggered immediately when
+   * the relay peer disconnects. Resets backoff when the relay reconnects.
+   */
+  private scheduleRelayReconnect(): void {
+    if (!this.running) return;
+    if (this.relayReconnectTimer) return; // already scheduled
+    this.relayReconnectTimer = setTimeout(async () => {
+      this.relayReconnectTimer = null;
+      if (!this.running) return;
+      const addrs = [...new Set([...lsLoadRelayAddrs(), ...this.knownRelayMap.keys()])].slice(0, 5);
+      let connected = false;
+      for (const addr of addrs) {
+        try { await this.libp2p.dial(multiaddr(addr)); connected = true; break; } catch { /* try next */ }
+      }
+      if (!connected) {
+        this.relayReconnectBackoff = Math.min(this.relayReconnectBackoff * 2, 30_000);
+        this.scheduleRelayReconnect();
+      }
+    }, this.relayReconnectBackoff);
   }
 
   private broadcastPeerAddrs(): void {

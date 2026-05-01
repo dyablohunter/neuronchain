@@ -174,11 +174,14 @@ async function main() {
   // alive through NAT. Both sides must push bytes — the browser pings the relay
   // and the relay pings the browser. Without server-side pings, an idle browser
   // tab that sends no libp2p traffic loses its NAT mapping anyway.
-  setInterval(() => {
-    for (const conn of node.getConnections()) {
-      node.services.ping.ping(conn.remotePeer).catch(() => {});
-    }
-  }, 10_000);
+  const pingService = node.services.ping;
+  if (pingService) {
+    setInterval(() => {
+      for (const conn of node.getConnections()) {
+        try { pingService.ping(conn.remotePeer).catch(() => {}); } catch { /* conn closed mid-loop */ }
+      }
+    }, 10_000);
+  }
 
   // ── Relay-to-relay mesh ───────────────────────────────────────────────────
   // Dial each peer relay from PEER_RELAYS so their GossipSub meshes merge.

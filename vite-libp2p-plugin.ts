@@ -13,28 +13,36 @@ import { join } from 'path';
 
 export function libp2pRelay(): Plugin {
   let relayProcess: ChildProcess | null = null;
+  let stopping = false;
+
+  function startRelay(relayPath: string) {
+    if (stopping) return;
+    relayProcess = spawn(process.execPath, [relayPath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PORT: '9090' },
+    });
+
+    relayProcess.stdout?.on('data', (d: Buffer) => {
+      process.stdout.write(`\x1b[36m[relay]\x1b[0m ${d.toString()}`);
+    });
+    relayProcess.stderr?.on('data', (d: Buffer) => {
+      process.stderr.write(`\x1b[31m[relay]\x1b[0m ${d.toString()}`);
+    });
+    relayProcess.on('exit', (code) => {
+      relayProcess = null;
+      if (stopping) return;
+      console.warn(`\x1b[31m[libp2p-relay]\x1b[0m Relay exited (code ${code}) — restarting in 2s`);
+      setTimeout(() => startRelay(relayPath), 2_000);
+    });
+  }
 
   return {
     name: 'libp2p-relay',
 
     configureServer(server: ViteDevServer) {
       const relayPath = join(process.cwd(), 'relay-server.js');
-
-      relayProcess = spawn(process.execPath, [relayPath], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, PORT: '9090' },
-      });
-
-      relayProcess.stdout?.on('data', (d: Buffer) => {
-        process.stdout.write(`\x1b[36m[relay]\x1b[0m ${d.toString()}`);
-      });
-      relayProcess.stderr?.on('data', (d: Buffer) => {
-        process.stderr.write(`\x1b[31m[relay]\x1b[0m ${d.toString()}`);
-      });
-      relayProcess.on('exit', (code) => {
-        if (code !== 0) console.warn(`[libp2p-relay] Relay exited with code ${code}`);
-        relayProcess = null;
-      });
+      stopping = false;
+      startRelay(relayPath);
 
       // Proxy /relay-info to the relay's info HTTP endpoint (port 9092)
       server.middlewares.use('/relay-info', (_req, res) => {
@@ -55,6 +63,7 @@ export function libp2pRelay(): Plugin {
     },
 
     closeServer() {
+      stopping = true;
       if (relayProcess) {
         relayProcess.kill('SIGTERM');
         relayProcess = null;
