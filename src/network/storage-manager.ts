@@ -134,6 +134,9 @@ export class StorageManager extends EventEmitter {
   private fileIndex: Map<string, FileIndexRecord> = new Map();
 
   private started = false;
+  /** Wall-clock time this manager started, used to grace-skip the heartbeat-staleness
+   *  filter until at least one heartbeat cycle has had time to refresh our view of peers. */
+  private startedAt = 0;
 
   constructor(
     ledger: DAGLedger,
@@ -153,6 +156,7 @@ export class StorageManager extends EventEmitter {
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    this.startedAt = Date.now();
 
     // When a block arrives via push (POST from uploader), write the cached marker and
     // publish a StorageReceipt immediately — without waiting for the CacheRequest pull.
@@ -589,9 +593,15 @@ export class StorageManager extends EventEmitter {
     const localDeviceId = getDeviceId();
     const allProviders = this.ledger.getStorageProviders();
     const now = Date.now();
+    // Right after start we haven't received a full heartbeat cycle of gossip yet, so a
+    // provider loaded from IDB can look stale (old lastHeartbeat) while actually being
+    // online. Skip the staleness filter during a one-heartbeat-interval warmup so we don't
+    // wrongly exclude live providers; once a cycle has passed, online peers have fresh
+    // heartbeats and genuinely-offline ones are correctly dropped.
+    const inWarmup = this.startedAt > 0 && now - this.startedAt < HEARTBEAT_INTERVAL_MS;
     const candidates = allProviders.filter(p => {
       if (p.deviceId && p.deviceId === localDeviceId) return false;
-      if (p.lastHeartbeat > 0 && now - p.lastHeartbeat > REWARD_EPOCH_MS) return false;
+      if (!inWarmup && p.lastHeartbeat > 0 && now - p.lastHeartbeat > REWARD_EPOCH_MS) return false;
       return true;
     });
 

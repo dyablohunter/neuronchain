@@ -726,11 +726,14 @@ async function getOrCreateSessionKey(): Promise<CryptoKey> {
 async function saveWallet() {
   const data = JSON.stringify(
     localAccounts.map((a) => {
-      const acc = a as AccountWithKeys & { pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string };
+      const acc = a as AccountWithKeys & { pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string; openBlock?: AccountBlock };
       return {
         username: a.username, pub: a.pub, keys: a.keys, createdAt: a.createdAt, faceMapHash: a.faceMapHash,
         pinSalt: acc.pinSalt, pinVerifier: acc.pinVerifier, linkedAnchor: acc.linkedAnchor,
         pqPub: acc.pqPub, pqKemPub: acc.pqKemPub, encryptedFaceDescriptor: acc.encryptedFaceDescriptor,
+        // Persist the signed open block (with its relay credentials) so it can be replayed
+        // verbatim on restart — re-creating it would mint a new timestamp/hash and fork the chain.
+        openBlock: acc.openBlock,
       };
     })
   );
@@ -766,10 +769,11 @@ async function loadWallet() {
       // Fallback: try parsing as plain JSON (migration from unencrypted format)
       parsed = raw;
     }
-    localAccounts = (JSON.parse(parsed) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string; pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string }[])
+    localAccounts = (JSON.parse(parsed) as { username: string; pub: string; keys: KeyPair; createdAt: number; faceMapHash: string; pinSalt?: string; pinVerifier?: string; linkedAnchor?: string; pqPub?: string; pqKemPub?: string; encryptedFaceDescriptor?: string; openBlock?: AccountBlock }[])
       .map((d) => Object.assign({ username: d.username, pub: d.pub, keys: d.keys, balance: 0, nonce: 0, createdAt: d.createdAt, faceMapHash: d.faceMapHash || '' }, {
         pinSalt: d.pinSalt, pinVerifier: d.pinVerifier, linkedAnchor: d.linkedAnchor,
         pqPub: d.pqPub, pqKemPub: d.pqKemPub, encryptedFaceDescriptor: d.encryptedFaceDescriptor,
+        openBlock: d.openBlock,
       }));
   } catch { /* corrupt */ }
 }
@@ -1363,9 +1367,22 @@ async function startNode() {
     // Deregister any local provider that has been offline for more than 24h.
     await node.storage.deregisterStaleLocalProviders();
     for (const acc of localAccounts) {
-      if (!node.ledger.getAccountHead(acc.pub)) {
-        const block = await node.ledger.openAccount(acc.pub, acc.faceMapHash, acc.keys);
-        await node.submitBlock(block);
+      if (node.ledger.getAccountHead(acc.pub)) continue;
+      const stored = (acc as AccountWithKeys & { openBlock?: AccountBlock }).openBlock;
+      try {
+        if (stored) {
+          // Replay the original signed open block (carries its relay credentials and
+          // original hash) — re-creating it would lack credentials and fork the chain.
+          await node.submitBlock(stored);
+        } else {
+          // Legacy account saved before open blocks were persisted: re-open will only
+          // succeed once relay credentials are available, otherwise the ledger syncs it
+          // from the network. Don't let one failure abort the rest of startup.
+          const block = await node.ledger.openAccount(acc.pub, acc.faceMapHash, acc.keys);
+          await node.submitBlock(block);
+        }
+      } catch (e) {
+        addLog(`Account ${acc.username}: open block not replayed (${(e as Error).message}); will sync from network`, 'warn');
       }
     }
     node.publishLocalData();
@@ -1517,9 +1534,13 @@ async function collectRelayCredentials(
   descriptor: number[],
   faceMapHash: string,
   onStatus: (msg: string) => void,
-): Promise<RelayCredential[]> {
+): Promise<{ credentials: RelayCredential[]; faceLimitError?: string }> {
   const credentials: RelayCredential[] = [];
   const seen = new Set<string>();
+  // A relay that responds with a face-limit rejection is up and working — it's deliberately
+  // refusing because this face already hit the per-face account cap. Capture that reason so
+  // the caller can report the real cause instead of "is the relay running?".
+  let faceLimitError: string | undefined;
   for (const ch of challenges) {
     try {
       const res = await fetch(faceVerifyEndpoint(ch.faceVerifyBase, 'verify'), {
@@ -1530,6 +1551,7 @@ async function collectRelayCredentials(
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.status })) as { error: unknown };
+        if (res.status === 429 && /face limit/i.test(String(err.error))) faceLimitError = String(err.error);
         onStatus(`Relay ${ch.peerId.slice(0, 8)} rejected: ${err.error}`);
         continue;
       }
@@ -1542,7 +1564,7 @@ async function collectRelayCredentials(
       onStatus(`Relay ${ch.peerId.slice(0, 8)}: ${(e as Error).message}`);
     }
   }
-  return credentials;
+  return { credentials, faceLimitError };
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1624,14 +1646,25 @@ $('#btnCreateAccount').addEventListener('click', async () => {
 
     // Step 3: Send descriptor to relays for signing (camera closed, no video needed)
     let relayCredentials: RelayCredential[] = [];
+    let faceLimitError: string | undefined;
     if (pendingChallenges.length > 0) {
       statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Verifying with relay nodes...</span>';
-      relayCredentials = await collectRelayCredentials(
+      const result = await collectRelayCredentials(
         pendingChallenges, faceMap.canonical, faceMap.hash,
         (msg) => { statusEl.innerHTML = `<span style="color:var(--accent)"><span class="spinner"></span> ${msg}</span>`; },
       );
+      relayCredentials = result.credentials;
+      faceLimitError = result.faceLimitError;
     }
     if (relayCredentials.length === 0) {
+      // Distinguish a deliberate face-limit refusal (relay is up, this face is maxed out)
+      // from an actual relay outage — otherwise hitting the per-face cap looks like a crash.
+      if (faceLimitError) {
+        addLog(`FaceID: ${faceLimitError}`, 'error');
+        toast('Face limit reached for this face', 'error');
+        statusEl.innerHTML = `<span style="color:var(--danger)">${escHtml(faceLimitError)} You cannot create more accounts with this face on ${escHtml(node.ledger.network)}.</span>`;
+        restoreCreateBtn(); return;
+      }
       const isMainnet = node.ledger.network === 'mainnet';
       addLog('FaceID: No relay endorsements obtained', 'error');
       toast('Relay face verification failed. Is the relay server running?', 'error');
@@ -1705,8 +1738,8 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     // Cache PIN for this session (rawBits needed for combined-key face update later)
     cachePinKey(keys.pub, pinKey, pinRawBits);
 
-    // Store locally
-    const fullAcc: AccountWithKeys = { ...account, keys, balance: 1000000 };
+    // Store locally — keep the signed open block so it can be replayed verbatim on restart.
+    const fullAcc: AccountWithKeys & { openBlock?: AccountBlock } = { ...account, keys, balance: 1000000, openBlock };
     partialPub = null; // fully committed — no rollback needed
     localAccounts.push(fullAcc);
     node.addLocalKey(keys.pub, keys);

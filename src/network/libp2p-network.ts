@@ -158,8 +158,13 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
     try {
       const res = await fetch('/relay-info', { signal: AbortSignal.timeout(4000) });
       if (!res.ok) throw new Error(`status ${res.status}`);
-      const json = await res.json() as { peerId?: string; signingPub?: string; faceVerifyUrl?: string };
+      const json = await res.json() as { peerId?: string; signingPub?: string; faceVerifyUrl?: string; ready?: boolean };
       if (!json.peerId) throw new Error('no peerId');
+      // The relay's p2p layer isn't dialable until node.start() finishes (ready=true).
+      // Keep retrying so the first dial targets a listening relay instead of failing and
+      // relying on the slower background-dial fallback. `ready` is absent on older relays
+      // (undefined !== false) so they are treated as ready and behaviour is unchanged.
+      if (json.ready === false && i < retries - 1) throw new Error('relay p2p not ready');
 
       const host = window.location.hostname;
       const isLocal = host === 'localhost' || host === '127.0.0.1';

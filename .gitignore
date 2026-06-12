@@ -4,3 +4,12 @@ dist/
 .relay-data/
 .certs/
 *.local
+
+# Relay server runtime state — secrets and local data, must never be committed.
+# .relay-signing-key.json is the relay's PRIVATE signing key (root of trust for
+# face-verify credentials); .relay-face-db.json contains users' biometric descriptors.
+.relay-signing-key.json
+.relay-face-db.json
+.relay-face-counts.json
+.relay-peer-id.json
+reload.log

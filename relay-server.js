@@ -300,9 +300,14 @@ async function main() {
 
     try {
       if (req.url === '/relay-info') {
+        // Always 200 so the HTTP face-verify fallback (which only needs signingPub) works
+        // even before — or without — libp2p. `ready` reports whether the p2p layer is
+        // dialable yet (relayAddrs populated after node.start()); p2p clients retry while
+        // it's false instead of caching an empty multiaddr list, and monitoring can use it
+        // to detect a relay whose p2p layer never came up.
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        // faceVerifyUrl is empty — clients use the relative /face-verify path via their own proxy
         res.end(JSON.stringify({
+          ready: relayAddrs.length > 0,
           peerId: peerId.toString(),
           multiaddrs: relayAddrs,
           wsPort: PORT,
@@ -341,7 +346,10 @@ async function main() {
         }
         const { descriptor, faceMapHash, challengeId } = body;
 
-        const session = challengeSessions.get(String(challengeId || ''));
+        // Derive the Map key once and use it for every lookup/delete so they can't diverge
+        // (set/get/delete must agree, else a used or expired session leaks and survives).
+        const sessionKey = String(challengeId || '');
+        const session = challengeSessions.get(sessionKey);
         if (!session) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Invalid or expired challengeId' })); return;
@@ -351,7 +359,7 @@ async function main() {
           res.end(JSON.stringify({ error: 'challengeId already used' })); return;
         }
         if (Date.now() - session.createdAt > CHALLENGE_TTL_MS) {
-          challengeSessions.delete(challengeId);
+          challengeSessions.delete(sessionKey);
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Challenge expired' })); return;
         }

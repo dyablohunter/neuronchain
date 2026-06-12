@@ -45,8 +45,11 @@ export async function startCamera(video: HTMLVideoElement): Promise<MediaStream>
     video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
   });
   video.srcObject = stream;
+  // Resolve only once playback has actually begun — onloadedmetadata fires when dimensions
+  // are known but before any frame is rendered, so awaiting play() here prevents callers
+  // from running face detection against an empty/not-yet-streaming video element.
   await new Promise<void>((resolve) => {
-    video.onloadedmetadata = () => { video.play(); resolve(); };
+    video.onloadedmetadata = () => { void video.play().catch(() => {}).finally(resolve); };
   });
   return stream;
 }
@@ -145,10 +148,10 @@ function smileRatio(pts: Point[]): number {
  * Blocks until the action is confirmed or the timeout expires.
  *
  * Actions:
- *   blink      — EAR drops below 0.22 for 2+ consecutive frames
+ *   blink      — eyes seen open, then EAR drops below threshold for 2+ consecutive frames
  *   look-left  — nose X shifts left ≥8 % of video width
  *   look-right — nose X shifts right ≥8 % of video width
- *   smile      — mouth height/width ratio exceeds 0.35
+ *   smile      — mouth height/width ratio exceeds threshold
  *
  * Returns true when the action is detected, false on timeout.
  */
@@ -160,9 +163,16 @@ export async function detectChallenge(
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   const EAR_THRESHOLD = 0.28;
-  const BLINK_FRAMES  = 1;
-  const SMILE_THRESHOLD = 0.40;
+  // Require ≥2 consecutive below-threshold frames (~160ms at 80ms/frame), and only
+  // after the eyes have been seen open — a static photo (eyes always open OR always
+  // closed) and single-frame sensor noise can no longer register as a blink.
+  const BLINK_FRAMES  = 2;
+  // mouthHeight/mouthWidth. A relaxed/neutral closed mouth sits well below this;
+  // a genuine smile (mouth widens / parts) clears it without straining. Empirically
+  // a full smile reaches ~0.28, so 0.22 gives margin above neutral and headroom to pass.
+  const SMILE_THRESHOLD = 0.22;
   let earBelowCount = 0;
+  let sawEyesOpen = false;
   let baselineNoseX: number | null = null;
   const baselineSamples: number[] = [];
 
@@ -193,12 +203,17 @@ export async function detectChallenge(
       const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
       const ear = (rightEAR + leftEAR) / 2;
       if (ear < EAR_THRESHOLD) {
-        earBelowCount++;
-        if (earBelowCount >= BLINK_FRAMES) { onStatus?.('Blink detected!'); return true; }
+        // Only count a closure as a blink once we've confirmed the eyes were open —
+        // this requires a real open→closed transition, defeating a static photo.
+        if (sawEyesOpen) {
+          earBelowCount++;
+          if (earBelowCount >= BLINK_FRAMES) { onStatus?.('Blink detected!'); return true; }
+        }
       } else {
+        sawEyesOpen = true;
         earBelowCount = 0;
       }
-      onStatus?.(`BLINK — close your eyes briefly (EAR ${ear.toFixed(2)})`);
+      onStatus?.(`BLINK — open your eyes, then close them briefly (EAR ${ear.toFixed(2)})`);
 
     } else if (type === 'look-left' || type === 'look-right') {
       const nose = pts[30];
@@ -251,9 +266,16 @@ export async function detectLiveness(
   const MIN_MOVEMENT = 30; // pixels of nose travel required (higher = harder to spoof with photo)
   const MIN_DIRECTION_CHANGES = 2; // must reverse direction at least twice (rules out linear pan)
 
-  onStatus?.('Face detected - slowly turn your head left and right...');
+  // Don't claim a face was found before we've actually looked — show a neutral prompt until
+  // the detection loop confirms one (otherwise "Face detected" flashes before the camera
+  // has even produced a frame).
+  onStatus?.('Position your face in the frame...');
 
   while (Date.now() - startTime < timeoutMs) {
+    // Skip detection until the camera is actually streaming frames — running face-api on a
+    // not-yet-playing video element wastes a cycle and can briefly report a stale result.
+    if (video.readyState < 2 || !video.videoWidth) { await sleep(100); continue; }
+
     let detection;
     try {
       detection = await faceapi
