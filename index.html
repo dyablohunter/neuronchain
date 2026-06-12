@@ -1626,7 +1626,7 @@ function getCount() { return state.counter; }"></textarea>
             <p>Private keys are protected by <strong>two independent cryptographic factors</strong>. Compromising one factor alone reveals nothing.</p>
             <h3>Encryption layers (inner &#8594; outer)</h3>
             <ol>
-              <li><strong>Face factor (inner):</strong> stored canonical face descriptor &#8594; quantize to 0.05 bins &#8594; PBKDF2-SHA-512 (100K iterations) &#8594; AES-256-GCM key</li>
+              <li><strong>Face factor (inner):</strong> stored canonical face descriptor &#8594; quantize to 0.1 bins &#8594; PBKDF2-SHA-256 (100K iterations) &#8594; AES-256-GCM key</li>
               <li><strong>PIN factor (outer):</strong> 4-digit PIN + 32-byte random salt &#8594; PBKDF2-SHA-512 (600K iterations, OWASP 2024) &#8594; AES-256-GCM key</li>
             </ol>
             <h3>Face enrollment</h3>
