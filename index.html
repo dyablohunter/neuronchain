@@ -996,15 +996,12 @@
 
     <!-- NODE TAB -->
     <div class="tab-panel active" id="tab-node">
+      <p style="font-size:14px;color:var(--text-dim);margin-bottom:16px;text-align:center;">The first decentralized quantum-resistant blockchain and web storage that runs entirely in the browser.</p>
       <div class="card">
-        <div class="card-title">Node Control</div>
-        <div class="btn-group">
-          <button class="btn btn-success" id="btnStartNode">Start Node</button>
-          <button class="btn btn-danger" id="btnStopNode" disabled>Stop Node</button>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+          <div class="card-title" style="margin-bottom:0;">Node Statistics</div>
+          <button class="btn btn-danger" id="btnStopNode" disabled style="padding:3px 10px;font-size:11px;">Stop Node</button>
         </div>
-      </div>
-      <div class="card">
-        <div class="card-title">Node Statistics</div>
         <div class="stats-grid" id="nodeStats"></div>
       </div>
       <div class="card">
@@ -1356,7 +1353,7 @@ function getCount() { return state.counter; }"></textarea>
         <!-- Image fields -->
         <div id="storageFields-image" class="storage-type-fields" style="display:none;">
           <div class="form-group">
-            <label class="form-label">Image file (JPEG, PNG, GIF, WebP, SVG, AVIF)</label>
+            <label class="form-label">Image file (JPEG, PNG, GIF, WebP, AVIF, JXL, SVG, HEIC)</label>
             <input type="file" class="form-input" id="imageFile" accept="image/*" style="padding:6px;" />
           </div>
           <div class="form-group">
@@ -1372,7 +1369,7 @@ function getCount() { return state.counter; }"></textarea>
         <!-- Video fields -->
         <div id="storageFields-video" class="storage-type-fields" style="display:none;">
           <div class="form-group">
-            <label class="form-label">Video file (MP4, WebM, Ogg, MOV)</label>
+            <label class="form-label">Video file (MP4, WebM/AV1, MKV, MOV, Ogg)</label>
             <input type="file" class="form-input" id="videoFile" accept="video/*" style="padding:6px;" />
           </div>
           <div class="form-group">
@@ -1388,7 +1385,7 @@ function getCount() { return state.counter; }"></textarea>
         <!-- Audio fields -->
         <div id="storageFields-audio" class="storage-type-fields" style="display:none;">
           <div class="form-group">
-            <label class="form-label">Audio file (MP3, WAV, OGG, FLAC, AAC)</label>
+            <label class="form-label">Audio file (MP3, Opus, FLAC, AAC, WAV, OGG)</label>
             <input type="file" class="form-input" id="audioFile" accept="audio/*" style="padding:6px;" />
           </div>
           <div class="form-group">
@@ -1785,7 +1782,7 @@ PEER_RELAYS=/dns4/relay-a.example.com/tcp/9090/ws/p2p/12D3KooWAaa...,\
               <li><strong>ECDSA-signed:</strong> every store action is signed by the account key — public content is authentically attributed to you.</li>
               <li><strong>Served by any peer</strong> that holds a copy via smoke Http on virtual port 5891. Known holders from storage receipts are tried first before broadcasting to all peers.</li>
               <li><strong>OPFS + IndexedDB persistence:</strong> large files use the browser's Origin Private File System (OPFS); small files use IndexedDB. All content survives relay downtime — readable offline.</li>
-              <li><strong>WebRTC signaling via GossipSub:</strong> smoke peer connections are coordinated through the GossipSub mesh. The relay's <code>/smoke-hub</code> is fallback only — relay is not on the content data path.</li>
+              <li><strong>WebRTC signaling via GossipSub:</strong> smoke peer connections are coordinated through the GossipSub mesh. When a direct WebRTC connection can be established (e.g. on LAN or with a public IP), the relay is signaling-only and not on the data path. When both peers are behind strict NAT — the common case — the relay provides a circuit-relay tunnel and <em>is</em> on the data path, typically capping transfer at 1–2 MB/s per connection.</li>
             </ul>
             <h3>Storage paths</h3>
             <table class="help-table">
@@ -1807,16 +1804,16 @@ PEER_RELAYS=/dns4/relay-a.example.com/tcp/9090/ws/p2p/12D3KooWAaa...,\
 │  Raw bytes (public) or AES-256-GCM ciphertext (private)  │
 └──────────────────────────────────────────────────────────┘</pre>
             <h3>Chunked OPFS manifest — large files (&gt; 8 MB)</h3>
-            <p>The file is split into 8 MB chunks. Each chunk is encrypted independently (IV embedded in ciphertext). Chunk files live in OPFS; a small JSON manifest lives in IndexedDB:</p>
+            <p>The file is split into 8 MB chunks. Chunk files live in OPFS; a small JSON manifest lives in IndexedDB (smoke FS). For <strong>private</strong> files each chunk is AES-256-GCM encrypted independently (IV embedded in ciphertext); for <strong>public</strong> files chunks are stored as raw bytes:</p>
 <pre class="help-pre">┌──────────────────────────────────────────────────────────────────┐
-│  Manifest block  (handle.cid) — stored encrypted in smoke FS     │
+│  Manifest block  (handle.cid) — stored in smoke FS               │
 │  { mimeType, size, encrypted, timestamp,                         │
 │    streamChunks: [{ cid, size }, …] }                            │
 └──────┬───────────┬───────────┬──────────────────────────────────┘
        │ chunk[0]  │ chunk[1]  │ chunk[N]  (each in OPFS)
        ▼           ▼           ▼
    bafkrei…    bafkrei…    bafkrei…
-   AES-GCM     AES-GCM     AES-GCM     (each chunk independently decryptable)</pre>
+   AES-GCM     AES-GCM     AES-GCM     (private only — public chunks are raw bytes)</pre>
             <p>The <code>cid</code> returned is always the <strong>manifest CID</strong>. To distribute large files to providers, pass <strong>all chunk CIDs</strong> alongside the manifest CID:</p>
 <pre class="help-pre"><span class="hp-kw">const</span> handle = <span class="hp-kw">await</span> api.<span class="hp-fn">storeContent</span>(videoBytes, <span class="hp-str">'video/mp4'</span>, keys);
 <span class="hp-cmt">// handle.isStream === true for large files; handle.chunkCids has all chunk CIDs</span>
@@ -1851,7 +1848,7 @@ PEER_RELAYS=/dns4/relay-a.example.com/tcp/9090/ws/p2p/12D3KooWAaa...,\
               <thead><tr><th>Mode</th><th>Storage</th><th>Who can read</th><th>Use for</th></tr></thead>
               <tbody>
                 <tr><td>Public</td><td>Raw bytes, no encryption</td><td>Anyone with the CID</td><td>Posts, profiles, public media</td></tr>
-                <tr><td>Private</td><td>AES-256-GCM, ECDH-derived key per chunk</td><td>Key holder only</td><td>Personal data, drafts, private media</td></tr>
+                <tr><td>Private</td><td>AES-256-GCM, ECDH-derived key per chunk</td><td>Anyone can fetch the ciphertext; only the key holder can decrypt it</td><td>Personal data, drafts, private media</td></tr>
               </tbody>
             </table>
             <p>Retrieval auto-detects visibility: tries decryption first (if keys provided), falls back to public read.</p>
@@ -1876,16 +1873,19 @@ latency_factor   = 1000ms / avg_retrieval_latency    (max 1.0; response rank wei
 spotcheck_factor = spot_checks_passed / spot_checks_received</pre>
             <p>Response <em>rank</em> (arrival order among all providers for a CID) is factored into the latency score - providers who respond first earn more.</p>
             <h3>Network stats</h3>
-            <p>The Storage tab shows a real-time summary of the whole network: active/total provider count, total declared capacity, estimated free space, average uptime, average score, and total UNIT minted to storage providers. These are computed from on-chain heartbeat data.</p>
+            <p>The Storage tab shows a real-time summary of the whole network: active/total provider count, total files indexed across the network, total declared capacity, estimated free space, average uptime, average score, and total UNIT minted to storage providers. These are computed from on-chain heartbeat data and the gossip file announcement index.</p>
             <h3>Redundancy check</h3>
             <p>Before any upload the UI checks that at least <strong>2 active providers</strong> have enough free space to hold the file. If fewer than 2 qualify, a warning is shown and the upload proceeds with reduced redundancy.</p>
             <h3>Content distribution</h3>
             <ul>
-              <li>Uploaders select up to 10 providers by weighted-random (weight = capacityGB &#215; score)</li>
+              <li>Uploaders select up to 10 providers using a <strong>geographic diversity-first</strong> algorithm: providers are grouped by country, then one is picked per country per round (weighted by capacityGB &#215; score within each group). Once every represented country has a slot, remaining slots are filled with additional providers from any country. Providers whose country is unknown are pooled together as a fallback group.</li>
               <li>A signed <code>CacheRequest</code> is broadcast via GossipSub with the uploader's smoke address</li>
-              <li>Providers fetch each block via smoke Http (HTTP-over-WebRTC) and store in IndexedDB</li>
-              <li>If confirmed providers for a CID fall below half the redundancy target (5), StorageManager automatically redistributes to fill the gap</li>
+              <li>Providers fetch each block via smoke Http (HTTP-over-WebRTC) — small blocks (≤ 4 MB) are stored in IndexedDB; large blocks (&gt; 4 MB) are stored in OPFS</li>
+              <li>StorageManager continuously retries distribution until confirmed providers reaches the redundancy target (10). Retries use exponential backoff capped at 5 minutes, reset whenever the relay reconnects or a new heartbeat arrives</li>
             </ul>
+            <h3>Geographic distribution</h3>
+            <p>Each provider self-reports its ISO 3166-1 alpha-2 country code (e.g. <code>US</code>, <code>DE</code>) via a one-time geolocation lookup at startup. Only the 2-letter code is shared — the IP address is never stored or gossiped. The country code is included in each <code>storage-heartbeat</code> block and propagates to all peers through the chain.</p>
+            <p>When selecting providers for a new upload, the algorithm maximises geographic spread: it groups candidates by country and picks one per country per round (weighted random within each group by capacityGB &#215; score). After every distinct country is represented it loops back to fill remaining slots. Providers with an unknown country are pooled as a single fallback group and treated equivalently.</p>
             <h3>Spot checks &amp; integrity</h3>
             <p>Nodes periodically fetch blocks directly from each provider's smoke address and verify <code>SHA-256(bytes) === CID</code>. Providers serving wrong bytes are removed from the confirmed-provider set and excluded from future selection.</p>
             <h3>StorageProvider fields</h3>

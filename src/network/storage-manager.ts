@@ -21,9 +21,9 @@ import { EventEmitter } from '../core/events';
 import { DAGLedger, StorageProvider } from '../core/dag-ledger';
 import { Libp2pNetwork, FileIndexRecord } from './libp2p-network';
 import { SmokeStore } from './smoke-store';
-import { AccountBlock, HEARTBEAT_INTERVAL_MS, REWARD_EPOCH_MS } from '../core/dag-block';
+import { AccountBlock, HEARTBEAT_INTERVAL_MS, MAX_HEARTBEATS_PER_DAY, REWARD_EPOCH_MS } from '../core/dag-block';
 import { KeyPair, signData, verifySignature } from '../core/crypto';
-import { getDeviceId } from './node';
+import { getDeviceId, getCountryCode } from './node';
 
 const HEARTBEAT_JITTER_MS = 5 * 60 * 1000;          // ±5 min jitter so nodes don't all fire at once
 const REWARD_CHECK_INTERVAL_MS = 30 * 60 * 1000;    // check every 30 min whether today's reward is due
@@ -108,6 +108,8 @@ export class StorageManager extends EventEmitter {
   private rewardInterval: ReturnType<typeof setInterval> | null = null;
   private spotCheckInterval: ReturnType<typeof setInterval> | null = null;
   private retryInterval: ReturnType<typeof setInterval> | null = null;
+  private statsRefreshInterval: ReturnType<typeof setInterval> | null = null;
+  private reannounceInterval: ReturnType<typeof setInterval> | null = null;
   private reannounceDebounce: ReturnType<typeof setTimeout> | null = null;
 
   /** Rolling 24h receipts per provider (off-chain, in-memory only) */
@@ -124,6 +126,9 @@ export class StorageManager extends EventEmitter {
 
   /** How many re-replication cycles each CID has been stuck at the same confirmed count */
   private cidStuckCount: Map<string, number> = new Map();
+
+  /** Primary CIDs currently being cached — prevents concurrent duplicate downloads */
+  private cachingInProgress = new Set<string>();
 
   /** Network-wide file index — built from gossip announcements and persisted in IDB */
   private fileIndex: Map<string, FileIndexRecord> = new Map();
@@ -241,6 +246,9 @@ export class StorageManager extends EventEmitter {
       this.emit('file:index-updated');
     });
 
+    // Kick off country-code lookup early so it's ready before the first heartbeat fires.
+    getCountryCode().catch(() => {});
+
     // Re-announce own tracked files after mesh forms so late joiners get the index
     setTimeout(() => this.reannounceTrackedFiles(), 5_000);
 
@@ -264,7 +272,10 @@ export class StorageManager extends EventEmitter {
     // When circuit-relay addresses first become available, re-trigger distribution
     // for any CIDs that were published before the relay was established. Providers
     // couldn't reach the uploader via WebRTC until the relay reservation completed.
+    // Also reset stuck-count backoff so files that accumulated retries before the relay
+    // was ready get retried promptly instead of waiting up to 5 minutes.
     this.net.on('relay:addresses-ready', () => {
+      this.cidStuckCount.clear();
       setTimeout(() => this.retryUnconfirmedDistributions(), 3_000);
     });
 
@@ -299,6 +310,17 @@ export class StorageManager extends EventEmitter {
     // Run spot checks hourly
     this.spotCheckInterval = setInterval(() => this.runSpotChecks(), SPOT_CHECK_INTERVAL_MS);
 
+    // Refresh heartbeat counts and scores every 30 min so uptime % stays live as the
+    // 24h rolling window moves, without waiting for a new heartbeat block to arrive.
+    this.statsRefreshInterval = setInterval(() => {
+      this.ledger.refreshHeartbeatCounts();
+      this.emit('storage:providers-updated');
+    }, REWARD_CHECK_INTERVAL_MS);
+
+    // Periodically re-announce own files so any peer that missed the original gossip
+    // receives it without needing a page reload or reconnect.
+    this.reannounceInterval = setInterval(() => this.reannounceTrackedFiles(), 5 * 60 * 1000);
+
     console.log('[StorageManager] Started');
   }
 
@@ -308,6 +330,8 @@ export class StorageManager extends EventEmitter {
     if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
     if (this.rewardInterval) { clearInterval(this.rewardInterval); this.rewardInterval = null; }
     if (this.spotCheckInterval) { clearInterval(this.spotCheckInterval); this.spotCheckInterval = null; }
+    if (this.statsRefreshInterval) { clearInterval(this.statsRefreshInterval); this.statsRefreshInterval = null; }
+    if (this.reannounceInterval) { clearInterval(this.reannounceInterval); this.reannounceInterval = null; }
     if (this.retryInterval) { clearInterval(this.retryInterval); this.retryInterval = null; }
     if (this.reannounceDebounce) { clearTimeout(this.reannounceDebounce); this.reannounceDebounce = null; }
     console.log('[StorageManager] Stopped');
@@ -326,12 +350,86 @@ export class StorageManager extends EventEmitter {
 
   private scheduleNextHeartbeat(): void {
     if (!this.started) return;
+    const localDeviceId = getDeviceId();
+    let minDueIn = HEARTBEAT_INTERVAL_MS;
+
+    for (const [pub] of this.localKeys) {
+      const provider = this.ledger.storageProviders.get(pub);
+      if (!provider || provider.capacityGB === 0) continue;
+      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
+      if (provider.lastHeartbeat === 0) {
+        minDueIn = 0; // first-ever heartbeat — fire promptly
+      } else {
+        const elapsed = Date.now() - provider.lastHeartbeat;
+        const dueIn = Math.max(0, HEARTBEAT_INTERVAL_MS - elapsed);
+        minDueIn = Math.min(minDueIn, dueIn);
+      }
+    }
+
     const jitter = Math.random() * HEARTBEAT_JITTER_MS;
-    const delay = HEARTBEAT_INTERVAL_MS + jitter;
-    this.heartbeatTimer = setTimeout(async () => {
-      await this.broadcastHeartbeatsForAll();
-      this.scheduleNextHeartbeat();
-    }, delay);
+
+    if (minDueIn === 0) {
+      // Past-due or first-ever heartbeat: wait for the first peer to connect before firing.
+      // This gives any un-persisted heartbeat block time to sync back from peers,
+      // preventing a conflict with a block that was sent but not yet written to IDB.
+      // Hard cap of 45s in case the node stays offline.
+      let fired = false;
+      const fire = async () => {
+        if (fired || !this.started) return;
+        fired = true;
+        this.net.off('peer:connected', fire);
+        if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
+        try {
+          await this.broadcastHeartbeatsForAll();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[StorageManager] Heartbeat broadcast failed: ${msg}`);
+        }
+        this.scheduleNextHeartbeat();
+      };
+      this.net.on('peer:connected', fire);
+      this.heartbeatTimer = setTimeout(fire, 45_000);
+    } else {
+      this.heartbeatTimer = setTimeout(async () => {
+        try {
+          await this.broadcastHeartbeatsForAll();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[StorageManager] Heartbeat broadcast failed: ${msg}`);
+        }
+        this.scheduleNextHeartbeat();
+      }, minDueIn + jitter);
+    }
+  }
+
+  /** Cancel the current heartbeat timer and reschedule based on current lastHeartbeat values.
+   *  Call after chain replay so the timer reflects actual on-chain timing, not startup time. */
+  rescheduleHeartbeat(): void {
+    if (!this.started) return;
+    if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
+    this.scheduleNextHeartbeat();
+  }
+
+  /**
+   * If a local storage provider has been offline for more than 24h, deregister it.
+   * Called on startup after keys are loaded so the node cleans up its own stale registration
+   * rather than appearing active to the network.
+   */
+  async deregisterStaleLocalProviders(): Promise<void> {
+    const localDeviceId = getDeviceId();
+    for (const [pub, keys] of this.localKeys) {
+      const provider = this.ledger.storageProviders.get(pub);
+      if (!provider || provider.capacityGB === 0) continue;
+      if (provider.deviceId && localDeviceId && provider.deviceId !== localDeviceId) continue;
+      if (provider.lastHeartbeat === 0) continue; // never heartbeated — still in grace period
+      if (Date.now() - provider.lastHeartbeat < REWARD_EPOCH_MS) continue;
+      const result = await this.ledger.createStorageDeregister(pub, keys);
+      if (result.block) {
+        await this.submitBlock(result.block);
+        console.log(`[StorageManager] Auto-deregistered ${pub.slice(0, 12)}… (offline >24h)`);
+        this.emit('storage:providers-updated');
+      }
+    }
   }
 
   private async broadcastHeartbeatsForAll(): Promise<void> {
@@ -347,7 +445,8 @@ export class StorageManager extends EventEmitter {
   async broadcastHeartbeat(pub: string, keys: KeyPair): Promise<{ success: boolean; error?: string }> {
     const smokeAddr = await this.store.getSmokeHostname();
     const actualStoredBytes = this.store.isStarted() ? await this.store.storageUsedBytes() : 0;
-    const result = await this.ledger.createStorageHeartbeat(pub, keys, smokeAddr, actualStoredBytes);
+    const countryCode = await getCountryCode();
+    const result = await this.ledger.createStorageHeartbeat(pub, keys, smokeAddr, actualStoredBytes, countryCode);
     if (!result.block) return { success: false, error: result.error };
     const submitResult = await this.submitBlock(result.block);
     if (submitResult.success) {
@@ -445,12 +544,20 @@ export class StorageManager extends EventEmitter {
     ownerPub?: string,
     perBlockTimeoutMs = 20_000,
   ): Promise<void> {
+    // Smoke HTTP POST times out for large payloads (~4s internal limit).
+    // Only push small blocks (manifest JSON, small content). Large chunks
+    // (8 MB OPFS slices) must be pulled by the provider via GET instead.
+    const MAX_PUSH_BYTES = 1 * 1024 * 1024; // 1 MB
     const allCids = [cid, ...additionalCids];
     await Promise.allSettled(providers.map(async provider => {
       if (!provider.smokeAddr) return;
       for (const c of allCids) {
         const data = await this.store.getBlock(c);
         if (!data) { console.warn(`[StorageManager] Push: block ${c.slice(0, 16)}… not found locally`); continue; }
+        if (data.byteLength > MAX_PUSH_BYTES) {
+          console.log(`[StorageManager] Push: skipping ${c.slice(0, 16)}… (${(data.byteLength / 1_048_576).toFixed(1)} MB — provider will pull)`);
+          continue;
+        }
         try {
           await this.store.pushBlock(provider.smokeAddr, c, data, ownerPub, perBlockTimeoutMs);
           console.log(`[StorageManager] Pushed ${c.slice(0, 16)}… to ${provider.pub.slice(0, 12)}`);
@@ -465,41 +572,73 @@ export class StorageManager extends EventEmitter {
   // ── Provider selection ────────────────────────────────────────────────────
 
   /**
-   * Select up to `count` storage providers using weighted-random selection.
-   * Weight = capacityGB × max(0.1, score). Local accounts are excluded.
+   * Select up to `count` storage providers with geographic diversity priority.
+   *
+   * Strategy: round-robin across distinct country codes, picking one provider
+   * per country per round (weighted random within each country group). Once
+   * every country has contributed a provider, a second round begins — and so on
+   * until `count` is reached or all candidates are exhausted. Providers whose
+   * country is unknown are grouped together and treated as a single bucket.
+   *
+   * This maximises the number of distinct countries in the result set before
+   * filling remaining slots with same-country providers.
+   *
+   * Weight = min(capacityGB, 100) × max(0.1, score). Local device excluded.
    */
   selectProviders(count: number): StorageProvider[] {
     const localDeviceId = getDeviceId();
-    // Exclude providers registered on this physical device - their content is already local.
-    // Providers on other devices are eligible even if the same account key is loaded here.
     const allProviders = this.ledger.getStorageProviders();
-    const candidates = allProviders.filter(p => !p.deviceId || p.deviceId !== localDeviceId);
+    const now = Date.now();
+    const candidates = allProviders.filter(p => {
+      if (p.deviceId && p.deviceId === localDeviceId) return false;
+      if (p.lastHeartbeat > 0 && now - p.lastHeartbeat > REWARD_EPOCH_MS) return false;
+      return true;
+    });
 
     console.log(`[StorageManager] selectProviders: ${allProviders.length} total, ${candidates.length} remote candidates (want ${count})`);
     if (candidates.length > 0) {
-      console.log(`[StorageManager] selectProviders candidates:`, candidates.map(p => `${p.pub.slice(0, 12)}… cap=${p.capacityGB}GB score=${p.score.toFixed(3)}`));
+      console.log(`[StorageManager] selectProviders candidates:`, candidates.map(p =>
+        `${p.pub.slice(0, 12)}… cap=${p.capacityGB}GB score=${p.score.toFixed(3)} country=${p.countryCode ?? '?'}`));
     }
 
     if (candidates.length === 0) return [];
 
-    // A6: cap contribution at 100GB to prevent one large provider monopolising selection
-    const weights = candidates.map(p => Math.max(0.01, Math.min(p.capacityGB, 100) * Math.max(0.1, p.score)));
-    const totalWeight = weights.reduce((a, b) => a + b, 0);
     const take = Math.min(count, candidates.length);
 
-    const selected: StorageProvider[] = [];
-    const usedIdx = new Set<number>();
+    // Group candidates by country; unknown country gets its own '__' bucket.
+    const byCountry = new Map<string, StorageProvider[]>();
+    for (const p of candidates) {
+      const cc = p.countryCode ?? '__';
+      const group = byCountry.get(cc) ?? [];
+      group.push(p);
+      byCountry.set(cc, group);
+    }
 
-    for (let attempt = 0; attempt < take * 4 && selected.length < take; attempt++) {
-      let r = Math.random() * totalWeight;
-      for (let i = 0; i < candidates.length; i++) {
+    // Weighted-random pick from a group, skipping already-selected pubs.
+    const usedPubs = new Set<string>();
+    const pickWeighted = (group: StorageProvider[]): StorageProvider | undefined => {
+      const pool = group.filter(p => !usedPubs.has(p.pub));
+      if (pool.length === 0) return undefined;
+      const weights = pool.map(p => Math.max(0.01, Math.min(p.capacityGB, 100) * Math.max(0.1, p.score)));
+      const total = weights.reduce((a, b) => a + b, 0);
+      let r = Math.random() * total;
+      for (let i = 0; i < pool.length; i++) {
         r -= weights[i];
-        if (r <= 0 && !usedIdx.has(i)) {
-          usedIdx.add(i);
-          selected.push(candidates[i]);
-          break;
-        }
+        if (r <= 0) return pool[i];
       }
+      return pool[pool.length - 1];
+    };
+
+    // Round-robin: each round picks one provider per distinct country.
+    const selected: StorageProvider[] = [];
+    while (selected.length < take) {
+      let addedThisRound = 0;
+      for (const group of byCountry.values()) {
+        if (selected.length >= take) break;
+        const picked = pickWeighted(group);
+        if (picked) { selected.push(picked); usedPubs.add(picked.pub); addedThisRound++; }
+      }
+      if (addedThisRound === 0) break; // all candidates exhausted
     }
 
     return selected;
@@ -695,6 +834,15 @@ export class StorageManager extends EventEmitter {
     // ICE candidates and establish a direct data-channel connection to the uploader.
     if (!this.store.isStarted()) { console.warn('[StorageManager] SmokeStore not started, cannot cache'); return; }
 
+    // Dedup: if a prior CacheRequest for this primary CID is still in progress (common
+    // when re-replication fires before a slow large-file download completes), ignore the
+    // duplicate so we don't download the same 8 MB chunks twice over the same relay link.
+    if (this.cachingInProgress.has(req.cid)) {
+      console.log(`[StorageManager] handleCacheRequest: ${req.cid.slice(0, 16)}… already caching, skipping duplicate`);
+      return;
+    }
+    this.cachingInProgress.add(req.cid);
+
     const allCids = [req.cid, ...(Array.isArray(req.additionalCids) ? req.additionalCids : [])];
     // Filter our own smoke address out of the fallback list to prevent self-fetch.
     // This is possible when this node is both a provider and was previously confirmed
@@ -714,7 +862,9 @@ export class StorageManager extends EventEmitter {
       for (const c of allCids) {
         console.log(`[StorageManager] handleCacheRequest: caching ${c.slice(0, 20)}…`);
         try {
-          await this.store.cache(c, 120_000, req.uploaderSmokeAddr as string | undefined, req.uploaderPub as string | undefined, providedFallbacks);
+          // 10-minute timeout per chunk — relay connections can be slow (~50 KB/s)
+          // and an 8 MB chunk would exceed the old 2-minute limit.
+          await this.store.cache(c, 600_000, req.uploaderSmokeAddr as string | undefined, req.uploaderPub as string | undefined, providedFallbacks);
         } catch (primaryErr) {
           // Uploader + provided fallbacks all failed. Try every other known peer address
           // as a last resort — this covers peers that cached the content without their
@@ -724,7 +874,7 @@ export class StorageManager extends EventEmitter {
           );
           if (broadFallbacks.length === 0) throw primaryErr;
           console.log(`[StorageManager] handleCacheRequest: primary failed (${errStr(primaryErr)}), trying ${broadFallbacks.length} broad fallback(s)`);
-          await this.store.cache(c, 60_000, undefined, req.uploaderPub as string | undefined, broadFallbacks);
+          await this.store.cache(c, 180_000, undefined, req.uploaderPub as string | undefined, broadFallbacks);
         }
         console.log(`[StorageManager] handleCacheRequest: cached ${c.slice(0, 20)}… OK`);
       }
@@ -766,6 +916,8 @@ export class StorageManager extends EventEmitter {
       this.emit('storage:cached', { pub: myProviderPub, cid: req.cid });
     } catch (err) {
       console.warn(`[StorageManager] Failed to cache ${req.cid.slice(0, 16)}...: ${errStr(err)}`);
+    } finally {
+      this.cachingInProgress.delete(req.cid);
     }
   }
 
@@ -1097,6 +1249,10 @@ export class StorageManager extends EventEmitter {
           // For unconfirmed candidates a 404/timeout is expected and should not trigger re-replication.
           if (wasConfirmed(pub)) {
             tracked.confirmedProviders.delete(pub);
+            // Reset backoff so the next re-replication interval fires quickly rather
+            // than waiting up to 5 minutes from a previous failed-upload backoff.
+            this.cidStuckCount.delete(cid);
+            tracked.lastDistributed = 0;
           }
         }
 
@@ -1204,10 +1360,10 @@ export class StorageManager extends EventEmitter {
     return !!provider && provider.capacityGB > 0;
   }
 
-  /** Get uptime percentage for a provider based on today's heartbeat count */
+  /** Get uptime percentage for a provider based on the current rolling 24h window. */
   getUptimePct(pub: string): number {
-    const provider = this.ledger.storageProviders.get(pub);
-    if (!provider) return 0;
-    return Math.round((provider.heartbeatsLast24h / 6) * 100); // MAX_HEARTBEATS_PER_DAY = 6
+    if (!this.ledger.storageProviders.has(pub)) return 0;
+    const current = this.ledger.countHeartbeatsLast24h(pub, Date.now());
+    return Math.round((current / MAX_HEARTBEATS_PER_DAY) * 100);
   }
 }

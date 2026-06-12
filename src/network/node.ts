@@ -22,6 +22,44 @@ export function getDeviceId(): string {
   } catch { return ''; }
 }
 
+const COUNTRY_CODE_KEY = 'neuronchain_country_code';
+const COUNTRY_CODE_TS_KEY = 'neuronchain_country_code_ts';
+const COUNTRY_CODE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // re-check weekly
+
+let _countryCode: string | null | undefined = undefined; // undefined = not yet resolved
+
+/**
+ * Returns the ISO 3166-1 alpha-2 country code for this device (e.g. "US", "DE").
+ * Resolved once via ipapi.co (returns only the 2-letter code, IP is not stored).
+ * Result is cached in localStorage for 7 days. Returns undefined on failure.
+ */
+export async function getCountryCode(): Promise<string | undefined> {
+  if (_countryCode !== undefined) return _countryCode ?? undefined;
+  try {
+    const ts = parseInt(localStorage.getItem(COUNTRY_CODE_TS_KEY) ?? '0', 10);
+    if (Date.now() - ts < COUNTRY_CODE_TTL_MS) {
+      const cached = localStorage.getItem(COUNTRY_CODE_KEY);
+      if (cached) { _countryCode = cached; return cached; }
+    }
+  } catch { /* ignore */ }
+  try {
+    const res = await fetch('https://ipapi.co/country/', { signal: AbortSignal.timeout(5_000) });
+    if (res.ok) {
+      const code = (await res.text()).trim().slice(0, 2).toUpperCase();
+      if (/^[A-Z]{2}$/.test(code)) {
+        _countryCode = code;
+        try {
+          localStorage.setItem(COUNTRY_CODE_KEY, code);
+          localStorage.setItem(COUNTRY_CODE_TS_KEY, String(Date.now()));
+        } catch { /* ignore */ }
+        return code;
+      }
+    }
+  } catch { /* network error or timeout — proceed without country */ }
+  _countryCode = null;
+  return undefined;
+}
+
 export interface NodeStats {
   status: 'stopped' | 'running' | 'validating';
   uptime: number;
@@ -483,6 +521,8 @@ export class NeuronNode extends EventEmitter {
       for (const block of chain) await this.ledger.addBlock(block);
     }
     // A7: faceAccountCount is maintained incrementally by addBlock - no rebuild needed
+    // Sync heartbeat counts to the current rolling window (uses Date.now() as reference).
+    this.ledger.refreshHeartbeatCounts();
 
     // Seed peer fallbacks from heartbeat-recorded smoke addresses. Providers that have
     // been online recently will have their current (or last known) smoke address on-chain.

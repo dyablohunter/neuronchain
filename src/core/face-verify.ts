@@ -8,7 +8,7 @@ const MODEL_URL = '/models';
 const MATCH_THRESHOLD = 0.45;
 const ENROLLMENT_SAMPLES = 3;
 /** Quantization bin size - coarser = more stable across sessions, less unique */
-const QUANT_BIN = 0.05;
+const QUANT_BIN = 0.1;
 
 export interface FaceDescriptor {
   data: number[];
@@ -114,6 +114,120 @@ export async function enrollFace(
   const hash = await hashDescriptor(quantized);
 
   return { canonical, quantized, hash, samples: descriptors.length, createdAt: Date.now() };
+}
+
+// ──── Challenge Action Detection ────
+
+type Point = { x: number; y: number };
+
+function dist(a: Point, b: Point): number {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+}
+
+function eyeAspectRatio(pts: Point[]): number {
+  // pts[0..5] = 6 eye landmarks (one eye)
+  // EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
+  const A = dist(pts[1], pts[5]);
+  const B = dist(pts[2], pts[4]);
+  const C = dist(pts[0], pts[3]);
+  return C < 0.001 ? 0 : (A + B) / (2 * C);
+}
+
+function smileRatio(pts: Point[]): number {
+  // Mouth corners 48 & 54, top lip 51, bottom lip 57 (in 68-pt model)
+  const mouthWidth  = dist(pts[48], pts[54]);
+  const mouthHeight = dist(pts[51], pts[57]);
+  return mouthWidth < 0.001 ? 0 : mouthHeight / mouthWidth;
+}
+
+/**
+ * Detect a specific facial action before face capture.
+ * Blocks until the action is confirmed or the timeout expires.
+ *
+ * Actions:
+ *   blink      — EAR drops below 0.22 for 2+ consecutive frames
+ *   look-left  — nose X shifts left ≥8 % of video width
+ *   look-right — nose X shifts right ≥8 % of video width
+ *   smile      — mouth height/width ratio exceeds 0.35
+ *
+ * Returns true when the action is detected, false on timeout.
+ */
+export async function detectChallenge(
+  video: HTMLVideoElement,
+  type: 'blink' | 'look-left' | 'look-right' | 'smile',
+  timeoutMs = 12000,
+  onStatus?: (msg: string) => void,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const EAR_THRESHOLD = 0.28;
+  const BLINK_FRAMES  = 1;
+  const SMILE_THRESHOLD = 0.40;
+  let earBelowCount = 0;
+  let baselineNoseX: number | null = null;
+  const baselineSamples: number[] = [];
+
+  const actionLabel =
+    type === 'blink' ? 'blink' :
+    type === 'smile' ? 'smile' :
+    type === 'look-left' ? 'look left' : 'look right';
+
+  onStatus?.(`${actionLabel.toUpperCase()} now — keep looking at the camera`);
+
+  while (Date.now() < deadline) {
+    let detection: Awaited<ReturnType<typeof faceapi.detectSingleFace>> & { landmarks?: ReturnType<typeof faceapi.detectSingleFace.prototype.withFaceLandmarks> } | undefined;
+    let det: { landmarks?: { positions: Point[] } } | undefined;
+    try {
+      det = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+        .withFaceLandmarks() as unknown as { landmarks?: { positions: Point[] } };
+    } catch {
+      await sleep(100); continue;
+    }
+    if (!det?.landmarks) { await sleep(100); continue; }
+
+    const pts = det.landmarks.positions as Point[];
+    const videoWidth = video.videoWidth || 640;
+
+    if (type === 'blink') {
+      const rightEAR = eyeAspectRatio(pts.slice(36, 42));
+      const leftEAR  = eyeAspectRatio(pts.slice(42, 48));
+      const ear = (rightEAR + leftEAR) / 2;
+      if (ear < EAR_THRESHOLD) {
+        earBelowCount++;
+        if (earBelowCount >= BLINK_FRAMES) { onStatus?.('Blink detected!'); return true; }
+      } else {
+        earBelowCount = 0;
+      }
+      onStatus?.(`BLINK — close your eyes briefly (EAR ${ear.toFixed(2)})`);
+
+    } else if (type === 'look-left' || type === 'look-right') {
+      const nose = pts[30];
+      if (baselineNoseX === null) {
+        baselineSamples.push(nose.x);
+        if (baselineSamples.length >= 5) {
+          baselineNoseX = baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
+        } else {
+          await sleep(80); continue;
+        }
+      }
+      const delta = Math.abs(nose.x - baselineNoseX);
+      const threshold = videoWidth * 0.08;
+      if (delta > threshold * 0.85) { onStatus?.(`${type === 'look-left' ? 'Look-left' : 'Look-right'} detected!`); return true; }
+      const pct = Math.min(99, Math.round((delta / threshold) * 100));
+      onStatus?.(`LOOK ${type === 'look-left' ? 'LEFT' : 'RIGHT'} — turn your head (${pct}%)`);
+
+    } else if (type === 'smile') {
+      const ratio = smileRatio(pts);
+      if (ratio > SMILE_THRESHOLD) { onStatus?.('Smile detected!'); return true; }
+      const pct = Math.min(99, Math.round((ratio / SMILE_THRESHOLD) * 100));
+      onStatus?.(`SMILE! (${pct}%)`);
+    }
+
+    await sleep(80);
+  }
+
+  onStatus?.(`Challenge timed out — ${actionLabel} not detected`);
+  return false;
 }
 
 // ──── Liveness Detection (Movement) ────

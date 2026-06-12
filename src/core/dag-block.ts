@@ -57,6 +57,16 @@ export function parseUNIT(input: string): number {
 
 export type ConfirmationStatus = 'pending' | 'voting' | 'confirmed' | 'rejected';
 
+/**
+ * A relay node's endorsement of an account's faceMapHash.
+ * Relay signs the faceMapHash after independently verifying the face descriptor.
+ * sig is JSON.stringify({ d: faceMapHash, s: base64_ecdsa_sig }) — same envelope as signData().
+ */
+export interface RelayCredential {
+  relayPub: string;  // base64(JSON(JWK)) of the relay's ECDSA P-256 signing key
+  sig: string;       // signData envelope: JSON.stringify({ d: faceMapHash, s: base64sig })
+}
+
 export interface AccountBlock {
   hash: string;
   accountPub: string;
@@ -93,6 +103,13 @@ export interface AccountBlock {
 
   /** ML-DSA-65 signature (base64) for quantum-safe hybrid verification. Present on new accounts. */
   pqSignature?: string;
+
+  /**
+   * Relay endorsements for open blocks. Each entry is a relay node's ECDSA signature
+   * over faceMapHash, proving the relay independently verified the face descriptor.
+   * Mainnet requires ≥3 valid credentials; testnet accepts 0 (backward compatibility).
+   */
+  relayCredentials?: RelayCredential[];
 }
 
 export interface ConfirmedBlock extends AccountBlock {
@@ -120,6 +137,8 @@ export interface StorageHeartbeatData {
   smokeAddr?: string;
   /** Actual bytes currently stored by this device (from SmokeStore.storageUsedBytes()). */
   actualStoredBytes?: number;
+  /** ISO 3166-1 alpha-2 country code of the provider (e.g. "US", "DE"). Self-reported via IP geolocation; used for geographic diversity in provider selection. */
+  countryCode?: string;
 }
 
 /**
@@ -147,6 +166,8 @@ export interface StorageRewardData {
 
 export async function hashAccountBlock(block: Omit<AccountBlock, 'hash' | 'signature' | 'pqSignature'>): Promise<string> {
   // JSON.stringify([...]) avoids collision between fields that contain ':'
+  // relayCredentials are NOT included in the hash — they are external attestations
+  // on the block, not block content. The hash commits to faceMapHash (what relays endorse).
   const data = JSON.stringify([
     block.accountPub,
     block.index,
@@ -196,6 +217,7 @@ export async function createAccountBlock(
     contractData?: string;
     contentCid?: string;
     updateData?: string;
+    relayCredentials?: RelayCredential[];
   },
   keys: KeyPair,
 ): Promise<AccountBlock> {

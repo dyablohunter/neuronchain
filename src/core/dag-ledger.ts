@@ -2,6 +2,7 @@ import {
   AccountBlock,
   AccountBlockType,
   ConfirmedBlock,
+  RelayCredential,
   StorageRegisterData,
   StorageHeartbeatData,
   StorageRewardData,
@@ -17,7 +18,7 @@ import {
   hashAccountBlock,
 } from './dag-block';
 import { Account } from './account';
-import { KeyPair } from './crypto';
+import { KeyPair, verifySignature } from './crypto';
 import { VoteManager, Vote } from './vote';
 import { EventEmitter } from './events';
 
@@ -57,6 +58,8 @@ export interface StorageProvider {
   totalEarned: number;
   /** Current smoke Hub address - set from heartbeat contractData, used for targeted retrieval */
   smokeAddr?: string;
+  /** ISO 3166-1 alpha-2 country code - self-reported via heartbeat, used for geographic diversity in provider selection */
+  countryCode?: string;
   // ── Off-chain metrics (updated by StorageManager, informational only) ────
   /** Rolling average retrieval latency from peer-signed receipts (0 = no data) */
   avgLatencyMs: number;
@@ -201,21 +204,18 @@ export class DAGLedger extends EventEmitter {
 
   // ── Block creation ────────────────────────────────────────────────────────
 
-  async openAccount(pub: string, faceMapHash: string, keys: KeyPair, faceDescriptor?: number[]): Promise<AccountBlock> {
-    let count: number;
-    if (faceDescriptor?.length === 128) {
-      count = this.countMatchingFaceAccounts(faceDescriptor, pub);
-    } else {
-      count = this.getFaceAccountCount(faceMapHash);
-    }
+  async openAccount(pub: string, faceMapHash: string, keys: KeyPair, faceDescriptor?: number[], relayCredentials?: RelayCredential[]): Promise<AccountBlock> {
+    const count = this.getFaceAccountCount(faceMapHash);
     const max = this.getMaxAccountsPerFace();
     if (count >= max) throw new Error(`Face already used for ${count} account(s). Limit: ${max} per face on ${this.network}.`);
 
     const block = await createAccountBlock({
       accountPub: pub, index: 0, type: 'open',
       previousHash: '0'.repeat(64), balance: VERIFICATION_MINT_AMOUNT, faceMapHash,
+      relayCredentials: relayCredentials?.length ? relayCredentials : undefined,
     }, keys);
-    await this.addBlock(block);
+    const result = await this.addBlock(block);
+    if (!result.success) throw new Error(result.error ?? 'Open block rejected');
     return block;
   }
 
@@ -330,7 +330,7 @@ export class DAGLedger extends EventEmitter {
    * smokeAddr is included in contractData so peers can discover the provider's
    * current WebRTC address from the chain without waiting for a live peer-addrs broadcast.
    */
-  async createStorageHeartbeat(pub: string, keys: KeyPair, smokeAddr?: string, actualStoredBytes?: number): Promise<{ block?: AccountBlock; error?: string }> {
+  async createStorageHeartbeat(pub: string, keys: KeyPair, smokeAddr?: string, actualStoredBytes?: number, countryCode?: string): Promise<{ block?: AccountBlock; error?: string }> {
     const provider = this.storageProviders.get(pub);
     if (!provider || provider.capacityGB === 0) return { error: 'Not a registered storage provider' };
 
@@ -341,7 +341,7 @@ export class DAGLedger extends EventEmitter {
 
     const head = this.getAccountHead(pub);
     if (!head) return { error: 'Account not opened' };
-    const heartbeatData: StorageHeartbeatData = { type: 'storage-heartbeat', smokeAddr, actualStoredBytes };
+    const heartbeatData: StorageHeartbeatData = { type: 'storage-heartbeat', smokeAddr, actualStoredBytes, countryCode };
     const block = await createAccountBlock({
       accountPub: pub, index: head.index + 1, type: 'storage-heartbeat',
       previousHash: head.hash, balance: head.balance,
@@ -466,9 +466,30 @@ export class DAGLedger extends EventEmitter {
       if (provider.lastHeartbeat > 0 && block.timestamp - provider.lastHeartbeat < HEARTBEAT_INTERVAL_MS - 60_000) {
         return { success: false, error: 'storage-heartbeat interval not reached' };
       }
-      // D4: reject heartbeats with timestamps far from the accepting node's wall clock
-      if (Math.abs(block.timestamp - Date.now()) > 10 * 60 * 1000) {
-        return { success: false, error: 'storage-heartbeat: timestamp too far from current time' };
+      // D4: reject heartbeats with timestamps more than 10 min in the future.
+      // Past timestamps are accepted — historical blocks from IDB replay must not be rejected,
+      // and an old heartbeat grants no advantage since the 24h window is timestamp-based.
+      if (block.timestamp > Date.now() + 10 * 60 * 1000) {
+        return { success: false, error: 'storage-heartbeat: timestamp too far in the future' };
+      }
+    }
+
+    // Relay credential verification for open blocks
+    // Mainnet: ≥3 valid relay endorsements required. Testnet: 0 required (backward compat).
+    if (block.type === 'open') {
+      const creds = block.relayCredentials ?? [];
+      let validCount = 0;
+      for (const cred of creds) {
+        try {
+          const result = await verifySignature(cred.sig, cred.relayPub);
+          if (result === block.faceMapHash) validCount++;
+        } catch { /* invalid sig — skip */ }
+      }
+      // mainnet: ≥3 endorsements required (independent relay committee)
+      // testnet: ≥1 endorsement required (prevents Sybil while allowing dev with single relay)
+      const minRequired = this.network === 'mainnet' ? 3 : 1;
+      if (validCount < minRequired) {
+        return { success: false, error: `Open block requires ${minRequired} relay credential(s); got ${validCount} valid` };
       }
     }
 
@@ -546,13 +567,20 @@ export class DAGLedger extends EventEmitter {
       const provider = this.storageProviders.get(block.accountPub);
       if (provider) {
         provider.lastHeartbeat = block.timestamp;
-        provider.heartbeatsLast24h = this.countHeartbeatsLast24h(block.accountPub, block.timestamp);
+        // Use Date.now() so the cached count always reflects the current 24h window.
+        // Using block.timestamp creates a window up to 28h wide (block is up to 4h old),
+        // causing heartbeatsLast24h to read higher than getUptimePct() and drop
+        // unexpectedly after a restart when refreshHeartbeatCounts recomputes with now.
+        provider.heartbeatsLast24h = this.countHeartbeatsLast24h(block.accountPub, Date.now());
         if (block.contractData) {
           try {
             const hbData = JSON.parse(block.contractData) as StorageHeartbeatData;
             if (hbData.smokeAddr) provider.smokeAddr = hbData.smokeAddr;
             if (typeof hbData.actualStoredBytes === 'number') {
               provider.lastActualStoredBytes = hbData.actualStoredBytes;
+            }
+            if (hbData.countryCode && /^[A-Z]{2}$/.test(hbData.countryCode)) {
+              provider.countryCode = hbData.countryCode;
             }
           } catch { /* ignore malformed */ }
         }
@@ -706,10 +734,19 @@ export class DAGLedger extends EventEmitter {
   }
 
   /** Count heartbeat blocks in the 24h window ending at refTime */
-  private countHeartbeatsLast24h(pub: string, refTime: number): number {
+  countHeartbeatsLast24h(pub: string, refTime: number): number {
     const chain = this.accountChains.get(pub) || [];
     const cutoff = refTime - 24 * 60 * 60 * 1000;
     return chain.filter(b => b.type === 'storage-heartbeat' && b.timestamp >= cutoff).length;
+  }
+
+  /** Recompute heartbeatsLast24h for all providers relative to now. Call after chain replay. */
+  refreshHeartbeatCounts(): void {
+    const now = Date.now();
+    for (const [pub, provider] of this.storageProviders) {
+      provider.heartbeatsLast24h = this.countHeartbeatsLast24h(pub, now);
+      this.updateProviderScore(provider);
+    }
   }
 
   /** Count heartbeat blocks in the 24h window for a given epoch day (P3: O(1) via index). */

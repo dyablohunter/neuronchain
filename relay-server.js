@@ -102,9 +102,163 @@ const PEER_ID_FILE = process.env.PEER_ID_FILE || '.relay-peer-id.json';
 // Comma-separated list of peer relay multiaddrs (must include /p2p/<peerId> suffix).
 // Example: PEER_RELAYS=/dns4/relay2.example.com/tcp/9090/ws/p2p/<peerId2>
 const PEER_RELAYS = (process.env.PEER_RELAYS || '').split(',').filter(Boolean);
+const SIGNING_KEY_FILE = process.env.SIGNING_KEY_FILE || '.relay-signing-key.json';
+const FACE_DB_FILE = process.env.FACE_DB_FILE || '.relay-face-db.json';
 
 // Must match PROTOCOL_VERSION in src/network/libp2p-network.ts
 const PROTOCOL_VERSION = 'v1';
+
+// ── Face-verify session store ─────────────────────────────────────────────────
+const CHALLENGE_TYPES = ['look-left', 'look-right', 'smile'];
+const CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const IP_WINDOW_MS = 24 * 60 * 60 * 1000;
+const IP_MAX_PER_DAY = 3;
+/** Max accounts per face: testnet=3, mainnet=1 */
+const FACE_MAX = { testnet: 3, mainnet: 1 };
+/**
+ * Euclidean distance threshold for "same face" — must match client MATCH_THRESHOLD.
+ * Below this distance = same person; above = different person.
+ */
+const FACE_MATCH_THRESHOLD = 0.45;
+/** challengeId → { type, createdAt, ip, used } */
+const challengeSessions = new Map();
+/** ip → { count, windowStart } */
+const ipVerifyLog = new Map();
+/**
+ * Persistent face descriptor database.
+ * Each entry: { descriptor: number[128], count: number, network: string }
+ * Matching uses Euclidean distance < FACE_MATCH_THRESHOLD (same as client).
+ * This is the only reliable Sybil check — hash-based counting fails because
+ * face descriptors vary slightly between sessions and hash differently each time.
+ */
+let faceDescriptorDB = [];
+
+async function loadFaceDB() {
+  try {
+    faceDescriptorDB = JSON.parse(await fs.readFile(FACE_DB_FILE, 'utf8'));
+    console.log(`[FaceVerify] Loaded face DB: ${faceDescriptorDB.length} enrolled face(s)`);
+  } catch { faceDescriptorDB = []; }
+}
+
+async function saveFaceDB() {
+  await fs.writeFile(FACE_DB_FILE, JSON.stringify(faceDescriptorDB)).catch(() => {});
+}
+
+function euclideanDistance(a, b) {
+  let sum = 0;
+  for (let i = 0; i < 128; i++) sum += (a[i] - b[i]) ** 2;
+  return Math.sqrt(sum);
+}
+
+/**
+ * Find the closest stored face entry for the given descriptor and network.
+ * Returns the entry if within FACE_MATCH_THRESHOLD, otherwise null (= new face).
+ */
+function findMatchingFace(descriptor, network) {
+  let best = null;
+  let bestDist = Infinity;
+  for (const entry of faceDescriptorDB) {
+    if (entry.network !== network) continue;
+    const d = euclideanDistance(descriptor, entry.descriptor);
+    if (d < FACE_MATCH_THRESHOLD && d < bestDist) {
+      bestDist = d;
+      best = entry;
+    }
+  }
+  return best;
+}
+
+// ── Face-verify helpers ───────────────────────────────────────────────────────
+
+function getClientIp(req) {
+  return ((req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0]).trim() || 'unknown';
+}
+
+function issueChallenge(ip) {
+  const challengeId = globalThis.crypto.randomUUID();
+  const type = CHALLENGE_TYPES[Math.floor(Math.random() * CHALLENGE_TYPES.length)];
+  const now = Date.now();
+  challengeSessions.set(challengeId, { type, createdAt: now, ip, used: false });
+  // Prune expired entries periodically
+  if (challengeSessions.size % 200 === 0) {
+    for (const [id, s] of challengeSessions) {
+      if (now - s.createdAt > CHALLENGE_TTL_MS) challengeSessions.delete(id);
+    }
+  }
+  return { challengeId, type, expiresAt: now + CHALLENGE_TTL_MS };
+}
+
+function checkIpLimit(ip) {
+  const now = Date.now();
+  const entry = ipVerifyLog.get(ip);
+  if (!entry || now - entry.windowStart > IP_WINDOW_MS) return true;
+  return entry.count < IP_MAX_PER_DAY;
+}
+
+function recordIpVerification(ip) {
+  const now = Date.now();
+  const entry = ipVerifyLog.get(ip);
+  if (!entry || now - entry.windowStart > IP_WINDOW_MS) {
+    ipVerifyLog.set(ip, { count: 1, windowStart: now });
+  } else {
+    entry.count++;
+  }
+}
+
+function validateDescriptor(descriptor) {
+  return Array.isArray(descriptor) &&
+    descriptor.length === 128 &&
+    descriptor.every(v => typeof v === 'number' && Number.isFinite(v) && v > -2.0 && v < 2.0);
+}
+
+async function computeFaceMapHash(descriptor) {
+  // Must match face-verify.ts: quantize (QUANT_BIN=0.1) then hash
+  const quantized = descriptor.map(v => Math.round(v / 0.1) * 0.1);
+  const str = quantized.map(v => v.toFixed(4)).join(',');
+  const encoded = new TextEncoder().encode(str);
+  const buf = await globalThis.crypto.subtle.digest('SHA-256', encoded);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function loadOrCreateSigningKey() {
+  try {
+    const saved = JSON.parse(await fs.readFile(SIGNING_KEY_FILE, 'utf8'));
+    const privKey = await globalThis.crypto.subtle.importKey(
+      'jwk', saved.private, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign'],
+    );
+    const pubKeyStr = Buffer.from(JSON.stringify(saved.public)).toString('base64');
+    console.log('[FaceVerify] Loaded existing signing key');
+    return { privKey, pubKeyStr };
+  } catch {
+    const pair = await globalThis.crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'],
+    );
+    const privateJwk = await globalThis.crypto.subtle.exportKey('jwk', pair.privateKey);
+    const publicJwk  = await globalThis.crypto.subtle.exportKey('jwk', pair.publicKey);
+    await fs.writeFile(SIGNING_KEY_FILE, JSON.stringify({ private: privateJwk, public: publicJwk }));
+    console.log('[FaceVerify] Generated new signing key pair');
+    return { privKey: pair.privateKey, pubKeyStr: Buffer.from(JSON.stringify(publicJwk)).toString('base64') };
+  }
+}
+
+async function signFaceMapHash(faceMapHash, privKey) {
+  const encoded = new TextEncoder().encode(faceMapHash);
+  const sigBytes = await globalThis.crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privKey, encoded);
+  const b64sig = Buffer.from(sigBytes).toString('base64');
+  return JSON.stringify({ d: faceMapHash, s: b64sig });
+}
+
+async function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 65536) reject(new Error('Request too large'));
+    });
+    req.on('end', () => { try { resolve(JSON.parse(body)); } catch { reject(new Error('Invalid JSON')); } });
+    req.on('error', reject);
+  });
+}
 
 // ── Persistent peer ID ────────────────────────────────────────────────────────
 
@@ -127,47 +281,224 @@ async function loadOrCreatePrivKey() {
 async function main() {
   const privKey = await loadOrCreatePrivKey();
   const peerId = peerIdFromPrivateKey(privKey);
+  const signingKey = await loadOrCreateSigningKey();
+  await loadFaceDB();
 
-  const node = await createLibp2p({
-    privateKey: privKey,
-    addresses: {
-      listen: [
-        `/ip4/0.0.0.0/tcp/${PORT}/ws`,
-        `/ip4/0.0.0.0/tcp/${PORT + 1}`,
-      ],
-    },
-    transports: [
-      webSockets(),
-      tcp(),
-    ],
-    connectionEncrypters: [noise()],
-    streamMuxers: [yamux()],
-    services: {
-      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true, emitSelf: false, runOnLimitedConnection: true }),
-      identify: identify(),
-      ping: ping(),
-      relay: circuitRelayServer({
-        // Allow browsers to use this node as a relay
-        reservations: {
-          maxReservations: 1024,
-          reservationTtl: 2 * 60 * 60 * 1000, // 2h
-          // Default data limit is 128 KB per circuit - raise it so large content
-          // transfers (signaling, libp2p protocol messages) can complete freely.
-          defaultDataLimit: BigInt(1 << 30), // 1 GB per circuit
-          // Default duration limit is 2 minutes - raise it for long-running sessions.
-          // Set to 1 hour so smoke WebRTC sessions don't get cut off mid-transfer.
-          defaultDurationLimit: 60 * 60 * 1000, // 1 hour in ms
-        },
-      }),
-      dht: kadDHT({
-        // Server mode - participates in DHT routing
-        clientMode: false,
-        kBucketSize: 20,
-      }),
-    },
+  // relayAddrs is populated after node.start(); empty until then (relay-info returns [] multiaddrs)
+  let relayAddrs = [];
+
+  // ── HTTP server (started BEFORE libp2p so face-verify works even if ports conflict) ──
+
+  const httpServer = createServer(async (req, res) => {
+    // CORS preflight for face-verify endpoints
+    if (req.url?.startsWith('/face-verify')) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+    }
+
+    try {
+      if (req.url === '/relay-info') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        // faceVerifyUrl is empty — clients use the relative /face-verify path via their own proxy
+        res.end(JSON.stringify({
+          peerId: peerId.toString(),
+          multiaddrs: relayAddrs,
+          wsPort: PORT,
+          signingPub: signingKey.pubKeyStr,
+          faceVerifyUrl: '',
+        }));
+
+      } else if (req.method === 'POST' && req.url === '/log-reload') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', async () => {
+          const line = `[${new Date().toISOString()}] ${body.trim()}\n`;
+          await fs.appendFile('reload.log', line).catch(() => {});
+          res.writeHead(204);
+          res.end();
+        });
+
+      } else if (req.method === 'POST' && req.url === '/face-verify/challenge') {
+        const ip = getClientIp(req);
+        if (!checkIpLimit(ip)) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Rate limit: max 3 verifications per IP per 24h' }));
+          return;
+        }
+        const challenge = issueChallenge(ip);
+        console.log(`[FaceVerify] Challenge issued: type=${challenge.type} ip=${ip}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(challenge));
+
+      } else if (req.method === 'POST' && req.url === '/face-verify/verify') {
+        const ip = getClientIp(req);
+        let body;
+        try { body = await readJsonBody(req); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message })); return;
+        }
+        const { descriptor, faceMapHash, challengeId } = body;
+
+        const session = challengeSessions.get(String(challengeId || ''));
+        if (!session) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid or expired challengeId' })); return;
+        }
+        if (session.used) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'challengeId already used' })); return;
+        }
+        if (Date.now() - session.createdAt > CHALLENGE_TTL_MS) {
+          challengeSessions.delete(challengeId);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Challenge expired' })); return;
+        }
+        if (!validateDescriptor(descriptor)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'descriptor must be 128 finite numbers in (-2, 2)' })); return;
+        }
+        const expectedHash = await computeFaceMapHash(descriptor);
+        if (expectedHash !== String(faceMapHash || '')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'faceMapHash does not match descriptor' })); return;
+        }
+        if (!checkIpLimit(ip)) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Rate limit exceeded' })); return;
+        }
+        const network = req.headers['x-network'] === 'mainnet' ? 'mainnet' : 'testnet';
+        const faceMax = FACE_MAX[network];
+
+        // Fuzzy face match: find the closest stored descriptor within FACE_MATCH_THRESHOLD.
+        // Hash-based counting is unreliable because face descriptors shift between sessions
+        // (lighting, angle) causing quantization bin flips and different hashes for the same face.
+        const matchedFace = findMatchingFace(descriptor, network);
+        const faceCount = matchedFace ? matchedFace.count : 0;
+        if (faceCount >= faceMax) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Face limit reached (${faceCount}/${faceMax} on ${network})` })); return;
+        }
+
+        session.used = true;
+        recordIpVerification(ip);
+
+        if (matchedFace) {
+          matchedFace.count++;
+          // Update centroid so future sessions are compared against a current reference,
+          // preventing descriptor drift from creating a false "new face" entry.
+          for (let i = 0; i < 128; i++) {
+            matchedFace.descriptor[i] = (matchedFace.descriptor[i] + descriptor[i]) / 2;
+          }
+        } else {
+          faceDescriptorDB.push({ descriptor: Array.from(descriptor), count: 1, network });
+        }
+        await saveFaceDB();
+
+        const sig = await signFaceMapHash(faceMapHash, signingKey.privKey);
+        console.log(`[FaceVerify] Signed for ip=${ip} face=${faceCount + 1}/${faceMax} (${matchedFace ? `matched dist<${FACE_MATCH_THRESHOLD}` : 'new face'})`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sig, signingPub: signingKey.pubKeyStr }));
+
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    } catch (e) {
+      console.error('[FaceVerify] HTTP error:', e);
+      if (!res.headersSent) { res.writeHead(500); res.end(); }
+    }
   });
 
-  await node.start();
+  // ── Smoke Hub ──────────────────────────────────────────────────────────────
+  const smokeHubWss = new WebSocketServer({ noServer: true });
+  const smokeHubPeers = new Map();
+
+  smokeHubWss.on('connection', (ws) => {
+    let address = null;
+    const keepAlive = setInterval(() => { if (ws.readyState === 1) ws.ping(); }, 15_000);
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (!address && msg.type === 'register' && typeof msg.address === 'string') {
+          address = msg.address;
+          smokeHubPeers.set(address, ws);
+          console.log(`[SmokeHub] Peer registered: ${address.slice(0, 8)}...`);
+          return;
+        }
+        if (address && typeof msg.to === 'string' && smokeHubPeers.has(msg.to)) {
+          const target = smokeHubPeers.get(msg.to);
+          if (target.readyState === 1) target.send(JSON.stringify({ ...msg, from: address }));
+        }
+      } catch { /* ignore malformed */ }
+    });
+    ws.on('close', () => {
+      clearInterval(keepAlive);
+      if (address) { smokeHubPeers.delete(address); console.log(`[SmokeHub] Peer disconnected: ${address.slice(0, 8)}...`); address = null; }
+    });
+  });
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url === '/smoke-hub') {
+      smokeHubWss.handleUpgrade(req, socket, head, (ws) => { smokeHubWss.emit('connection', ws, req); });
+    } else {
+      socket.destroy();
+    }
+  });
+
+  httpServer.listen(PORT + 2, () => console.log(`[Relay] HTTP/face-verify server listening on port ${PORT + 2}`));
+
+  // ── Start libp2p node ────────────────────────────────────────────────────────
+  // Wrapped in try/catch: if libp2p fails (e.g. EADDRINUSE) the HTTP face-verify
+  // server stays alive so clients can still get relay credentials.
+
+  let node;
+  try {
+    node = await createLibp2p({
+      privateKey: privKey,
+      addresses: {
+        listen: [
+          `/ip4/0.0.0.0/tcp/${PORT}/ws`,
+          `/ip4/0.0.0.0/tcp/${PORT + 1}`,
+        ],
+      },
+      transports: [
+        webSockets(),
+        tcp(),
+      ],
+      connectionEncrypters: [noise()],
+      streamMuxers: [yamux()],
+      services: {
+        pubsub: gossipsub({ allowPublishToZeroTopicPeers: true, emitSelf: false, runOnLimitedConnection: true }),
+        identify: identify(),
+        ping: ping(),
+        relay: circuitRelayServer({
+          // Allow browsers to use this node as a relay
+          reservations: {
+            maxReservations: 1024,
+            reservationTtl: 2 * 60 * 60 * 1000, // 2h
+            // Default data limit is 128 KB per circuit - raise it so large content
+            // transfers (signaling, libp2p protocol messages) can complete freely.
+            defaultDataLimit: BigInt(1 << 30), // 1 GB per circuit
+            // Default duration limit is 2 minutes - raise it for long-running sessions.
+            // Set to 1 hour so smoke WebRTC sessions don't get cut off mid-transfer.
+            defaultDurationLimit: 60 * 60 * 1000, // 1 hour in ms
+          },
+        }),
+        dht: kadDHT({
+          // Server mode - participates in DHT routing
+          clientMode: false,
+          kBucketSize: 20,
+        }),
+      },
+    });
+
+    await node.start();
+  } catch (e) {
+    console.error('[Relay] libp2p failed to start — HTTP/face-verify server remains available:', e.message);
+    return; // main() resolves normally; httpServer keeps the process alive
+  }
 
   // ── Server-side keepalive pings ───────────────────────────────────────────
   // Ping all connected peers every 10s so the WebSocket TCP connections stay
@@ -328,82 +659,8 @@ async function main() {
     }
   });
 
-  const addrs = node.getMultiaddrs().map(a => a.toString());
-
-  // ── HTTP /relay-info endpoint for Vite dev plugin ─────────────────────────
-
-  const httpServer = createServer((req, res) => {
-    if (req.url === '/relay-info') {
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({
-        peerId: node.peerId.toString(),
-        multiaddrs: addrs,
-        wsPort: PORT,
-      }));
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  });
-
-  // ── Smoke Hub ──────────────────────────────────────────────────────────────
-  // WebSocket signaling server for @sinclair/smoke WebRTC connections.
-  // Browsers connect to ws://host:PORT+2/smoke-hub (proxied via Vite in dev).
-  // Each peer registers with its UUID address; the hub routes ICE/offer/answer
-  // messages between peers so smoke's Http-over-WebRTC layer can establish
-  // direct data-channel connections for block transfer.
-
-  const smokeHubWss = new WebSocketServer({ noServer: true });
-  /** address string → WebSocket */
-  const smokeHubPeers = new Map();
-
-  smokeHubWss.on('connection', (ws) => {
-    let address = null;
-
-    // Send WebSocket-level ping frames every 15s to keep the TCP connection alive
-    // through NAT devices that drop idle connections after 20-30s. Mobile browsers
-    // automatically respond with pong frames, so the NAT table entry stays fresh.
-    const keepAlive = setInterval(() => { if (ws.readyState === 1) ws.ping(); }, 15_000);
-
-    ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (!address && msg.type === 'register' && typeof msg.address === 'string') {
-          address = msg.address;
-          smokeHubPeers.set(address, ws);
-          console.log(`[SmokeHub] Peer registered: ${address.slice(0, 8)}...`);
-          return;
-        }
-        if (address && typeof msg.to === 'string' && smokeHubPeers.has(msg.to)) {
-          const target = smokeHubPeers.get(msg.to);
-          if (target.readyState === 1 /* OPEN */) {
-            target.send(JSON.stringify({ ...msg, from: address }));
-          }
-        }
-      } catch { /* ignore malformed */ }
-    });
-
-    ws.on('close', () => {
-      clearInterval(keepAlive);
-      if (address) {
-        smokeHubPeers.delete(address);
-        console.log(`[SmokeHub] Peer disconnected: ${address.slice(0, 8)}...`);
-        address = null;
-      }
-    });
-  });
-
-  httpServer.on('upgrade', (req, socket, head) => {
-    if (req.url === '/smoke-hub') {
-      smokeHubWss.handleUpgrade(req, socket, head, (ws) => {
-        smokeHubWss.emit('connection', ws, req);
-      });
-    } else {
-      socket.destroy();
-    }
-  });
-
-  httpServer.listen(PORT + 2);
+  // Populate relay addresses now that node is up
+  relayAddrs = node.getMultiaddrs().map(a => a.toString());
 
   // ── Graceful shutdown ─────────────────────────────────────────────────────
 
@@ -418,6 +675,6 @@ async function main() {
 }
 
 main().catch(err => {
-  console.error('[Relay] Fatal error:', err);
-  process.exit(1);
+  console.error('[Relay] Unhandled error in main():', err);
+  // Do NOT process.exit — the HTTP face-verify server may still be alive and serving clients.
 });

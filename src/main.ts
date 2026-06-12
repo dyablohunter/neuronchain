@@ -3,8 +3,9 @@ import { validateUsername, generateAccountKeys, buildAccount, AccountWithKeys, A
 import { NetworkType } from './core/dag-ledger';
 import { KeyPair, signData } from './core/crypto';
 import { startKeepAlive, stopKeepAlive } from './core/keepalive';
-import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock } from './core/dag-block';
-import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
+import { writeReloadLog, initReloadMonitor, markNodeStopped } from './core/reload-monitor';
+import { formatUNIT, parseUNIT, VERIFICATION_MINT_AMOUNT, AccountBlock, RelayCredential } from './core/dag-block';
+import { loadModels, startCamera, stopCamera, enrollFace, detectLiveness, detectChallenge, deriveFaceKey, deriveFaceRawBits, encryptWithFaceKey, quantizeDescriptor } from './core/face-verify';
 import { createEncryptedKeyBlob, recoverKeysWithFace, EncryptedKeyBlob, updateAttemptStateInBlob, verifyKeyBlobHash, deriveCombinedKey } from './core/face-store';
 import { acquireTabLock } from './core/tab-lock';
 import { initStreamSW, registerStreamURL, unregisterStreamURL } from './network/stream-sw';
@@ -26,6 +27,8 @@ if (!acquireTabLock()) {
     </div>`;
   throw new Error('Tab locked - another NeuronChain tab is active');
 }
+
+initReloadMonitor();
 
 // ──── State ────
 const savedNetwork = (localStorage.getItem('neuronchain_network') || 'testnet') as NetworkType;
@@ -609,7 +612,7 @@ function showAccountDetail(pub: string) {
       <div class="stats-grid">
         <div class="stat-item"><div class="stat-label">Capacity</div><div class="stat-value">${provider.capacityGB} GB</div></div>
         <div class="stat-item"><div class="stat-label">Score</div><div class="stat-value">${provider.score.toFixed(2)}</div></div>
-        <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${(provider.heartbeatsLast24h / 6 * 100).toFixed(0)}%</div></div>
+        <div class="stat-item"><div class="stat-label">Uptime</div><div class="stat-value">${node.storage.getUptimePct(pub)}%</div></div>
         <div class="stat-item"><div class="stat-label">Rate</div><div class="stat-value">${formatUNIT(provider.earningRate)} UNIT/day</div></div>
         <div class="stat-item"><div class="stat-label">Total Earned</div><div class="stat-value">${formatUNIT(provider.totalEarned)} UNIT</div></div>
         <div class="stat-item"><div class="stat-label">Avg Latency</div><div class="stat-value">${provider.avgLatencyMs > 0 ? provider.avgLatencyMs + ' ms' : '-'}</div></div>
@@ -1331,41 +1334,69 @@ $('#btnResetConfirm').addEventListener('click', async () => {
   localStorage.removeItem('neuronchain_facemaps');
   // Reload page to fully clear in-memory state
   toast('Testnet reset - reloading...', 'success');
+  writeReloadLog('manual testnet reset button');
   setTimeout(() => location.reload(), 500);
 });
 
 // ──── Node Control ────
-$('#btnStartNode').addEventListener('click', async () => {
-  const btn = $('#btnStartNode');
-  const origText = btn.innerHTML;
-  btn.innerHTML = '<span class="spinner"></span> Starting...';
-  btn.setAttribute('disabled', '');
+let nodeStarting = false;
 
-  await node.start();
-  registerLocalKeys();
-  for (const acc of localAccounts) {
-    if (!node.ledger.getAccountHead(acc.pub)) {
-      const block = await node.ledger.openAccount(acc.pub, acc.faceMapHash, acc.keys);
-      await node.submitBlock(block);
+async function startNode() {
+  if (nodeStarting || node.net.running) return;
+  nodeStarting = true;
+  try {
+    await node.start();
+    registerLocalKeys();
+    // Backfill file index for any library entries never announced (e.g. private files uploaded
+    // before the encrypted-file announcement guard was removed).
+    setTimeout(async () => {
+      const fileIndex = node.storage.getFileIndex();
+      for (const rec of loadContentLibrary()) {
+        if (fileIndex.has(rec.cid)) continue;
+        const acc = localAccounts.find(a => a.pub === rec.ownerPub);
+        if (!acc) continue;
+        await node.storage.announceFile(rec.cid, rec.sizeBytes, rec.mimeType, rec.ownerPub, acc.keys).catch(() => {});
+      }
+    }, 6_000);
+    // Keys are now loaded — reschedule the heartbeat timer with accurate lastHeartbeat timing.
+    node.storage.rescheduleHeartbeat();
+    // Deregister any local provider that has been offline for more than 24h.
+    await node.storage.deregisterStaleLocalProviders();
+    for (const acc of localAccounts) {
+      if (!node.ledger.getAccountHead(acc.pub)) {
+        const block = await node.ledger.openAccount(acc.pub, acc.faceMapHash, acc.keys);
+        await node.submitBlock(block);
+      }
     }
-  }
-  // Publish all local data to the network (accounts + blocks created before node started)
-  node.publishLocalData();
+    node.publishLocalData();
 
-  btn.innerHTML = origText;
-  $('#btnStopNode').removeAttribute('disabled');
-  $('#statusDot').classList.add('active');
-  setNodeDependentTabs(true);
-  startKeepAlive(() => refreshTab());
-  wireNodeEvents();
-  startRefreshInterval();
-  nodeStartedAt = Date.now();
-  lastKnownBlockCount = 0;
-  blockCountStableSince = 0;
-  addLog('Node started', 'success');
-  toast('Node started', 'success');
-  refreshTab();
-});
+    $('#btnStopNode').removeAttribute('disabled');
+    $('#statusDot').classList.add('active');
+    setNodeDependentTabs(true);
+    startKeepAlive(() => refreshTab());
+    wireNodeEvents();
+    startRefreshInterval();
+    nodeStartedAt = Date.now();
+    lastKnownBlockCount = 0;
+    blockCountStableSince = 0;
+    addLog('Node started', 'success');
+    toast('Node started', 'success');
+    refreshTab();
+  } finally {
+    nodeStarting = false;
+  }
+}
+
+// Auto-start on page load
+startNode();
+
+// Watchdog: restart every minute if the node is not running
+setInterval(() => {
+  if (!node.net.running && !nodeStarting) {
+    addLog('Node not running — restarting...', 'warn');
+    startNode();
+  }
+}, 60_000);
 
 $('#btnStopNode').addEventListener('click', async () => {
   const btn = $('#btnStopNode');
@@ -1376,12 +1407,12 @@ $('#btnStopNode').addEventListener('click', async () => {
   await node.stop();
 
   btn.innerHTML = origText;
-  $('#btnStartNode').removeAttribute('disabled');
   $('#statusDot').classList.remove('active');
   setNodeDependentTabs(false);
   stopKeepAlive();
   stopRefreshInterval();
   unwireNodeEvents();
+  markNodeStopped();
   addLog('Node stopped', 'warn');
   refreshNode();
 });
@@ -1418,6 +1449,103 @@ node.net.on('relays:updated', () => { if (document.getElementById('tab-node')?.c
 
 
 // ══════════════════════════════════════════════════════════
+// ──── Relay Face Verification Helpers ────
+// ══════════════════════════════════════════════════════════
+
+interface PendingChallenge {
+  challengeId: string;
+  type: string;
+  signingPub: string;
+  /** Base URL for /face-verify/*; empty string = use relative /face-verify (primary relay via Vite proxy) */
+  faceVerifyBase: string;
+  peerId: string;
+}
+
+function faceVerifyEndpoint(base: string, endpoint: string): string {
+  return base ? `${base}/face-verify/${endpoint}` : `/face-verify/${endpoint}`;
+}
+
+function pickRandomRelays(relays: import('./network/libp2p-network').KnownRelayRecord[], n: number) {
+  const eligible = relays.filter(r => r.signingPub);
+  return eligible.sort(() => Math.random() - 0.5).slice(0, n);
+}
+
+/**
+ * Phase 1 — contact relays and get challenge IDs BEFORE face capture.
+ * Falls back to the primary relay via the Vite-proxied /face-verify path if
+ * no community relays with signing keys are known yet.
+ */
+async function getRelayChallenges(
+  relays: import('./network/libp2p-network').KnownRelayRecord[],
+): Promise<PendingChallenge[]> {
+  // If no known relays have a signingPub, fall back to the primary relay via /relay-info
+  let targets = [...relays];
+  if (targets.length === 0) {
+    try {
+      const infoRes = await fetch('/relay-info', { signal: AbortSignal.timeout(4000) });
+      if (infoRes.ok) {
+        const info = await infoRes.json() as { signingPub?: string };
+        if (info.signingPub) {
+          targets = [{ addr: '', peerId: 'primary', lastSeen: 0, failCount: 0, announcerPub: '', signingPub: info.signingPub, faceVerifyUrl: '' }];
+        }
+      }
+    } catch { /* relay not reachable */ }
+  }
+  const results: PendingChallenge[] = [];
+  for (const relay of targets) {
+    const base = relay.faceVerifyUrl || '';
+    try {
+      const res = await fetch(faceVerifyEndpoint(base, 'challenge'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ error: res.status })) as { error: unknown };
+        addLog(`Relay challenge rejected (${res.status}): ${body.error}`, 'error');
+        continue;
+      }
+      const { challengeId, type } = await res.json() as { challengeId: string; type: string };
+      results.push({ challengeId, type, signingPub: relay.signingPub!, faceVerifyBase: base, peerId: relay.peerId });
+    } catch { /* relay unreachable */ }
+  }
+  return results;
+}
+
+/** Phase 2 — send the enrolled descriptor to relays for signing, AFTER face capture. */
+async function collectRelayCredentials(
+  challenges: PendingChallenge[],
+  descriptor: number[],
+  faceMapHash: string,
+  onStatus: (msg: string) => void,
+): Promise<RelayCredential[]> {
+  const credentials: RelayCredential[] = [];
+  const seen = new Set<string>();
+  for (const ch of challenges) {
+    try {
+      const res = await fetch(faceVerifyEndpoint(ch.faceVerifyBase, 'verify'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-network': node.ledger.network },
+        body: JSON.stringify({ descriptor, faceMapHash, challengeId: ch.challengeId }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.status })) as { error: unknown };
+        onStatus(`Relay ${ch.peerId.slice(0, 8)} rejected: ${err.error}`);
+        continue;
+      }
+      const { sig, signingPub } = await res.json() as { sig: string; signingPub: string };
+      if (!sig || !signingPub || seen.has(signingPub)) continue;
+      seen.add(signingPub);
+      credentials.push({ relayPub: signingPub, sig });
+      onStatus(`Relay ${ch.peerId.slice(0, 8)} endorsed ✓ (${credentials.length}/${challenges.length})`);
+    } catch (e) {
+      onStatus(`Relay ${ch.peerId.slice(0, 8)}: ${(e as Error).message}`);
+    }
+  }
+  return credentials;
+}
+
+// ══════════════════════════════════════════════════════════
 // ──── Account Creation (FaceID mandatory) ────
 // ══════════════════════════════════════════════════════════
 
@@ -1444,7 +1572,7 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     cameraStream = await startCamera(video);
 
     // Step 1: Liveness
-    setCameraStatus('<span class="spinner"></span> Step 1/2: Slowly turn your head left and right');
+    setCameraStatus('<span class="spinner"></span> Step 1/3: Slowly turn your head left and right');
     const isLive = await detectLiveness(video, 15000, (msg: string) => {
       overlay.textContent = msg;
     });
@@ -1454,11 +1582,36 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       statusEl.innerHTML = '<span style="color:var(--danger)">Liveness failed. Try again with more head movement.</span>';
       hideCameraModal(); restoreCreateBtn(); return;
     }
-    // Step 2: Face enrollment
-    setCameraStatus('<span class="spinner"></span> Step 2/2: Hold still - capturing face map');
+
+    // Step 2: Pre-fetch relay challenges BEFORE face capture, then show the challenge
+    // instruction during enrollment so the user performs the action on camera.
+    setCameraStatus('<span class="spinner"></span> Step 2/3: Contacting relay nodes...');
+    overlay.textContent = 'Contacting relay nodes...';
+    const pendingChallenges = await getRelayChallenges(pickRandomRelays(node.getKnownRelays(), 5));
+
+    // Active challenge: detect the relay-issued action before face capture.
+    // This blocks enrollment until the user performs the action (blink/smile/look-left/right).
+    if (pendingChallenges.length > 0) {
+      const challengeType = pendingChallenges[0].type as 'blink' | 'look-left' | 'look-right' | 'smile';
+      setCameraStatus(`<span class="spinner"></span> Step 2/3: Challenge — perform the action`);
+      const actionDone = await detectChallenge(video, challengeType, 18000, (msg) => {
+        overlay.textContent = msg;
+        setCameraStatus(`<span class="spinner"></span> Step 2/3: ${msg}`);
+      });
+      if (!actionDone) {
+        addLog('FaceID: Challenge action not detected — aborting account creation', 'error');
+        toast('Challenge failed — please perform the requested action and try again', 'error');
+        statusEl.innerHTML = '<span style="color:var(--danger)">Challenge timed out. Try again.</span>';
+        hideCameraModal(); restoreCreateBtn(); return;
+      }
+    }
+
+    // Face enrollment (camera still open, immediately after challenge action)
+    setCameraStatus('<span class="spinner"></span> Step 2/3: Hold still — capturing face map');
+    overlay.textContent = 'Hold still — capturing face map';
     const faceMap = await enrollFace(video, (step, total, status) => {
       overlay.textContent = `[${step}/${total}] ${status}`;
-      setCameraStatus(`<span class="spinner"></span> Step 2/2: Sample ${step}/${total}`);
+      setCameraStatus(`<span class="spinner"></span> Step 2/3: Sample ${step}/${total}`);
     });
     hideCameraModal();
 
@@ -1469,7 +1622,36 @@ $('#btnCreateAccount').addEventListener('click', async () => {
       restoreCreateBtn(); return;
     }
 
-    // Step 3: PIN setup
+    // Step 3: Send descriptor to relays for signing (camera closed, no video needed)
+    let relayCredentials: RelayCredential[] = [];
+    if (pendingChallenges.length > 0) {
+      statusEl.innerHTML = '<span style="color:var(--accent)"><span class="spinner"></span> Verifying with relay nodes...</span>';
+      relayCredentials = await collectRelayCredentials(
+        pendingChallenges, faceMap.canonical, faceMap.hash,
+        (msg) => { statusEl.innerHTML = `<span style="color:var(--accent)"><span class="spinner"></span> ${msg}</span>`; },
+      );
+    }
+    if (relayCredentials.length === 0) {
+      const isMainnet = node.ledger.network === 'mainnet';
+      addLog('FaceID: No relay endorsements obtained', 'error');
+      toast('Relay face verification failed. Is the relay server running?', 'error');
+      statusEl.innerHTML = `<span style="color:var(--danger)">Relay verification failed — ${isMainnet ? 'mainnet requires 3' : 'at least 1 relay endorsement required'}. Ensure the relay is running and try again.</span>`;
+      restoreCreateBtn(); return;
+    }
+    addLog(`FaceID: ${relayCredentials.length} relay endorsement(s) collected`, 'success');
+
+    // Local face-limit check using localStorage accounts (reliable across restarts)
+    const max = node.ledger.getMaxAccountsPerFace();
+    const localFaceCount = localAccounts.filter(a => a.faceMapHash === faceMap.hash).length;
+    const ledgerFaceCount = node.ledger.getFaceAccountCount(faceMap.hash);
+    const faceCount = Math.max(localFaceCount, ledgerFaceCount);
+    if (faceCount >= max) {
+      addLog(`FaceID: Face limit reached (${faceCount}/${max})`, 'error');
+      statusEl.innerHTML = `<span style="color:var(--danger)">Face already used for ${faceCount} account(s). Limit is ${max} on ${node.ledger.network}.</span>`;
+      restoreCreateBtn(); return;
+    }
+
+    // PIN setup
     statusEl.innerHTML = '<span style="color:var(--accent)">Face enrolled. Now set your account PIN...</span>';
     const pin = await promptSetPin();
     if (!pin) {
@@ -1504,8 +1686,8 @@ $('#btnCreateAccount').addEventListener('click', async () => {
     node.ledger.registerAccount(account);
     partialPub = account.pub;
 
-    // Create open block (mints 1M UNIT)
-    const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys);
+    // Create open block (mints 1M UNIT) — embed relay endorsements
+    const openBlock = await node.ledger.openAccount(keys.pub, faceMap.hash, keys, faceMap.canonical, relayCredentials.length > 0 ? relayCredentials : undefined);
 
     // Submit through node (publishes to libp2p network, triggers auto-vote)
     await node.submitBlock(openBlock);
@@ -1579,6 +1761,7 @@ function finishRecovery(): void {
   if (pendingGenerationReset) {
     pendingGenerationReset = false;
     toast('Network reset received - reloading...', 'info');
+    writeReloadLog('generation:reset after face recovery');
     setTimeout(() => location.reload(), 800);
   }
 }
@@ -2335,6 +2518,7 @@ function wireNodeEvents() {
   });
   node.storage.on('file:index-updated', () => { refreshStorage(); });
   node.storage.on('storage:providers-updated', () => { refreshStorage(); });
+  node.ledger.on('storage:deregistered', () => { refreshStorage(); });
   node.on('peer:connected', () => { refreshNode(); });
   node.on('peer:disconnected', () => { refreshNode(); });
   node.on('auto:received', (data: unknown) => {
@@ -2381,6 +2565,7 @@ function wireNodeEvents() {
       return;
     }
     toast('Network reset received - reloading...', 'info');
+    writeReloadLog('generation:reset from network peer');
     setTimeout(() => location.reload(), 800);
   });
   node.net.on('peer:connected', (url: unknown) => {
@@ -2582,11 +2767,9 @@ $('#btnReplaceConfirm')?.addEventListener('click', async () => {
     removeFromContentLibrary(cid);
     addToContentLibrary({ ...record, cid: newCid, contentCid: newContentCid, chunkCids: newChunkCids, isStream: newIsStream, sizeBytes: data.length, mimeType, timestamp: Date.now() });
 
-    // Update global file index: remove old, announce new (public files only)
-    if (!record.encrypted) {
-      await node.storage.removeFileAnnouncement(cid, record.ownerPub, acc.keys).catch(() => {});
-      node.storage.announceFile(newCid, data.length, mimeType, record.ownerPub, acc.keys).catch(() => {});
-    }
+    // Update global file index: remove old, announce new
+    await node.storage.removeFileAnnouncement(cid, record.ownerPub, acc.keys).catch(() => {});
+    node.storage.announceFile(newCid, data.length, mimeType, record.ownerPub, acc.keys).catch(() => {});
 
     toast('Content replaced successfully', 'success');
     modal.classList.remove('active');
@@ -3053,8 +3236,7 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
     resultEl.innerHTML = `<strong>Stored!</strong> (${visLabel})${streamBadge}&nbsp; CID: <span>${escHtml(cid)}</span> ${cpBtn(cid)}<br>${distInfo}`;
 
     addToContentLibrary({ cid, contentCid, chunkCids, isStream: isStreamFile, name: finalName, contentType, mimeType, sizeBytes: data.length, timestamp: Date.now(), ownerPub: pub, encrypted: isEncrypted });
-    // Announce to the global file index (only for public files — don't leak encrypted CIDs)
-    if (!isEncrypted) node.storage.announceFile(cid, data.length, mimeType, pub, acc.keys).catch(() => {});
+    node.storage.announceFile(cid, data.length, mimeType, pub, acc.keys).catch(() => {});
     toast(`Content stored (${visLabel})`, 'success');
     refreshStorage();
   } catch (err) {
@@ -3063,6 +3245,26 @@ $('#btnStoreContent')?.addEventListener('click', async () => {
 });
 
 // ── Stream helpers (large files > 8 MB) ──────────────────────────────────────
+
+function mimeToExt(mime: string): string {
+  const map: Record<string, string> = {
+    // Video
+    'video/mp4': '.mp4', 'video/webm': '.webm', 'video/ogg': '.ogv',
+    'video/quicktime': '.mov', 'video/x-matroska': '.mkv', 'video/av1': '.av1',
+    // Audio
+    'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/ogg': '.ogg',
+    'audio/opus': '.opus', 'audio/flac': '.flac', 'audio/wav': '.wav',
+    'audio/webm': '.weba', 'audio/aac': '.aac', 'audio/x-flac': '.flac',
+    // Image
+    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+    'image/webp': '.webp', 'image/avif': '.avif', 'image/jxl': '.jxl',
+    'image/svg+xml': '.svg', 'image/heic': '.heic', 'image/heif': '.heif',
+    // Text / code
+    'text/html': '.html', 'text/css': '.css', 'text/plain': '.txt',
+    'application/javascript': '.js', 'application/json': '.json',
+  };
+  return map[mime] ?? (mime.startsWith('video/') ? '.mp4' : mime.startsWith('audio/') ? '.mp3' : '');
+}
 
 function mimeTypeIcon(mime: string): string {
   if (mime.startsWith('video/')) return '🎬';
@@ -3223,7 +3425,7 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
     const statusId = `streamStatus_${cid.slice(0, 8)}`;
     const mediaId  = `streamMedia_${cid.slice(0, 8)}`;
     const ownerPub = knownRecord?.ownerPub ?? pub;
-    const ext = mime.startsWith('video/') ? '.mp4' : mime.startsWith('audio/') ? '.mp3' : mime.includes('json') ? '.json' : '';
+    const ext = mimeToExt(mime) || (mime.includes('json') ? '.json' : '');
     const dlFilename = escHtml((meta.name || cid.slice(0, 12)) + ext);
 
     const isVideo = mime.startsWith('video/');
@@ -3300,7 +3502,7 @@ $('#btnRetrieveContent')?.addEventListener('click', async () => {
     }
 
     const downloadUrl = URL.createObjectURL(new Blob([dataBuf], { type: mime }));
-    const ext = mime.includes('json') || mime.includes('neuron') ? '.json' : mime.includes('html') ? '.html' : mime.includes('css') ? '.css' : mime.includes('javascript') ? '.js' : '';
+    const ext = mimeToExt(mime) || (mime.includes('json') || mime.includes('neuron') ? '.json' : '');
     const filename = escHtml((meta.name || cid.slice(0, 12)) + ext);
 
     resultEl.innerHTML = `

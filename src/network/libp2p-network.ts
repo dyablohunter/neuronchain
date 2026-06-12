@@ -104,6 +104,7 @@ const _gsOrigOIS = (GossipSub.prototype as unknown as Record<string, unknown>)['
 import { EventEmitter } from '../core/events';
 import { AccountBlock } from '../core/dag-block';
 import { Vote } from '../core/vote';
+import { writeReloadLog } from '../core/reload-monitor';
 import { verifySignature } from '../core/crypto';
 import { LockoutNotice, lockoutPayload } from '../core/pin-crypto';
 
@@ -128,6 +129,8 @@ export function getSynapseIndex(accountPub: string): number {
 interface RelayInfo {
   peerId: string;
   bootstrapAddr: string;
+  signingPub?: string;
+  faceVerifyUrl?: string;
 }
 
 /**
@@ -155,7 +158,7 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
     try {
       const res = await fetch('/relay-info', { signal: AbortSignal.timeout(4000) });
       if (!res.ok) throw new Error(`status ${res.status}`);
-      const json = await res.json() as { peerId?: string };
+      const json = await res.json() as { peerId?: string; signingPub?: string; faceVerifyUrl?: string };
       if (!json.peerId) throw new Error('no peerId');
 
       const host = window.location.hostname;
@@ -166,7 +169,7 @@ async function fetchRelayInfo(retries = 5, delayMs = 1500): Promise<RelayInfo | 
         ? `/dns4/localhost/tcp/9090/ws/p2p/${json.peerId}`
         : `/dns4/${host}/tcp/${port}/${wsProto}/http-path/relay-ws/p2p/${json.peerId}`;
 
-      return { peerId: json.peerId, bootstrapAddr };
+      return { peerId: json.peerId, bootstrapAddr, signingPub: json.signingPub, faceVerifyUrl: json.faceVerifyUrl };
     } catch {
       if (i < retries - 1) await new Promise(r => setTimeout(r, delayMs));
     }
@@ -259,11 +262,13 @@ export interface TrackedCidRecord {
 }
 
 export interface KnownRelayRecord {
-  addr: string;         // full multiaddr — keyPath
-  peerId: string;       // extracted from /p2p/<id> suffix
-  lastSeen: number;     // Unix ms — last successful connection or fresh announcement
-  failCount: number;    // consecutive dial failures; evicted at RELAY_FAIL_EVICT
-  announcerPub: string; // account pub that signed the announcement
+  addr: string;          // full multiaddr — keyPath
+  peerId: string;        // extracted from /p2p/<id> suffix
+  lastSeen: number;      // Unix ms — last successful connection or fresh announcement
+  failCount: number;     // consecutive dial failures; evicted at RELAY_FAIL_EVICT
+  announcerPub: string;  // account pub that signed the announcement
+  signingPub?: string;   // base64(JSON(JWK)) of relay's ECDSA signing key for face verification
+  faceVerifyUrl?: string; // HTTP base URL for /face-verify endpoints on this relay
 }
 
 export interface FileIndexRecord {
@@ -289,10 +294,10 @@ async function openNeuronDB(network: string): Promise<IDBPDatabase<NeuronDB>> {
   return openDB<NeuronDB>(`neuronchain-${network}`, 8, {
     // Another tab has a newer DB version open — close this connection so the
     // upgrade can proceed instead of blocking indefinitely.
-    blocking() { location.reload(); },
+    blocking() { writeReloadLog('idb blocking (another tab has newer DB version)'); location.reload(); },
     // This tab holds an old version while another tab tries to upgrade — close
     // our connection immediately so the upgrade isn't blocked.
-    blocked() { location.reload(); },
+    blocked()  { writeReloadLog('idb blocked (this tab has old DB version)');        location.reload(); },
     upgrade(db, oldVersion, _newVersion, transaction) {
       if (oldVersion < 2) {
         const bs = db.createObjectStore('blocks', { keyPath: 'hash' });
@@ -453,7 +458,7 @@ export class Libp2pNetwork extends EventEmitter {
     } catch { /* fresh DB */ }
   }
 
-  async upsertKnownRelay(addr: string, announcerPub: string): Promise<void> {
+  async upsertKnownRelay(addr: string, announcerPub: string, signingPub?: string, faceVerifyUrl?: string): Promise<void> {
     const peerId = Libp2pNetwork.peerIdFromAddr(addr);
     if (!peerId) return;
     const existing = this.knownRelayMap.get(addr);
@@ -462,6 +467,8 @@ export class Libp2pNetwork extends EventEmitter {
       lastSeen: Date.now(),
       failCount: 0,
       announcerPub: existing?.announcerPub || announcerPub,
+      signingPub: signingPub || existing?.signingPub,
+      faceVerifyUrl: faceVerifyUrl || existing?.faceVerifyUrl,
     };
     this.knownRelayMap.set(addr, record);
     lsAddRelayAddr(addr);
@@ -689,10 +696,18 @@ export class Libp2pNetwork extends EventEmitter {
       }
       // Announce own relay + all known community relays so new peers can learn them
       if (relayInfo) {
-        this.publish(topicRelays(this.network), { addr: relayInfo.bootstrapAddr, peerId: relayInfo.peerId, timestamp: Date.now(), pub: '', signature: '' });
+        this.publish(topicRelays(this.network), { addr: relayInfo.bootstrapAddr, peerId: relayInfo.peerId, timestamp: Date.now(), pub: '', signature: '', signingPub: relayInfo.signingPub || '', faceVerifyUrl: relayInfo.faceVerifyUrl || '' });
+        await this.upsertKnownRelay(relayInfo.bootstrapAddr, '', relayInfo.signingPub, relayInfo.faceVerifyUrl);
+      }
+      // Register baked-in bootstrap relays so they appear in the relay table
+      if (typeof __BOOTSTRAP_ADDRS__ !== 'undefined' && Array.isArray(__BOOTSTRAP_ADDRS__)) {
+        for (const addr of __BOOTSTRAP_ADDRS__) {
+          const peerId = Libp2pNetwork.peerIdFromAddr(addr);
+          if (peerId) await this.upsertKnownRelay(addr, '');
+        }
       }
       for (const r of this.knownRelayMap.values()) {
-        this.publish(topicRelays(this.network), { addr: r.addr, peerId: r.peerId, timestamp: r.lastSeen, pub: r.announcerPub, signature: '' });
+        this.publish(topicRelays(this.network), { addr: r.addr, peerId: r.peerId, timestamp: r.lastSeen, pub: r.announcerPub, signature: '', signingPub: r.signingPub || '', faceVerifyUrl: r.faceVerifyUrl || '' });
       }
     }, 5000);
 
@@ -1022,7 +1037,7 @@ export class Libp2pNetwork extends EventEmitter {
 
     // Community relay announcements — verify signature when present, upsert and dial
     if (topic === topicRelays(this.network)) {
-      const msg = decode<{ addr?: string; peerId?: string; timestamp?: number; pub?: string; signature?: string }>(data);
+      const msg = decode<{ addr?: string; peerId?: string; timestamp?: number; pub?: string; signature?: string; signingPub?: string; faceVerifyUrl?: string }>(data);
       if (!msg.addr || typeof msg.addr !== 'string') return;
       if (!Libp2pNetwork.peerIdFromAddr(msg.addr)) return;
       // Verify signature when the message was explicitly signed by an account holder
@@ -1031,7 +1046,7 @@ export class Libp2pNetwork extends EventEmitter {
         const result = await verifySignature(msg.signature, msg.pub);
         if (result !== payload) return;
       }
-      await this.upsertKnownRelay(msg.addr, msg.pub || '');
+      await this.upsertKnownRelay(msg.addr, msg.pub || '', msg.signingPub, msg.faceVerifyUrl);
       this.emit('relay:discovered', msg.addr);
       try { await this.libp2p.dial(multiaddr(msg.addr)); } catch { /* unreachable, skip */ }
       return;
@@ -1382,6 +1397,7 @@ export class Libp2pNetwork extends EventEmitter {
       receiveAmount: block.receiveAmount ?? 0, faceMapHash: block.faceMapHash || '',
       contractData: block.contractData || '', contentCid: block.contentCid || '',
       updateData: block.updateData || '',
+      relayCredentials: block.relayCredentials ? JSON.stringify(block.relayCredentials) : '',
     };
   }
 
@@ -1410,6 +1426,7 @@ export class Libp2pNetwork extends EventEmitter {
         contractData: data.contractData ? String(data.contractData) : undefined,
         contentCid: data.contentCid ? String(data.contentCid) : undefined,
         updateData: data.updateData ? String(data.updateData) : undefined,
+        relayCredentials: data.relayCredentials ? (() => { try { return JSON.parse(String(data.relayCredentials)); } catch { return undefined; } })() : undefined,
       };
     } catch { return null; }
   }

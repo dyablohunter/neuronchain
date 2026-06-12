@@ -9,7 +9,7 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     watch: {
-      ignored: ['**/.relay-peer-id.json'],
+      ignored: ['**/.relay-peer-id.json', '**/.relay-signing-key.json', '**/.relay-face-db.json'],
     },
     proxy: {
       // Proxy relay WebSocket through Vite so the tunnel URL (port 5173/443)
@@ -28,6 +28,12 @@ export default defineConfig({
         target: 'ws://localhost:9092',
         ws: true,
       },
+      '/log-reload': {
+        target: 'http://localhost:9092',
+      },
+      '/face-verify': {
+        target: 'http://localhost:9092',
+      },
     },
   },
   build: {
@@ -44,9 +50,10 @@ export default defineConfig({
     //     '/dns4/relay2.example.com/tcp/443/wss/http-path/relay-ws/p2p/<peerId2>',
     //   ])
     // The localStorage key 'neuronchain_bootstrap' always takes priority over this list.
-    __BOOTSTRAP_ADDRS__: JSON.stringify(
-      (process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean)
-    ),
+    __BOOTSTRAP_ADDRS__: JSON.stringify([
+      '/dns4/neuronweb.org/tcp/443/wss/http-path/relay-ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
+      ...(process.env.BOOTSTRAP_ADDRS || '').split(',').filter(Boolean),
+    ]),
   },
   resolve: {
     alias: {

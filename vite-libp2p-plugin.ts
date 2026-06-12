@@ -19,7 +19,11 @@ export function libp2pRelay(): Plugin {
     if (stopping) return;
     relayProcess = spawn(process.execPath, [relayPath], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PORT: '9090' },
+      env: {
+        ...process.env,
+        PORT: '9090',
+        PEER_RELAYS: '/dns4/neuronweb.org/tcp/9090/ws/p2p/12D3KooWDqCwT9M8VFAZJ2qGDPuxYqdFpa5nAXJcyp7eXAQJYsf7',
+      },
     });
 
     relayProcess.stdout?.on('data', (d: Buffer) => {
@@ -60,14 +64,14 @@ export function libp2pRelay(): Plugin {
       });
 
       console.log('  libp2p relay: starting on port 9090');
-    },
 
-    closeServer() {
-      stopping = true;
-      if (relayProcess) {
-        relayProcess.kill('SIGTERM');
-        relayProcess = null;
-      }
+      server.httpServer?.on('close', () => {
+        stopping = true;
+        if (relayProcess) {
+          relayProcess.kill('SIGTERM');
+          relayProcess = null;
+        }
+      });
     },
   };
 }
