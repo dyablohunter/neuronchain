@@ -265,7 +265,7 @@ export async function recoverKeysWithFace(
     const storedQuantized = quantizeDescriptor(storedCanonical);
 
     // Biometric verification: live scan must match stored canonical
-    if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor))) return null;
+    if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor)).match) return null;
 
     // Derive combined key and decrypt
     const faceBytes = await deriveFaceRawBits(storedQuantized, blob.pub);
@@ -302,7 +302,7 @@ export async function recoverKeysWithFace(
           const storedCanonical = JSON.parse(canonicalJson) as number[];
           const storedQuantized = quantizeDescriptor(storedCanonical);
           resolvedFaceKey = await deriveFaceKey(storedQuantized, blob.pub);
-          if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor))) return null;
+          if (!compareFaces(storedQuantized, quantizeDescriptor(newDescriptor)).match) return null;
         } catch { /* fall back to live-scan key */ }
       }
     }
